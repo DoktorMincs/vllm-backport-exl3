@@ -197,14 +197,37 @@ docs/exl3-mm31/patches/                          engine + plugin diffs, AGPL not
 README-upstream.md                               the original vllm-backport README
 ```
 
+## Credits
+
+Almost none of what runs here is ours. In rough order of how much this repo owes them:
+
+| project / people | what it provides | license |
+|---|---|---|
+| [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) — MiniMax | the model itself (official MXFP8 checkpoint), the DSpark speculative draft and the vision tower, copied verbatim into the packs | follow MiniMax's model terms |
+| **Mia-AiLab** — the EXL3 packs | `MiniMax-M3.1-Flash-EXL3-EAQ-v1` at 3.55 and 3.06 bpw: the trellis quantization of every body linear, the 8/6-bit `lm_head`, and the packing this engine is written against | derivative of the base model; same terms |
+| [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) — turboderp | the EXL3 format (`trellis`/`suh`/`svh`, `mul1` codebook, `out_scales`), the quantizer and the dequant/GEMM kernels everything decodes through | MIT / Apache-2.0 per the upstream project |
+| [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3) — vcruz305 | the vLLM EXL3 plugin: weight loading, MoE and linear methods, TP geometry. Our work there exists only as the diffs in `patches/` | **AGPL-3.0** |
+| [vllm-project/vllm](https://github.com/vllm-project/vllm) and its contributors | the engine everything else is a fork of — including the MiniMax-M3 model itself: block-sparse attention, the top-k indexer, the fused MoE and the multimodal preprocessor that this work builds on | Apache-2.0 |
+| [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) — lazymio | the backport this tree descends from: sm_86 support and the model bring-ups (DeepSeek-V4, Qwen3.8, GLM-5.3, MiMo) | Apache-2.0 |
+| [avtc/vllm-backport](https://github.com/avtc/vllm-backport) — avtc | the fork this branch is based on (`ced6985fd1`) | Apache-2.0 |
+
+And to the usual stack underneath all of it: PyTorch, Triton, FlashInfer, NCCL and CUDA.
+
+**What is ours** is narrow and specific: the six fixes in `docs/exl3-mm31/` (MoE K=3 kernel
+routing, the 128-aligned `lm_head` TP window, the view-returning TP shard loader, the DSpark
+drafter port with its MXFP8 dequant, the vision-tower and dummy-video corrections, the
+`<mm:think>` streaming parser), the measurements, and the runbook. If you reuse any of it,
+credit the projects above first.
+
 ## Scope and licensing
 
-- The engine changes here inherit **Apache-2.0** from vLLM and `avtc/vllm-backport`.
+- The engine changes here inherit **Apache-2.0** from vLLM, `wtdcode/vllm-backport` and
+  `avtc/vllm-backport`.
 - The diffs under `docs/exl3-mm31/patches/` that touch `vllm-exl3` are derivative works of
   an **AGPL-3.0** project and remain under that license; see
-  [`patches/NOTICE-plugin.md`](docs/exl3-mm31/patches/NOTICE-plugin.md). Credits to
-  [`vcruz305/vllm-exl3`](https://github.com/vcruz305/vllm-exl3) and
-  [`turboderp-org/exllamav3`](https://github.com/turboderp-org/exllamav3).
-- **No model weights are distributed here.** The packs are third-party artifacts.
+  [`patches/NOTICE-plugin.md`](docs/exl3-mm31/patches/NOTICE-plugin.md). The plugin source
+  itself is **not** vendored here — patch it in place.
+- **No model weights are distributed here.** The packs belong to their authors and carry the
+  base model's terms.
 - Hardware-specific by design: this was tuned on 10× RTX 3090 with PCIe only. Numbers on
-  other cards will differ, and the sm_86 kernel rebuild is required.
+  other cards will differ, and the sm_86 `exllamav3` rebuild is required.
