@@ -14,6 +14,8 @@ The MiniMax-M3-preview config selects a single set of branches:
 
 from collections.abc import Iterable
 
+import os as _os
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -109,6 +111,102 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
     if moe_layer_freq is None:
         return True
     return moe_layer_freq[layer_id] != 0
+
+
+# --- instrumentacao de depuracao (VLLM_M3_DEBUG=1; inerte quando desligada) ---
+_M3_DBG = _os.environ.get("VLLM_M3_DEBUG", "")
+_M3_DBG_MAX = int(_os.environ.get("VLLM_M3_DEBUG_MAX", "2"))
+_M3_DBG_N: dict[str, int] = {}
+
+
+def _m3_dbg(tag: str, t: torch.Tensor) -> None:
+    """Imprime estatisticas de um tensor (absmean/absmax/rms/nan) no stdout."""
+    if not _M3_DBG:
+        return
+    n = _M3_DBG_N.get(tag, 0)
+    if n >= _M3_DBG_MAX:
+        return
+    _M3_DBG_N[tag] = n + 1
+    try:
+        x = t.detach().float()
+        print(
+            f"[M3DBG] {tag} shape={tuple(t.shape)} dtype={t.dtype} "
+            f"absmean={x.abs().mean().item():.5g} "
+            f"absmax={x.abs().max().item():.5g} "
+            f"rms={x.pow(2).mean().sqrt().item():.5g} "
+            f"nan={int(torch.isnan(x).sum().item())}",
+            flush=True,
+        )
+    except Exception as exc:  # pragma: no cover - diagnostico
+        print(f"[M3DBG] {tag} falhou: {exc!r}", flush=True)
+
+
+# --- dump de tensores para comparacao com o oraculo (VLLM_M3_DUMP=<dir>) ---
+_M3_DUMP = _os.environ.get("VLLM_M3_DUMP", "")
+_M3_DUMP_MAXT = int(_os.environ.get("VLLM_M3_DUMP_MAXT", "64"))
+_M3_DUMP_T = int(_os.environ.get("VLLM_M3_DUMP_T", "0"))
+# Portao de armacao: os forwards de profiling do boot (batch de tokens
+# identicos) tem o mesmo T do request. O dump so vale depois que o arquivo
+# <dir>/ARM existe, entao o primeiro forward pequeno APOS o ARM e o request.
+_M3_ARM = _os.path.join(_M3_DUMP, "ARM") if _M3_DUMP else ""
+_M3_DUMPED: set[str] = set()
+_M3_DUMP_SKIP: set[str] = set()
+
+
+def _m3_dump(tag: str, t: torch.Tensor, force: bool = False) -> None:
+    """Salva um tensor [T, H] em <dir>/<tag>.npz (uma vez por tag por processo).
+
+    Filtro de chamada: com VLLM_M3_DUMP_T > 0 so grava T exato (o request real);
+    senao grava T <= VLLM_M3_DUMP_MAXT (exclui o profiling/warmup).
+    Tensores [T, 1, H] sao achatados; o primeiro shape visto por tag e logado.
+    """
+    if not _M3_DUMP:
+        return
+    if not _os.path.exists(_M3_ARM):
+        return
+    if t.dim() == 3 and t.shape[1] == 1:
+        t = t[:, 0, :]
+    if t.dim() != 2:
+        if tag not in _M3_DUMP_SKIP:
+            _M3_DUMP_SKIP.add(tag)
+            print(f"[M3DUMP-SKIP] {tag} dim={t.dim()} shape={tuple(t.shape)}", flush=True)
+        return
+    if force:
+        # `force` existe para os logits: o runner chama compute_logits com
+        # apenas o ultimo token ([1, vocab]), nao com o batch paddado.
+        ok = True
+    elif _M3_DUMP_T > 0:
+        ok = int(t.shape[0]) == _M3_DUMP_T
+    else:
+        ok = int(t.shape[0]) <= _M3_DUMP_MAXT
+    if tag not in _M3_DUMP_SKIP:
+        _M3_DUMP_SKIP.add(tag)
+        print(f"[M3DUMP-SHAPE] {tag} shape={tuple(t.shape)} dump={ok}", flush=True)
+    if not ok:
+        return
+    if tag in _M3_DUMPED:
+        return
+    _M3_DUMPED.add(tag)
+    try:
+        import numpy as np
+
+        arr = t.detach().float().cpu().numpy()
+        # Sufixo por rank: em TP>1 os dois ranks tem a mesma camada e
+        # escreveriam no mesmo arquivo (corrida, o comparador pegaria o ultimo).
+        rank = ""
+        try:
+            import torch.distributed as _td
+
+            if _td.is_available() and _td.is_initialized():
+                rank = f".r{_td.get_rank()}"
+        except Exception:
+            pass
+        path = _os.path.join(_M3_DUMP, tag.replace("/", "_") + rank + ".npz")
+        np.savez_compressed(path, x=arr)
+        print(f"[M3DUMP] {tag} {tuple(t.shape)} -> {path}", flush=True)
+    except Exception as exc:  # pragma: no cover - diagnostico
+        print(f"[M3DUMP] {tag} falhou: {exc!r}", flush=True)
+
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -498,8 +596,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         set_default_quant_scales(self, register_buffer=True)
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
         # cache (--attention-config '{"indexer_kv_dtype": ...}').
+        # Default follows the qkv dtype: the fused qk-norm/rope/kv-insert
+        # kernel stores index-K in the qkv dtype, so a bf16 side cache under an
+        # fp16 model trips its dtype check.
+        _idx_default = (
+            "fp16" if vllm_config.model_config.dtype == torch.float16 else "bf16"
+        )
         self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
-            "bf16"
+            _idx_default
         )
 
         # Shared top-k buffer: the indexer writes the selected blocks into it and
@@ -767,16 +871,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states = self.input_layernorm(hidden_states)
             else:
                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        _m3_dbg(f"L{self.layer_id:02d} normed_in", hidden_states)
+        _m3_dump(f"L{self.layer_id:02d}_normed_in", hidden_states)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        _m3_dbg(f"L{self.layer_id:02d} attn_out", hidden_states)
+        _m3_dump(f"L{self.layer_id:02d}_attn_out", hidden_states)
+        _m3_dbg(f"L{self.layer_id:02d} residual", residual)
+        _m3_dump(f"L{self.layer_id:02d}_residual", residual)
 
         hidden_states, residual = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, self.post_attention_layernorm
         )
+        _m3_dbg(f"L{self.layer_id:02d} ffn_in", hidden_states)
+        _m3_dump(f"L{self.layer_id:02d}_ffn_in", hidden_states)
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
+        _m3_dbg(f"L{self.layer_id:02d} ffn_out", hidden_states)
+        _m3_dump(f"L{self.layer_id:02d}_ffn_out", hidden_states)
         return hidden_states, residual
 
     @property
@@ -790,6 +904,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    # DSpark precisa dos estados de 5 camadas (3, 17, 31, 45, 59) e com PP=5
+    # eles nascem em estagios diferentes: cada estagio carrega os seus no
+    # IntermediateTensors (ver o patch local em forward()).
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -875,22 +993,36 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             else:
                 hidden_states = self.embed_input_ids(input_ids)
             residual = None
+            _m3_dump("embed", hidden_states)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        # EAGLE3 is not yet compatible with pipeline parallel
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        # Aux hidden states (DSpark/EAGLE3) sobre PP: os estagios anteriores
+        # mandam os seus pelo IntermediateTensors e cada estagio captura os
+        # seus com o indice GLOBAL da camada (idx+1 = "depois da camada idx").
+        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
+        local_aux: list[torch.Tensor] = self._maybe_add_hidden_state(
+            [], 0, hidden_states, residual
+        )
+        for idx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer],
+            start=self.start_layer,
+        ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                local_aux, idx + 1, hidden_states, residual
             )
+        aux_hidden_states = list(remote_aux) + list(local_aux)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                {
+                    "hidden_states": hidden_states,
+                    "residual": residual,
+                    **self.pack_local_aux_hidden_states(local_aux),
+                }
             )
 
         if self.fuse_final_norm_allreduce:
@@ -899,6 +1031,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             )
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
+        _m3_dump("final_normed", hidden_states)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
@@ -1057,7 +1190,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        out = self.logits_processor(self.lm_head, hidden_states)
+        if _M3_DUMP:
+            try:
+                _m3_dump(
+                    "logits_local",
+                    self.logits_processor(self.lm_head, hidden_states, skip_gather=True),
+                    force=True,
+                )
+            except Exception as exc:  # pragma: no cover - diagnostico
+                print(f"[M3DUMP] logits_local falhou: {exc!r}", flush=True)
+        return out
 
     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
@@ -1133,7 +1276,14 @@ class MiniMaxM3SparseForConditionalGeneration(
                 config=PretrainedConfig.from_dict(vision_config),
                 text_hidden_size=text_hidden_size,
                 projector_hidden_size=projector_hidden_size,
-                quant_config=self.quant_config,
+                # The vision tower is stored bf16 in the checkpoint: the EXL3
+                # quantization_config lists no vision_tower/visual/projector
+                # key at all. Handing it the global quant_config made the
+                # plugin claim these Linears and read bf16 weights as trellis,
+                # failing at load with "EXL3 linear shard 0: neither mcg nor
+                # mul1 marker is set" (only visible once --language-model-only
+                # is dropped and the tower is actually built).
+                quant_config=None,
                 prefix=maybe_prefix(prefix, "vision_tower"),
             )
 

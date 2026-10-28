@@ -1260,6 +1260,14 @@ class SpeculativeConfig:
                 draft_hf_overrides: HfOverrides
                 if self.method == "medusa":
                     draft_hf_overrides = {"model_type": "medusa"}
+                elif self.method == "dspark":
+                    # DSpark drafts are drafter checkpoints with their own
+                    # config, not MTP modules of the target. The base target
+                    # override rewrites MiniMax-M3 VL configs into their MTP
+                    # architecture, and a DSpark drafter of M3 shares
+                    # model_type "minimax_m3_vl" -- applying it would replace
+                    # the drafter's architectures with MiniMaxM3MTP.
+                    draft_hf_overrides = {}
                 else:
                     # Compose any callable hf_overrides set on the target so the
                     # draft config receives the same transform (e.g. the test
@@ -1416,6 +1424,8 @@ class SpeculativeConfig:
                     not in self.draft_model_config.architectures
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
+                    and "DSparkMiniMaxDraftModel"
+                    not in self.draft_model_config.architectures
                 ):
                     # DeepSeek-V4(.1) DSpark reuses the full target config
                     # and its weights ship in the target checkpoint.
@@ -1459,6 +1469,19 @@ class SpeculativeConfig:
                     ):
                         hf.n_predict = hf.block_size
 
+                if (
+                    self.method == "dspark"
+                    and "DSparkMiniMaxDraftModel"
+                    in self.draft_model_config.architectures
+                ):
+                    # O drafter do M3 e' um punhado de lineares em MXFP8 que a
+                    # implementacao (vllm/models/minimax_m3/nvidia/dflash.py)
+                    # desquantiza na carga: o MXFP8 do backport so aceita
+                    # ativacoes bf16 e o motor roda fp16. Declarar a
+                    # quantizacao do checkpoint aqui quebraria o boot antes de
+                    # chegar no loader.
+                    self.draft_model_config.quantization = None
+
                 if self.method in ("dflash", "dspark"):
                     self.parallel_drafting = True
 
@@ -1472,6 +1495,11 @@ class SpeculativeConfig:
                 n_predict = getattr(
                     self.draft_model_config.hf_config, "n_predict", None
                 )
+                if n_predict is not None and int(n_predict) <= 0:
+                    # LOCAL (MiniMax-M3.1 DSpark): o hf_config do drafter traz
+                    # n_predict=0 (num_nextn_predict_layers=0), e o `%` abaixo
+                    # estourava ZeroDivisionError. 0 = "nao definido".
+                    n_predict = None
                 if n_predict is not None:
                     if self.num_speculative_tokens is None:
                         # Default to max value defined in draft model config.

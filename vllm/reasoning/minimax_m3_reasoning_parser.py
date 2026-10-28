@@ -311,10 +311,27 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
         return count
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
-        start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)
-        end_index = self._rfind_token_sequence(input_ids, self._end_token_ids)
-        if end_index < 0:
-            return False
-        if start_index < 0:
-            return True
-        return end_index > start_index
+        # This is called with the PROMPT ids to decide whether the first
+        # generated token already belongs to the answer. Only what the chat
+        # template prefills at the END of the prompt matters: ``</mm:think>``
+        # when thinking is disabled, ``<mm:think>`` when it is enabled, nothing
+        # in adaptive mode.
+        #
+        # Scanning the whole prompt for the marker pair does not work here: the
+        # template's <thinking_instructions> block writes both tags literally
+        # ("...wrap your reasoning in <mm:think></mm:think> tags..."), so the
+        # first pair found is that empty block and the prompt looks like it
+        # already closed reasoning. Streaming then routes the model's own
+        # <mm:think> block into ``content`` (non-streaming is unaffected, it
+        # only inspects the output).
+        ids = list(input_ids)
+        for marker_ids, ended in (
+            (self._end_token_ids, True),
+            (self._start_token_ids, False),
+        ):
+            if marker_ids and len(ids) >= len(marker_ids):
+                if tuple(ids[-len(marker_ids) :]) == marker_ids:
+                    return ended
+        # No prefill: the model emits its own markers, so the streaming parser
+        # decides position by position.
+        return False

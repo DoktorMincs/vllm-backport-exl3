@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import time
 from collections.abc import Mapping
 from typing import Any
 
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -39,6 +41,12 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+
+        # Diagnostico de tempo do passo de draft (VLLM_M3_TIME_DRAFT=1).
+        self._dbg_t0: float | None = None
+        self._dbg_t_ctx: float = 0.0
+        self._dbg_step: int = 0
+        self._dbg_acc: list[float] = [0.0, 0.0, 0.0]
 
         self.hidden_states = torch.zeros(
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
@@ -259,6 +267,33 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         return last_hidden_states
 
+    def _debug_aux(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+        num_target_tokens: int,
+    ) -> None:
+        """Diagnostico pontual da entrada do drafter (VLLM_M3_DEBUG_DRAFT=1).
+
+        Aceitacao 0 com o alvo coerente quase sempre e' entrada errada, nao
+        peso ruim: este log separa "veio o aux ou caiu no last_hidden_states"
+        e mostra se o estado combinado tem escala absurda (norma errada,
+        ordem dos aux trocada, fc com peso nao carregado).
+        """
+        n = min(num_target_tokens, 8)
+        x = hidden_states[:n].float()
+        logger.info(
+            "M3-DEBUG draft input: aux=%s n_aux=%s ctx_tokens=%d "
+            "absmax=%.3f mean=%.5f std=%.3f first=%s",
+            aux_hidden_states is not None,
+            None if aux_hidden_states is None else len(aux_hidden_states),
+            num_target_tokens,
+            x.abs().max().item(),
+            x.mean().item(),
+            x.std().item(),
+            x[0, :6].tolist(),
+        )
+
     def _generate_draft(
         self,
         num_reqs: int,
@@ -365,6 +400,8 @@ class DFlashSpeculator(DraftModelSpeculator):
             )
         else:
             hidden_states = last_hidden_states
+        if envs.VLLM_M3_DEBUG_DRAFT and not dummy_run:
+            self._debug_aux(hidden_states, aux_hidden_states, num_target_tokens)
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -437,11 +474,19 @@ class DFlashSpeculator(DraftModelSpeculator):
             ]
         else:
             context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        self._dbg_t0 = None
+        if envs.VLLM_M3_TIME_DRAFT:
+            torch.cuda.synchronize()
+            self._dbg_t0 = time.perf_counter()
         self.model.precompute_and_store_context_kv(
             self.hidden_states[:num_target_tokens],
             self.context_positions[:num_target_tokens],
             context_slots,
         )
+        if self._dbg_t0 is not None:
+            torch.cuda.synchronize()
+            self._dbg_t_ctx = time.perf_counter() - self._dbg_t0
+            self._dbg_t0 = time.perf_counter()
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
@@ -496,6 +541,26 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
+
+        if self._dbg_t0 is not None:
+            torch.cuda.synchronize()
+            t_draft = time.perf_counter() - self._dbg_t0
+            self._dbg_step += 1
+            self._dbg_acc[0] += self._dbg_t_ctx
+            self._dbg_acc[1] += t_draft
+            self._dbg_acc[2] += num_target_tokens
+            if self._dbg_step % 10 == 0:
+                n = self._dbg_step
+                logger.info(
+                    "M3-TIME draft (sync, %d passos): ctx=%.2f ms (%s tok) "
+                    "draft=%.2f ms total_propose=%.2f ms",
+                    n,
+                    1000 * self._dbg_acc[0] / n,
+                    self._dbg_acc[2] / n,
+                    1000 * self._dbg_acc[1] / n,
+                    1000 * (self._dbg_acc[0] + self._dbg_acc[1]) / n,
+                )
+                self._dbg_acc = [0.0, 0.0, 0.0]
 
         return self.draft_tokens[:num_reqs]
 

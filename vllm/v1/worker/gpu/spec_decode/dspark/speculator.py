@@ -25,6 +25,8 @@ backbone forward AND the sequential Markov sampling.
 
 from typing import Any
 
+import time
+
 import torch
 from torch.profiler import record_function
 
@@ -95,6 +97,8 @@ class DSparkSpeculator(DFlashSpeculator):
         # Fused Markov chain (greedy vocab-sharded path only); built in
         # load_draft_model once the head's weights and shard geometry exist.
         self._fused_markov: FusedMarkovSampler | None = None
+        # Diagnostico de tempo (VLLM_M3_TIME_DRAFT=1): [logits, markov, passos].
+        self._t_dbg: list[float] = [0.0, 0.0, 0.0]
 
     def load_draft_model(
         self,
@@ -217,12 +221,32 @@ class DSparkSpeculator(DFlashSpeculator):
         # only, so `vocab_size` below is the shard width -- nothing in this
         # method reads it as a vocab id.
         with record_function("dspark::draft_logits"):
+            _t0 = None
+            if envs.VLLM_M3_TIME_DRAFT and not torch.cuda.is_current_stream_capturing():
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
             if self.use_local_argmax_reduction:
                 base_logits = self.model.compute_draft_logits_shard(sample_hidden)
             else:
                 base_logits = self.model.compute_draft_logits(sample_hidden)
+            if _t0 is not None:
+                torch.cuda.synchronize()
+                self._t_dbg[0] += time.perf_counter() - _t0
+                _t0 = time.perf_counter()
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
+        if envs.VLLM_M3_DEBUG_DRAFT and not getattr(self, "_dbg_done", False):
+            self._dbg_done = True
+            l0 = base_logits[0].float()
+            logger.info(
+                "M3-DEBUG draft logits: shape=%s absmax=%.3f mean=%.4f "
+                "argmax_per_step=%s anchor_id=%s",
+                tuple(base_logits.shape),
+                l0.abs().max().item(),
+                l0.mean().item(),
+                l0.argmax(dim=-1).tolist(),
+                self.input_buffers.input_ids[self._anchor_idx[:1]].tolist(),
+            )
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
@@ -237,6 +261,8 @@ class DSparkSpeculator(DFlashSpeculator):
             # three [num_reqs, shard_width] round trips collapsed into one
             # pass over markov_w2. Writes draft_tokens directly.
             self._fused_markov.sample(num_reqs, base_logits, prev, self.draft_tokens)
+            if _t0 is not None:
+                self._dbg_markov_time(_t0)
             return
 
         for i in range(n_spec):
@@ -270,6 +296,25 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
                 num_reqs, n_spec
             )
+        if _t0 is not None:
+            self._dbg_markov_time(_t0)
+
+    def _dbg_markov_time(self, t_markov_start: float) -> None:
+        """Acumula o tempo da cadeia Markov e loga a cada 10 passos."""
+        torch.cuda.synchronize()
+        self._t_dbg[1] += time.perf_counter() - t_markov_start
+        self._t_dbg[2] += 1
+        if self._t_dbg[2] % 10 == 0:
+            n = self._t_dbg[2]
+            logger.info(
+                "M3-TIME draft detail (sync, %d passos): logits_lm_head=%.2f ms "
+                "markov=%.2f ms",
+                n,
+                1000 * self._t_dbg[0] / n,
+                1000 * self._t_dbg[1] / n,
+            )
+            self._t_dbg[0] = 0.0
+            self._t_dbg[1] = 0.0
 
     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         """Apply the sequential Markov head only to top-k base-logit candidates.

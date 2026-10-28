@@ -328,6 +328,8 @@ if TYPE_CHECKING:
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
     VLLM_DSPARK_FUSED_MARKOV: bool = True
+    VLLM_M3_DEBUG_DRAFT: bool = False
+    VLLM_M3_TIME_DRAFT: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2300,6 +2302,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to 0 to fall back to the eager op chain.
     "VLLM_DSPARK_FUSED_MARKOV": lambda: (
         os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
+    ),
+    "VLLM_M3_DEBUG_DRAFT": lambda: (
+        os.environ.get("VLLM_M3_DEBUG_DRAFT", "0") == "1"
+    ),
+    "VLLM_M3_TIME_DRAFT": lambda: (
+        os.environ.get("VLLM_M3_TIME_DRAFT", "0") == "1"
     ),
     # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
     # the batch-adaptive heuristic, which picks splits from the query count and

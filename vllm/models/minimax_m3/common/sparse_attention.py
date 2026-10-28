@@ -61,6 +61,35 @@ from vllm.v1.kv_cache_interface import (
 
 logger = init_logger(__name__)
 
+# --- instrumentacao de depuracao (VLLM_M3_DEBUG_ATTN=1; inerte quando off) ---
+import os as _os
+
+_M3_ATTN_DBG = _os.environ.get("VLLM_M3_DEBUG_ATTN", "")
+_M3_ATTN_DBG_N = 0
+
+
+def _m3_attn_dbg(tag: str, topk, block_table, seq_lens) -> None:
+    """Dumpa o top-k de blocos do indexer (ids) e o block_table do prefill."""
+    global _M3_ATTN_DBG_N
+    if _M3_ATTN_DBG_N >= 4:
+        return
+    _M3_ATTN_DBG_N += 1
+    try:
+        print(f"[M3ATTN] {tag} topk.shape={tuple(topk.shape)} "
+              f"dtype={topk.dtype}", flush=True)
+        if seq_lens is not None:
+            print(f"[M3ATTN]   seq_lens={seq_lens[:8].tolist()}", flush=True)
+        if block_table is not None:
+            print(f"[M3ATTN]   block_table[0][:20]="
+                  f"{block_table[0][:20].tolist()}", flush=True)
+        t = topk[:1, :4, :].to(torch.int32)
+        print(f"[M3ATTN]   topk[h0, tok0..3, :]={t.tolist()}", flush=True)
+        print(f"[M3ATTN]   topk min/max={int(topk.min())}/{int(topk.max())}",
+              flush=True)
+    except Exception as exc:  # pragma: no cover - diagnostico
+        print(f"[M3ATTN] dump falhou: {exc!r}", flush=True)
+
+
 
 def _minimax_m3_aiter_sparse_pa_requested() -> bool:
     return rocm_aiter_ops.is_enabled() and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
@@ -469,6 +498,12 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
             else topk_buffer[:num_tokens].transpose(0, 1)
         )
         assert topk is not None
+        if _M3_ATTN_DBG:
+            _m3_attn_dbg(tag=f"nd={nd} q={num_tokens}", topk=topk,
+                         block_table=main_md.prefill.block_table
+                         if main_md.num_prefills > 0 else None,
+                         seq_lens=main_md.prefill.seq_lens
+                         if main_md.num_prefills > 0 else None)
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)

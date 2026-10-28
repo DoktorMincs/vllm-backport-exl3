@@ -1,0 +1,490 @@
+diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
+index d2be348..b3bafdb 100644
+--- a/src/vllm_exl3/exl3.py
++++ b/src/vllm_exl3/exl3.py
+@@ -1456,13 +1456,27 @@ def _narrow_tp(
+                 "block; unset VLLM_EXL3_MOE_TP_ALIGN or use an expert-parallel build"
+             )
+         off, length = aligned_tp_split(size * unit, tp_rank, tp_size, align)
+-        return tensor.narrow(dim, off // unit, length // unit).contiguous()
+-    if size % tp_size:
+-        raise ValueError(
+-            f"EXL3 TP shard: dim {dim} size {size} is not divisible by tp={tp_size}"
+-        )
+-    chunk = size // tp_size
+-    return tensor.narrow(dim, chunk * tp_rank, chunk).contiguous()
++        shard = tensor.narrow(dim, off // unit, length // unit)
++    else:
++        if size % tp_size:
++            raise ValueError(
++                f"EXL3 TP shard: dim {dim} size {size} is not divisible by tp={tp_size}"
++            )
++        chunk = size // tp_size
++        shard = tensor.narrow(dim, chunk * tp_rank, chunk)
++    # NO-COPY LOCAL (27/10): este narrow era seguido de .contiguous(), que
++    # materializa uma copia anonima por tensor. No MoE o staging do trellis
++    # fica vivo ate' o process_weights_after_loading (fim do load), entao em
++    # TP>1 isso virava ~1,3 GiB ANON por camada por rank x 10 ranks = ~150 GiB
++    # de RAM do host -> OOM-killer (boot tp2pp5-coop2, 27/10 08:53). Em TP=1
++    # _narrow_tp nao toca em nada e o staging e' uma view do mmap (page cache,
++    # reclamavel) — por isso o TP=1 nunca sofreu. Devolver a view mantem o
++    # staging no page cache; quem precisar de contiguidade copia por expert,
++    # transitoriamente (_pack_trellis_arenas ja' faz isso).
++    # EXL3_TP_COPY_SHARD=1 restaura o comportamento antigo.
++    if os.environ.get("EXL3_TP_COPY_SHARD", "0") == "1":
++        return shard.contiguous()
++    return shard
+ 
+ 
+ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
+@@ -1487,6 +1501,28 @@ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
+     return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
+ 
+ 
++def _exl3_pad_to(tensor: torch.Tensor, want: tuple[int, ...]) -> torch.Tensor:
++    """Grow ``tensor`` with zeros up to ``want`` along each differing dim.
++
++    Padded-geometry loader helper (TP>1 LOCAL, 27/10): a rank holds the true
++    width of its checkpoint slice (lm_head 200064/2 = 100032) while the
++    destination is 128-aligned (100096). The extra columns keep svh = 0, so
++    their outputs are zero and the apply-side trim (``_exl3_linear_true_out``)
++    drops them.
++    """
++    have = tuple(int(x) for x in tensor.shape)
++    want = tuple(int(x) for x in want)
++    if have == want:
++        return tensor
++    if len(have) != len(want) or any(h > w for h, w in zip(have, want)):
++        raise RuntimeError(
++            f"EXL3 padded load: cannot grow {have} to {want}"
++        )
++    buf = tensor.new_zeros(want)
++    buf[tuple(slice(0, h) for h in have)] = tensor
++    return buf
++
++
+ def shard_exl3_col(
+     loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int, aligned: bool = False
+ ) -> torch.Tensor:
+@@ -1790,6 +1826,25 @@ def _hf_config_is_minimax_m3(hf_config: Any) -> bool:
+     )
+ 
+ 
++def _minimax_m3_pack_requested() -> bool:
++    """Architecture marker OR explicit opt-in env (VLLM_EXL3_MINIMAX_M3=1).
++
++    The process-global marker is only set where vLLM runs
++    ``override_quantization_method`` (the engine/frontend process, from
++    ``ModelConfig.__post_init__``). Model loading -- and therefore
++    ``Exl3Config.from_config`` -- happens in the worker processes, which
++    receive the already-built config and never call the override hook. The
++    env flag makes the coverage derivation deterministic in every process.
++    """
++    if _MINIMAX_M3_PACK_REQUESTED:
++        return True
++    return os.environ.get("VLLM_EXL3_MINIMAX_M3", "0").strip().lower() in (
++        "1",
++        "true",
++        "yes",
++    )
++
++
+ def minimax_pack_detected(cfg: "Exl3Config") -> bool:
+     """Whether this Exl3Config serves the MiniMax-M3 sparse-attention pack.
+ 
+@@ -1798,7 +1853,7 @@ def minimax_pack_detected(cfg: "Exl3Config") -> bool:
+     override_quantization_method marker (set from vLLM's hf_config) plus the
+     derived non-routed coverage.
+     """
+-    if _MINIMAX_M3_PACK_REQUESTED:
++    if _minimax_m3_pack_requested():
+         return True
+     layers = getattr(getattr(cfg, "non_routed_exl3", None), "layers", {}) or {}
+     modules = getattr(getattr(cfg, "non_routed_exl3", None), "modules", []) or []
+@@ -3294,6 +3349,18 @@ def apply_exl3_fused_moe(
+         return out
+ 
+     fat_possible = (not _capturing) and (tokens > FAT_EXPERT_THRESHOLD)
++    if fat_possible and os.environ.get("VLLM_EXL3_FAT_K4_ONLY", "1") != "0":
++        # PATCH LOCAL 27/10: o tier fat so' e' rapido onde o kernel nativo
++        # `exl3_fat_gemm` roda, e ele exige up-K == 4 com codebook MCG (ver o
++        # gate em apply_exl3_batched_fat). Em K=3 o mesmo dispatch cai no
++        # `reconstruct` do peso INTEIRO por expert e por chunk: medido, um
++        # prefill de 2k que levava 1,9 s passou de 12 min sem terminar (GPUs a
++        # 100%, ~140x mais lento). Ou seja: em K3 o fat e' correto e inviavel.
++        # Restringindo as camadas de K4 uniforme (L3-16 e L46-59 = 28 das 57
++        # camadas MoE) o kernel rapido volta a ser usado.
++        _kt = getattr(layer, "_exl3_k_tuple", None)
++        _ku = int(_kt[1]) if _kt is not None else int(getattr(layer, "_exl3_k", 4) or 4)
++        fat_possible = _ku == 4
+     fat_route = torch.zeros_like(local, dtype=torch.bool)
+     if fat_possible:
+         fat = counts > FAT_EXPERT_THRESHOLD
+@@ -3676,6 +3743,16 @@ def apply_exl3_experts(
+     if fused is True and not have_ptrs:
+         raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
+     use_fused = (fused_moe_enabled() if fused is None else bool(fused)) and have_ptrs
++    # A/B LOCAL: EXL3_UNIFORM_LOOP=1 manda SO' as camadas de K uniforme pelo
++    # loop Python por expert (LinearEXL3, o caminho de referencia). A flag
++    # EXL3_FUSED_MOE=0 nao serve para isso: ela tambem desligaria o mixed-K da
++    # L17, que cairia em apply_mixed_reference sem store (AttributeError).
++    if (
++        use_fused
++        and os.environ.get("EXL3_UNIFORM_LOOP", "0") == "1"
++        and not getattr(layer, "_exl3_mixedk_unified", False)
++    ):
++        use_fused = False
+     if use_fused:
+         try:
+             import exllamav3_ext
+@@ -3716,6 +3793,29 @@ def _exl3_pad128(n: int) -> int:
+     return (int(n) + 127) // 128 * 128
+ 
+ 
++def _exl3_pad_col_window(
++    true_out: int, tp_rank: int, tp_size: int, block: int = 128
++) -> tuple[int, int, int]:
++    """``(offset, lead, width)`` da janela 128-alinhada do rank, em colunas.
++
++    O EXL3 aplica a Hadamard de saída em blocos de 128 colunas, então o corte
++    do TP não pode cair no meio de um bloco — se cair, o shard inteiro é
++    decodificado contra a transformada errada (ver `_moe_tp_align`, usado nos
++    experts roteados). Isso vale igual para o lm_head: 200064/2 = 100032 não é
++    múltiplo de 128, e sem alinhar o rank 1 sai lixo (medido 27/10: cos -0,50
++    contra o oráculo, top-1 cravado em 'etim').
++
++    A janela começa no bloco que contém a fatia do rank, tem largura múltipla
++    de 128 e cobre a fatia inteira; ``lead`` é quantas colunas da janela
++    pertencem ao rank anterior e precisam ser descartadas na saída.
++    """
++    start = int(tp_rank) * int(true_out)
++    off = (start // block) * block
++    lead = start - off
++    width = ((lead + int(true_out) + block - 1) // block) * block
++    return off, lead, width
++
++
+ def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
+     """Module-path suffix match: "self_attn.o_proj" matches
+     "model.layers.3.self_attn.o_proj" but not "...cross_attn.o_proj_x"."""
+@@ -4061,7 +4161,7 @@ class Exl3Config(QuantizationConfig):
+         # MiniMax-M3 pack: no ledger anywhere (the public card is only
+         # {quant_method: exl3, version: 0.0.2}); the coverage comes from the
+         # architecture via the override_quantization_method marker instead.
+-        if not inst.non_routed_exl3 and _MINIMAX_M3_PACK_REQUESTED:
++        if not inst.non_routed_exl3 and _minimax_m3_pack_requested():
+             derived = _derive_minimax_non_routed_coverage()
+             inst.non_routed_exl3 = derived
+             logger.info(
+@@ -4303,6 +4403,41 @@ def _check_moe_codebook_markers(mcg: torch.Tensor, mul1: torch.Tensor, what: str
+         )
+ 
+ 
++# --- debug: dump do roteamento por camada (VLLM_EXL3_DUMP_ROUTE=<dir>) ------
++# Compara topk_ids/topk_weights do vLLM com o route_out do oraculo ref.py.
++# Mesmo portao do dump de tensores: so vale depois que <dir>/ARM existe, para
++# nao capturar os forwards de profiling do boot (batch de tokens identicos).
++_ROUTE_DIR = os.environ.get("VLLM_EXL3_DUMP_ROUTE", "")
++_ROUTE_DUMPED: set[str] = set()
++
++
++def _dump_route(layer, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
++                x: torch.Tensor) -> None:
++    if not _ROUTE_DIR:
++        return
++    if not os.path.exists(os.path.join(_ROUTE_DIR, "ARM")):
++        return
++    T = int(x.shape[0]) if x.dim() >= 1 else -1
++    if T > 16:
++        return
++    prefix = str(getattr(layer, "prefix", None) or getattr(layer, "layer_name", "?"))
++    key = prefix.replace("/", "_")
++    if key in _ROUTE_DUMPED:
++        return
++    _ROUTE_DUMPED.add(key)
++    try:
++        import numpy as np
++
++        ids = topk_ids.detach().to("cpu", dtype=torch.int64).numpy()
++        wts = topk_weights.detach().to("cpu", dtype=torch.float32).numpy()
++        np.savez(os.path.join(_ROUTE_DIR, key + ".npz"), ids=ids, weights=wts,
++                 T=np.array([T]))
++        print(f"[EXL3ROUTE] {prefix} T={T} ids[0]={ids[0].tolist()} "
++              f"w[0]={[round(float(v), 5) for v in wts[0]]}", flush=True)
++    except Exception as exc:  # pragma: no cover - diagnostico
++        print(f"[EXL3ROUTE] {prefix} falhou: {exc!r}", flush=True)
++
++
+ class Exl3MoEMethod(FusedMoEMethodBase):
+     """Packed MCG trellis experts: create/load packed tensors, LinearEXL3 apply."""
+ 
+@@ -4724,7 +4859,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                     staged = staged.cpu()
+                 if staged.dtype != torch.int16:
+                     staged = staged.to(dtype=torch.int16)
+-                if not staged.is_contiguous():
++                # NO-COPY LOCAL (27/10): NAO forcar contiguidade aqui. Em TP>1 o
++                # shard ja' vem estreitado por _narrow_tp; copiar para deixar
++                # contiguo aloca RAM anonima por camada, e a staging vive ate'
++                # o fim do load -> OOM do host (ver _narrow_tp). O
++                # _pack_trellis_arenas aceita fonte nao-contigua e copia um
++                # expert por vez. EXL3_TP_COPY_SHARD=1 restaura o antigo.
++                if not staged.is_contiguous() and os.environ.get(
++                    "EXL3_TP_COPY_SHARD", "0"
++                ) == "1":
+                     staged = staged.contiguous()
+                 if _exl3_mem_waterfall_enabled():
+                     _exl3_mem_snapshot("AFTER_READ", owner_mod)
+@@ -4993,6 +5136,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             )
+         layer._exl3_inners = inners
+         mixed_k = len(set(k_values)) > 1
++        # A/B LOCAL: EXL3_FORCE_MIXEDK=1 manda tambem as camadas de K uniforme
++        # pelo kernel mixedk (K por expert). Motivo (27/10): o kernel uniforme
++        # `exl3_moe` bate no K=4 (L3..16) mas produz saida errada no K=3
++        # (L18..45; ffn_out com cos 0.32 partindo de um ffn_in que bate a 4e-4).
++        # O mixedk trata K=3 corretamente (o w2 da L17 e' K3 e bate). A copia
++        # coop (decode) tambem e' desviada, porque compartilha o mesmo caminho
++        # uniforme de K escalar.
++        if not mixed_k and os.environ.get("EXL3_FORCE_MIXEDK", "0") == "1":
++            mixed_k = True
+         layer._exl3_mixed_k = mixed_k
+         k_tuples = {
+             (
+@@ -5009,6 +5161,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         else:
+             layer._exl3_k_tuple = None
+             layer._exl3_coop_compat = False
++        if os.environ.get("EXL3_FORCE_MIXEDK", "0") == "1" and os.environ.get(
++            "EXL3_FORCED_MIXEDK_COOP", "0"
++        ) != "1":
++            # A/B LOCAL: layer uniforme forcado ao mixedk nao pode cair na
++            # copia coop de decode (mesmo caminho de K escalar, errado no K=3).
++            # EXL3_FORCED_MIXEDK_COOP=1 religa o coop SO' no formato de decode
++            # (tokens*topk <= 256): o prefill continua no mixedk e o decode usa
++            # o kernel cooperativo, que e' outro kernel (exl3_moe_coop), nao o
++            # `exl3_moe` uniforme defeituoso. Validar a saida do decode antes
++            # de confiar (prefix_consistency.py).
++            layer._exl3_coop_compat = False
+         # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
+         # every expert in a layer must agree. Gateless layers have no gate
+         # projection: the up module's flags stand in for the gate slots (the
+@@ -5139,6 +5302,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         # act 3) and beta (must be None/1.0) and returns the clamp limit.
+         _alpha, limit = resolve_moe_gate_params(self._gate_param_source(layer))
+         del _alpha
++        _dump_route(layer, topk_ids, topk_weights, x)
+         return apply_exl3_experts(
+             x, topk_ids, topk_weights, layer, limit=limit
+         )
+@@ -5898,10 +6062,24 @@ class Exl3LinearMethod(LinearMethodBase):
+         indexer_shards = self._indexer_shards(layer, n_shards)
+         if indexer_shards:
+             _, tp_size = _resolve_tp_geometry(layer)
+-            if tp_size > 1:
++            # TP>1 LOCAL (27/10): a guarda original recusa TP>1 para as shards
++            # do indexer. Nos pacotes em que index_q/index_k ja' vem fp16/bf16
++            # (como o M3.1 daqui), elas nao usam o staging MXFP8: caem no
++            # caminho generico de bf16 que ja' e' ciente de TP (shard_tp_size /
++            # shard_tp_rank por shard, com index_k replicado). A flag deixa
++            # testar TP>1 sem mudar o comportamento padrao.
++            if tp_size > 1 and os.environ.get("EXL3_ALLOW_TP_INDEXER", "0") != "1":
+                 raise RuntimeError(
+                     "EXL3 MiniMax indexer shards are not supported with "
+-                    f"TP size > 1; tp_size={tp_size}"
++                    f"TP size > 1; tp_size={tp_size} "
++                    "(set EXL3_ALLOW_TP_INDEXER=1 for native fp16/bf16 indexer packs)"
++                )
++            if tp_size > 1:
++                getattr(logger, "info_once", logger.info)(
++                    "EXL3: TP=%d with MiniMax indexer shards allowed by "
++                    "EXL3_ALLOW_TP_INDEXER=1 (index_q column-sharded, index_k "
++                    "replicated)",
++                    tp_size,
+                 )
+         # Unified BF16-staging shard list: config bf16 shards plus the
+         # dequantized indexer shards, in ascending order (the apply-side row
+@@ -5924,17 +6102,34 @@ class Exl3LinearMethod(LinearMethodBase):
+         in_per_partition = _exl3_pad128(true_in)
+         output_partition_sizes = [_exl3_pad128(s) for s in true_out_sizes]
+         padded = in_per_partition != true_in or output_partition_sizes != true_out_sizes
++        # Janela 128-alinhada por rank (a Hadamard de saida e' em blocos de 128:
++        # cortar o TP no meio do bloco decodifica o shard inteiro errado).
++        pad_window = None
++        pad_lead = [0] * n_shards
++        if padded and not is_row_parallel and n_shards == 1:
++            _tpr, _tpw = _resolve_tp_geometry(layer)
++            if _tpw > 1 and true_out_sizes[0] % 128:
++                off, lead, width = _exl3_pad_col_window(true_out_sizes[0], _tpr, _tpw)
++                pad_window = (off, lead, width)
++                pad_lead = [lead]
++                output_partition_sizes = [width]
++                logger.info(
++                    "EXL3 padded col TP: rank %d/%d out %d -> janela [%d, %d) lead=%d",
++                    _tpr, _tpw, true_out_sizes[0], off, off + width, lead,
++                )
+         if padded and (bf16_shards or n_shards > 1):
+             raise NotImplementedError(
+                 "EXL3 padded linear geometry is supported for single-shard layers "
+                 f"without bf16 shards only: in={true_in} out={true_out_sizes}"
+             )
+         if padded:
+-            _, _pad_tp = _resolve_tp_geometry(layer)
+-            if int(_pad_tp) > 1:
+-                raise NotImplementedError(
+-                    "EXL3 padded linear geometry requires tensor parallel size 1"
+-                )
++            # TP>1 LOCAL (27/10): a geometria com padding era recusada em TP>1.
++            # O que faltava era o loader: cada rank recebe a fatia real do
++            # checkpoint (ex.: lm_head 200064 / tp2 = 100032) e precisa
++            # completa-la com zeros ate' a largura 128-alinhada (100096), com
++            # svh = 0 nas colunas de padding (o apply ja' corta a saida em
++            # _exl3_linear_true_out). Ver o bloco de copia em
++            # _make_weight_loader.
+             # vLLM registers the bias after create_weights with this instance's
+             # weight_loader; a padded checkpoint bias is trimmed to the true size.
+             _orig_loader = layer.weight_loader
+@@ -6073,6 +6268,8 @@ class Exl3LinearMethod(LinearMethodBase):
+         layer._exl3_linear_is_merged = is_merged_col_parallel
+         layer._exl3_linear_bf16_shards = bf16_shards
+         layer._exl3_linear_padded = padded
++        layer._exl3_linear_pad_window = pad_window
++        layer._exl3_linear_pad_lead = pad_lead
+         layer._exl3_linear_true_in = true_in
+         layer._exl3_linear_true_out = true_out_sizes
+ 
+@@ -6191,14 +6388,24 @@ class Exl3LinearMethod(LinearMethodBase):
+                         f"EXL3 indexer shard {shard_idx} payload arrived via "
+                         f"suffix {suffix!r}, expected 'weight'"
+                     )
+-                slot = indexer_shards.index(shard_idx)
+-                payload = loaded_weight.detach().contiguous()
+-                if layer._exl3_indexer_payloads[slot] is not None:
+-                    raise RuntimeError(
+-                        f"EXL3 indexer shard {shard_idx} payload loaded twice"
+-                    )
+-                layer._exl3_indexer_payloads[slot] = payload
+-                return
++                # Packs that keep the indexer natively in BF16/FP16 carry no
++                # MXFP8 payload/scales: load such tensors straight into the
++                # BF16 staging rows, exactly like any other bf16 shard.
++                if loaded_weight.dtype in (
++                    torch.float16,
++                    torch.bfloat16,
++                    torch.float32,
++                ):
++                    pass
++                else:
++                    slot = indexer_shards.index(shard_idx)
++                    payload = loaded_weight.detach().contiguous()
++                    if layer._exl3_indexer_payloads[slot] is not None:
++                        raise RuntimeError(
++                            f"EXL3 indexer shard {shard_idx} payload loaded twice"
++                        )
++                    layer._exl3_indexer_payloads[slot] = payload
++                    return
+ 
+             # Special handling for weight (bf16 staging) and markers
+             if suffix in ("weight", "mcg", "mul1"):
+@@ -6270,7 +6477,27 @@ class Exl3LinearMethod(LinearMethodBase):
+                 shard_tp_rank = tp_rank
+ 
+             # Apply TP slicing based on layer type
+-            if is_row_parallel:
++            _win = getattr(layer, "_exl3_linear_pad_window", None) if layer is not None else None
++            if not is_row_parallel and _win is not None and shard_idx == 0:
++                # Geometria paddada (TP>1): a fatia do rank nao pode cortar o
++                # bloco de 128 da Hadamard de saida. Carrega a janela alinhada
++                # inteira (com as colunas do rank vizinho nas bordas) e o apply
++                # descarta o `lead`.
++                _off, _lead, _width = _win
++                if suffix == "trellis":
++                    # dim 1 do trellis esta em unidades de 16 colunas
++                    _tot = int(loaded.shape[1]) * 16
++                    _len = min(_width, _tot - _off)
++                    sharded = loaded.narrow(1, _off // 16, _len // 16)
++                elif suffix == "svh":
++                    _tot = int(loaded.shape[0])
++                    _len = min(_width, _tot - _off)
++                    sharded = loaded.narrow(0, _off, _len)
++                else:
++                    sharded = shard_exl3_col(
++                        loaded, suffix, shard_tp_rank, shard_tp_size
++                    )
++            elif is_row_parallel:
+                 # Row-parallel: input is sharded, trellis dim 0 and suh dim 0
+                 sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
+             else:
+@@ -6279,6 +6506,11 @@ class Exl3LinearMethod(LinearMethodBase):
+                     loaded, suffix, shard_tp_rank, shard_tp_size
+                 )
+ 
++            # Padded geometry at TP>1 (LOCAL 27/10): the shard above is the
++            # true checkpoint slice; every destination here is 128-aligned.
++            # Grow the slice with zeros so the padded columns carry svh = 0.
++            padded_layer = bool(getattr(layer, "_exl3_linear_padded", False))
++
+             # Copy into the right location
+             if suffix == "trellis":
+                 # Ragged per-shard staging: shards may carry different K, so
+@@ -6287,8 +6519,19 @@ class Exl3LinearMethod(LinearMethodBase):
+                 if dest.numel() == 0:
+                     # First arrival for this shard: adopt the exact-shape
+                     # payload (already TP-sharded above) as the slot's data.
++                    if padded_layer:
++                        sharded = _exl3_pad_to(
++                            sharded,
++                            (
++                                int(layer._exl3_linear_input_size_per_partition) // 16,
++                                int(output_partition_sizes[shard_idx]) // 16,
++                                int(sharded.shape[2]),
++                            ),
++                        )
+                     dest.data = sharded.detach().clone()
+                 else:
++                    if padded_layer:
++                        sharded = _exl3_pad_to(sharded, tuple(dest.shape))
+                     if tuple(dest.shape) != tuple(sharded.shape):
+                         raise RuntimeError(
+                             f"EXL3 linear trellis shape mismatch shard={shard_idx}: "
+@@ -6306,6 +6549,9 @@ class Exl3LinearMethod(LinearMethodBase):
+             else:
+                 raise ValueError(f"unknown EXL3 suffix={suffix}")
+ 
++            if padded_layer and suffix in ("suh", "svh"):
++                sharded = _exl3_pad_to(sharded, tuple(dest.shape))
++
+             if tuple(dest.shape) != tuple(sharded.shape):
+                 raise RuntimeError(
+                     f"EXL3 linear load shape mismatch shard={shard_idx} "
+@@ -6616,6 +6862,10 @@ class Exl3LinearMethod(LinearMethodBase):
+         for slot, shard_idx in enumerate(indexer_shards):
+             payload = layer._exl3_indexer_payloads[slot]
+             scales = layer._exl3_indexer_scales[slot]
++            if payload is None and scales is None:
++                # Native BF16/FP16 indexer pack: the loader already copied
++                # this shard into its BF16 staging rows; nothing to dequantize.
++                continue
+             if payload is None or scales is None:
+                 raise RuntimeError(
+                     f"EXL3 indexer shard {shard_idx} incomplete at load end "
+@@ -6725,9 +6975,17 @@ class Exl3LinearMethod(LinearMethodBase):
+         else:
+             y = outputs[0]
+ 
+-        # Trim padded output columns (svh = 0 there, so they are zeros)
++        # Trim padded output columns. Na janela alinhada por rank o trim tem
++        # dois lados: `lead` colunas do inicio (pertencem ao rank anterior) e o
++        # resto do bloco no fim.
+         if getattr(layer, "_exl3_linear_padded", False):
+-            y = y[:, : sum(layer._exl3_linear_true_out)]
++            _lead = getattr(layer, "_exl3_linear_pad_lead", None)
++            if _lead and any(int(v) for v in _lead) and len(outputs) == 1:
++                _l = int(_lead[0])
++                _t = int(layer._exl3_linear_true_out[0])
++                y = y[:, _l : _l + _t]
++            else:
++                y = y[:, : sum(layer._exl3_linear_true_out)]
+ 
+         # Cast back to input dtype
+         y = y.to(dtype=x.dtype)

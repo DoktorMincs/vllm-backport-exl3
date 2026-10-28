@@ -1,0 +1,764 @@
+diff --git a/vllm/config/attention.py b/vllm/config/attention.py
+index d5a150c92a..65cef44ba4 100644
+--- a/vllm/config/attention.py
++++ b/vllm/config/attention.py
+@@ -13,7 +13,7 @@ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
+ logger = init_logger(__name__)
+ 
+-IndexerKVDType = Literal["auto", "bf16", "fp8", "mxfp4", "nvfp4"]
++IndexerKVDType = Literal["auto", "bf16", "fp16", "fp8", "mxfp4", "nvfp4"]
+ MiniMaxM3MSADecodeBackend = Literal["triton", "cutlass"]
+ 
+ 
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 0a22b51b3c..260cf36c04 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -1260,6 +1260,14 @@ class SpeculativeConfig:
+                 draft_hf_overrides: HfOverrides
+                 if self.method == "medusa":
+                     draft_hf_overrides = {"model_type": "medusa"}
++                elif self.method == "dspark":
++                    # DSpark drafts are drafter checkpoints with their own
++                    # config, not MTP modules of the target. The base target
++                    # override rewrites MiniMax-M3 VL configs into their MTP
++                    # architecture, and a DSpark drafter of M3 shares
++                    # model_type "minimax_m3_vl" -- applying it would replace
++                    # the drafter's architectures with MiniMaxM3MTP.
++                    draft_hf_overrides = {}
+                 else:
+                     # Compose any callable hf_overrides set on the target so the
+                     # draft config receives the same transform (e.g. the test
+@@ -1416,6 +1424,8 @@ class SpeculativeConfig:
+                     not in self.draft_model_config.architectures
+                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
+                     and "K3DSparkModel" not in self.draft_model_config.architectures
++                    and "DSparkMiniMaxDraftModel"
++                    not in self.draft_model_config.architectures
+                 ):
+                     # DeepSeek-V4(.1) DSpark reuses the full target config
+                     # and its weights ship in the target checkpoint.
+@@ -1459,6 +1469,19 @@ class SpeculativeConfig:
+                     ):
+                         hf.n_predict = hf.block_size
+ 
++                if (
++                    self.method == "dspark"
++                    and "DSparkMiniMaxDraftModel"
++                    in self.draft_model_config.architectures
++                ):
++                    # O drafter do M3 e' um punhado de lineares em MXFP8 que a
++                    # implementacao (vllm/models/minimax_m3/nvidia/dflash.py)
++                    # desquantiza na carga: o MXFP8 do backport so aceita
++                    # ativacoes bf16 e o motor roda fp16. Declarar a
++                    # quantizacao do checkpoint aqui quebraria o boot antes de
++                    # chegar no loader.
++                    self.draft_model_config.quantization = None
++
+                 if self.method in ("dflash", "dspark"):
+                     self.parallel_drafting = True
+ 
+@@ -1472,6 +1495,11 @@ class SpeculativeConfig:
+                 n_predict = getattr(
+                     self.draft_model_config.hf_config, "n_predict", None
+                 )
++                if n_predict is not None and int(n_predict) <= 0:
++                    # LOCAL (MiniMax-M3.1 DSpark): o hf_config do drafter traz
++                    # n_predict=0 (num_nextn_predict_layers=0), e o `%` abaixo
++                    # estourava ZeroDivisionError. 0 = "nao definido".
++                    n_predict = None
+                 if n_predict is not None:
+                     if self.num_speculative_tokens is None:
+                         # Default to max value defined in draft model config.
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 5ceb4c5ecd..ee010819dd 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -328,6 +328,8 @@ if TYPE_CHECKING:
+     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
+     VLLM_TOKEN_BUCKET_PAD: bool = True
+     VLLM_DSPARK_FUSED_MARKOV: bool = True
++    VLLM_M3_DEBUG_DRAFT: bool = False
++    VLLM_M3_TIME_DRAFT: bool = False
+     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
+     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
+     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+@@ -2301,6 +2303,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     "VLLM_DSPARK_FUSED_MARKOV": lambda: (
+         os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
+     ),
++    "VLLM_M3_DEBUG_DRAFT": lambda: (
++        os.environ.get("VLLM_M3_DEBUG_DRAFT", "0") == "1"
++    ),
++    "VLLM_M3_TIME_DRAFT": lambda: (
++        os.environ.get("VLLM_M3_TIME_DRAFT", "0") == "1"
++    ),
+     # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
+     # the batch-adaptive heuristic, which picks splits from the query count and
+     # batch-average KV lengths so a request's reduction order can depend on the
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index 771506b6ca..ae108eaaa7 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -516,6 +516,12 @@ _MULTIMODAL_MODELS = {
+         "vllm.models.minimax_m3",
+         "MiniMaxM3SparseForConditionalGeneration",
+     ),
++    # Drafter DSpark do MiniMax-M3.1-Flash (LOCAL): DFlash denso de 5 camadas
++    # com fc dos 5 estados do alvo e as cabecas markov/confidence.
++    "DSparkMiniMaxDraftModel": (
++        "vllm.models.minimax_m3.nvidia.dflash",
++        "DSparkMiniMaxM3ForCausalLM",
++    ),
+     "MiniCPMO": ("minicpmo", "MiniCPMO"),
+     "MiniCPMV": ("minicpmv", "MiniCPMV"),
+     "MiniCPMV4_6ForConditionalGeneration": (
+diff --git a/vllm/models/minimax_m3/common/indexer.py b/vllm/models/minimax_m3/common/indexer.py
+index f5a8db0c24..843f1e587c 100644
+--- a/vllm/models/minimax_m3/common/indexer.py
++++ b/vllm/models/minimax_m3/common/indexer.py
+@@ -118,10 +118,17 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
+             cache_dtype = torch.float8_e4m3fn
+         elif indexer_kv_dtype == "bf16":
+             cache_dtype = torch.bfloat16
++        elif indexer_kv_dtype in ("fp16", "float16"):
++            # Follow the qkv dtype: the fused QK-norm/RoPE/KV-insert kernel
++            # stores index-K in the qkv dtype and the Triton indexer scores it
++            # with tl.dot against index_q (also qkv dtype). Hardcoded bf16
++            # raises a dtype mismatch with an fp16 model.
++            indexer_kv_dtype = "fp16"
++            cache_dtype = torch.float16
+         else:
+             raise NotImplementedError(
+                 f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
+-                "MiniMax M3 indexer cache (only 'bf16' or 'fp8'/'fp8_e4m3')."
++                "MiniMax M3 indexer cache (only 'bf16', 'fp16' or 'fp8'/'fp8_e4m3')."
+             )
+         self.kv_cache = torch.tensor([])
+         self.head_dim = head_dim
+@@ -528,7 +535,11 @@ def select_indexer_impl_cls(
+             indexer_kv_dtype,
+         )
+         return MiniMaxM3IndexerMSAImpl
+-    if indexer_kv_dtype != "bf16":
++    # bf16 and fp16 are both fine for the Triton kernels: index_q and the side
++    # cache share the qkv dtype and every score path goes through tl.dot with
++    # fp32 accumulate. fp16 exists so the side cache can follow an fp16 model
++    # (the fused qk-norm/rope/kv-insert kernel requires equal dtypes).
++    if indexer_kv_dtype not in ("bf16", "fp16"):
+         raise NotImplementedError(
+             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
+             "Triton indexer impl."
+diff --git a/vllm/models/minimax_m3/common/mm_preprocess.py b/vllm/models/minimax_m3/common/mm_preprocess.py
+index 9f1d08011a..9e019f1b23 100644
+--- a/vllm/models/minimax_m3/common/mm_preprocess.py
++++ b/vllm/models/minimax_m3/common/mm_preprocess.py
+@@ -249,6 +249,22 @@ class MiniMaxM3VLProcessingInfo(BaseProcessingInfo):
+     ) -> int:
+         max_videos = mm_counts.get("video", 0)
+         max_total_frames = self._get_max_video_frames(seq_len)
++        # Bound the dummy by what the encoder can actually see in one call:
++        # MiniMaxVLVisionModel._apply_max_frames_limit splits any video into
++        # segments of `vision_segment_max_frames` (4 for M3.1). Without this the
++        # profiling dummy is sized from seq_len alone — with max_model_len
++        # 262144 that asked for hundreds of frames, and the memory-profiling
++        # forward OOM'd inside the vision tower's first layer_norm, which has
++        # nothing to do with the memory the real 4-frame path needs.
++        vision_config = self.get_hf_config().vision_config
++        # vLLM keeps this as a plain dict (the model rebuilds it with
++        # PretrainedConfig.from_dict), so getattr alone silently finds nothing.
++        if isinstance(vision_config, Mapping):
++            segment_cap = vision_config.get("vision_segment_max_frames")
++        else:
++            segment_cap = getattr(vision_config, "vision_segment_max_frames", None)
++        if segment_cap:
++            max_frames_per_video = min(max_frames_per_video, int(segment_cap))
+         max_frames_per_video = min(
+             max_total_frames // max(max_videos, 1), max_frames_per_video
+         )
+diff --git a/vllm/models/minimax_m3/common/sparse_attention.py b/vllm/models/minimax_m3/common/sparse_attention.py
+index 50c03dd9bf..81c1064fe6 100644
+--- a/vllm/models/minimax_m3/common/sparse_attention.py
++++ b/vllm/models/minimax_m3/common/sparse_attention.py
+@@ -61,6 +61,35 @@ from vllm.v1.kv_cache_interface import (
+ 
+ logger = init_logger(__name__)
+ 
++# --- instrumentacao de depuracao (VLLM_M3_DEBUG_ATTN=1; inerte quando off) ---
++import os as _os
++
++_M3_ATTN_DBG = _os.environ.get("VLLM_M3_DEBUG_ATTN", "")
++_M3_ATTN_DBG_N = 0
++
++
++def _m3_attn_dbg(tag: str, topk, block_table, seq_lens) -> None:
++    """Dumpa o top-k de blocos do indexer (ids) e o block_table do prefill."""
++    global _M3_ATTN_DBG_N
++    if _M3_ATTN_DBG_N >= 4:
++        return
++    _M3_ATTN_DBG_N += 1
++    try:
++        print(f"[M3ATTN] {tag} topk.shape={tuple(topk.shape)} "
++              f"dtype={topk.dtype}", flush=True)
++        if seq_lens is not None:
++            print(f"[M3ATTN]   seq_lens={seq_lens[:8].tolist()}", flush=True)
++        if block_table is not None:
++            print(f"[M3ATTN]   block_table[0][:20]="
++                  f"{block_table[0][:20].tolist()}", flush=True)
++        t = topk[:1, :4, :].to(torch.int32)
++        print(f"[M3ATTN]   topk[h0, tok0..3, :]={t.tolist()}", flush=True)
++        print(f"[M3ATTN]   topk min/max={int(topk.min())}/{int(topk.max())}",
++              flush=True)
++    except Exception as exc:  # pragma: no cover - diagnostico
++        print(f"[M3ATTN] dump falhou: {exc!r}", flush=True)
++
++
+ 
+ def _minimax_m3_aiter_sparse_pa_requested() -> bool:
+     return rocm_aiter_ops.is_enabled() and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+@@ -469,6 +498,12 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
+             else topk_buffer[:num_tokens].transpose(0, 1)
+         )
+         assert topk is not None
++        if _M3_ATTN_DBG:
++            _m3_attn_dbg(tag=f"nd={nd} q={num_tokens}", topk=topk,
++                         block_table=main_md.prefill.block_table
++                         if main_md.num_prefills > 0 else None,
++                         seq_lens=main_md.prefill.seq_lens
++                         if main_md.num_prefills > 0 else None)
+         hd = self.head_size
+         q = query[:num_tokens].view(-1, self.num_heads, hd)
+         out = output[:num_tokens].view(-1, self.num_heads, hd)
+diff --git a/vllm/models/minimax_m3/nvidia/model.py b/vllm/models/minimax_m3/nvidia/model.py
+index 970b06d407..f0da9ee89e 100644
+--- a/vllm/models/minimax_m3/nvidia/model.py
++++ b/vllm/models/minimax_m3/nvidia/model.py
+@@ -14,6 +14,8 @@ The MiniMax-M3-preview config selects a single set of branches:
+ 
+ from collections.abc import Iterable
+ 
++import os as _os
++
+ import torch
+ from torch import nn
+ from transformers import PretrainedConfig
+@@ -111,6 +113,102 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
+     return moe_layer_freq[layer_id] != 0
+ 
+ 
++# --- instrumentacao de depuracao (VLLM_M3_DEBUG=1; inerte quando desligada) ---
++_M3_DBG = _os.environ.get("VLLM_M3_DEBUG", "")
++_M3_DBG_MAX = int(_os.environ.get("VLLM_M3_DEBUG_MAX", "2"))
++_M3_DBG_N: dict[str, int] = {}
++
++
++def _m3_dbg(tag: str, t: torch.Tensor) -> None:
++    """Imprime estatisticas de um tensor (absmean/absmax/rms/nan) no stdout."""
++    if not _M3_DBG:
++        return
++    n = _M3_DBG_N.get(tag, 0)
++    if n >= _M3_DBG_MAX:
++        return
++    _M3_DBG_N[tag] = n + 1
++    try:
++        x = t.detach().float()
++        print(
++            f"[M3DBG] {tag} shape={tuple(t.shape)} dtype={t.dtype} "
++            f"absmean={x.abs().mean().item():.5g} "
++            f"absmax={x.abs().max().item():.5g} "
++            f"rms={x.pow(2).mean().sqrt().item():.5g} "
++            f"nan={int(torch.isnan(x).sum().item())}",
++            flush=True,
++        )
++    except Exception as exc:  # pragma: no cover - diagnostico
++        print(f"[M3DBG] {tag} falhou: {exc!r}", flush=True)
++
++
++# --- dump de tensores para comparacao com o oraculo (VLLM_M3_DUMP=<dir>) ---
++_M3_DUMP = _os.environ.get("VLLM_M3_DUMP", "")
++_M3_DUMP_MAXT = int(_os.environ.get("VLLM_M3_DUMP_MAXT", "64"))
++_M3_DUMP_T = int(_os.environ.get("VLLM_M3_DUMP_T", "0"))
++# Portao de armacao: os forwards de profiling do boot (batch de tokens
++# identicos) tem o mesmo T do request. O dump so vale depois que o arquivo
++# <dir>/ARM existe, entao o primeiro forward pequeno APOS o ARM e o request.
++_M3_ARM = _os.path.join(_M3_DUMP, "ARM") if _M3_DUMP else ""
++_M3_DUMPED: set[str] = set()
++_M3_DUMP_SKIP: set[str] = set()
++
++
++def _m3_dump(tag: str, t: torch.Tensor, force: bool = False) -> None:
++    """Salva um tensor [T, H] em <dir>/<tag>.npz (uma vez por tag por processo).
++
++    Filtro de chamada: com VLLM_M3_DUMP_T > 0 so grava T exato (o request real);
++    senao grava T <= VLLM_M3_DUMP_MAXT (exclui o profiling/warmup).
++    Tensores [T, 1, H] sao achatados; o primeiro shape visto por tag e logado.
++    """
++    if not _M3_DUMP:
++        return
++    if not _os.path.exists(_M3_ARM):
++        return
++    if t.dim() == 3 and t.shape[1] == 1:
++        t = t[:, 0, :]
++    if t.dim() != 2:
++        if tag not in _M3_DUMP_SKIP:
++            _M3_DUMP_SKIP.add(tag)
++            print(f"[M3DUMP-SKIP] {tag} dim={t.dim()} shape={tuple(t.shape)}", flush=True)
++        return
++    if force:
++        # `force` existe para os logits: o runner chama compute_logits com
++        # apenas o ultimo token ([1, vocab]), nao com o batch paddado.
++        ok = True
++    elif _M3_DUMP_T > 0:
++        ok = int(t.shape[0]) == _M3_DUMP_T
++    else:
++        ok = int(t.shape[0]) <= _M3_DUMP_MAXT
++    if tag not in _M3_DUMP_SKIP:
++        _M3_DUMP_SKIP.add(tag)
++        print(f"[M3DUMP-SHAPE] {tag} shape={tuple(t.shape)} dump={ok}", flush=True)
++    if not ok:
++        return
++    if tag in _M3_DUMPED:
++        return
++    _M3_DUMPED.add(tag)
++    try:
++        import numpy as np
++
++        arr = t.detach().float().cpu().numpy()
++        # Sufixo por rank: em TP>1 os dois ranks tem a mesma camada e
++        # escreveriam no mesmo arquivo (corrida, o comparador pegaria o ultimo).
++        rank = ""
++        try:
++            import torch.distributed as _td
++
++            if _td.is_available() and _td.is_initialized():
++                rank = f".r{_td.get_rank()}"
++        except Exception:
++            pass
++        path = _os.path.join(_M3_DUMP, tag.replace("/", "_") + rank + ".npz")
++        np.savez_compressed(path, x=arr)
++        print(f"[M3DUMP] {tag} {tuple(t.shape)} -> {path}", flush=True)
++    except Exception as exc:  # pragma: no cover - diagnostico
++        print(f"[M3DUMP] {tag} falhou: {exc!r}", flush=True)
++
++
++
+ class MiniMAXGemmaRMSNorm(nn.Module):
+     """Gemma-style RMS normalization backed by FlashInfer kernels.
+ 
+@@ -498,8 +596,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
+         set_default_quant_scales(self, register_buffer=True)
+         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
+         # cache (--attention-config '{"indexer_kv_dtype": ...}').
++        # Default follows the qkv dtype: the fused qk-norm/rope/kv-insert
++        # kernel stores index-K in the qkv dtype, so a bf16 side cache under an
++        # fp16 model trips its dtype check.
++        _idx_default = (
++            "fp16" if vllm_config.model_config.dtype == torch.float16 else "bf16"
++        )
+         self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+-            "bf16"
++            _idx_default
+         )
+ 
+         # Shared top-k buffer: the indexer writes the selected blocks into it and
+@@ -767,16 +871,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
+                 hidden_states = self.input_layernorm(hidden_states)
+             else:
+                 hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _m3_dbg(f"L{self.layer_id:02d} normed_in", hidden_states)
++        _m3_dump(f"L{self.layer_id:02d}_normed_in", hidden_states)
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+         )
++        _m3_dbg(f"L{self.layer_id:02d} attn_out", hidden_states)
++        _m3_dump(f"L{self.layer_id:02d}_attn_out", hidden_states)
++        _m3_dbg(f"L{self.layer_id:02d} residual", residual)
++        _m3_dump(f"L{self.layer_id:02d}_residual", residual)
+ 
+         hidden_states, residual = fused_allreduce_gemma_rms_norm(
+             hidden_states, residual, self.post_attention_layernorm
+         )
++        _m3_dbg(f"L{self.layer_id:02d} ffn_in", hidden_states)
++        _m3_dump(f"L{self.layer_id:02d}_ffn_in", hidden_states)
+         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+         hidden_states = ffn(hidden_states)
++        _m3_dbg(f"L{self.layer_id:02d} ffn_out", hidden_states)
++        _m3_dump(f"L{self.layer_id:02d}_ffn_out", hidden_states)
+         return hidden_states, residual
+ 
+     @property
+@@ -790,6 +904,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
+ 
+ class MiniMaxM3Model(nn.Module, EagleModelMixin):
+     fall_back_to_pt_during_load = False
++    # DSpark precisa dos estados de 5 camadas (3, 17, 31, 45, 59) e com PP=5
++    # eles nascem em estagios diferentes: cada estagio carrega os seus no
++    # IntermediateTensors (ver o patch local em forward()).
++    supports_aux_hidden_states_over_pp = True
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+@@ -875,22 +993,36 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
+             else:
+                 hidden_states = self.embed_input_ids(input_ids)
+             residual = None
++            _m3_dump("embed", hidden_states)
+         else:
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
+-        # EAGLE3 is not yet compatible with pipeline parallel
+-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+-        for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
++        # Aux hidden states (DSpark/EAGLE3) sobre PP: os estagios anteriores
++        # mandam os seus pelo IntermediateTensors e cada estagio captura os
++        # seus com o indice GLOBAL da camada (idx+1 = "depois da camada idx").
++        remote_aux = self.collect_remote_aux_hidden_states(intermediate_tensors)
++        local_aux: list[torch.Tensor] = self._maybe_add_hidden_state(
++            [], 0, hidden_states, residual
++        )
++        for idx, layer in enumerate(
++            self.layers[self.start_layer : self.end_layer],
++            start=self.start_layer,
++        ):
+             hidden_states, residual = layer(positions, hidden_states, residual)
+             self._maybe_add_hidden_state(
+-                aux_hidden_states, idx + 1, hidden_states, residual
++                local_aux, idx + 1, hidden_states, residual
+             )
++        aux_hidden_states = list(remote_aux) + list(local_aux)
+ 
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors(
+-                {"hidden_states": hidden_states, "residual": residual}
++                {
++                    "hidden_states": hidden_states,
++                    "residual": residual,
++                    **self.pack_local_aux_hidden_states(local_aux),
++                }
+             )
+ 
+         if self.fuse_final_norm_allreduce:
+@@ -899,6 +1031,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
+             )
+         else:
+             hidden_states, _ = self.norm(hidden_states, residual)
++        _m3_dump("final_normed", hidden_states)
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+@@ -1057,7 +1190,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+ 
+     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+-        return self.logits_processor(self.lm_head, hidden_states)
++        out = self.logits_processor(self.lm_head, hidden_states)
++        if _M3_DUMP:
++            try:
++                _m3_dump(
++                    "logits_local",
++                    self.logits_processor(self.lm_head, hidden_states, skip_gather=True),
++                    force=True,
++                )
++            except Exception as exc:  # pragma: no cover - diagnostico
++                print(f"[M3DUMP] logits_local falhou: {exc!r}", flush=True)
++        return out
+ 
+     def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
+@@ -1133,7 +1276,14 @@ class MiniMaxM3SparseForConditionalGeneration(
+                 config=PretrainedConfig.from_dict(vision_config),
+                 text_hidden_size=text_hidden_size,
+                 projector_hidden_size=projector_hidden_size,
+-                quant_config=self.quant_config,
++                # The vision tower is stored bf16 in the checkpoint: the EXL3
++                # quantization_config lists no vision_tower/visual/projector
++                # key at all. Handing it the global quant_config made the
++                # plugin claim these Linears and read bf16 weights as trellis,
++                # failing at load with "EXL3 linear shard 0: neither mcg nor
++                # mul1 marker is set" (only visible once --language-model-only
++                # is dropped and the tower is actually built).
++                quant_config=None,
+                 prefix=maybe_prefix(prefix, "vision_tower"),
+             )
+ 
+diff --git a/vllm/reasoning/minimax_m3_reasoning_parser.py b/vllm/reasoning/minimax_m3_reasoning_parser.py
+index d49f9311f4..a1b23f3e1a 100644
+--- a/vllm/reasoning/minimax_m3_reasoning_parser.py
++++ b/vllm/reasoning/minimax_m3_reasoning_parser.py
+@@ -311,10 +311,27 @@ class MiniMaxM3ReasoningParser(BaseThinkingReasoningParser):
+         return count
+ 
+     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
+-        start_index = self._rfind_token_sequence(input_ids, self._start_token_ids)
+-        end_index = self._rfind_token_sequence(input_ids, self._end_token_ids)
+-        if end_index < 0:
+-            return False
+-        if start_index < 0:
+-            return True
+-        return end_index > start_index
++        # This is called with the PROMPT ids to decide whether the first
++        # generated token already belongs to the answer. Only what the chat
++        # template prefills at the END of the prompt matters: ``</mm:think>``
++        # when thinking is disabled, ``<mm:think>`` when it is enabled, nothing
++        # in adaptive mode.
++        #
++        # Scanning the whole prompt for the marker pair does not work here: the
++        # template's <thinking_instructions> block writes both tags literally
++        # ("...wrap your reasoning in <mm:think></mm:think> tags..."), so the
++        # first pair found is that empty block and the prompt looks like it
++        # already closed reasoning. Streaming then routes the model's own
++        # <mm:think> block into ``content`` (non-streaming is unaffected, it
++        # only inspects the output).
++        ids = list(input_ids)
++        for marker_ids, ended in (
++            (self._end_token_ids, True),
++            (self._start_token_ids, False),
++        ):
++            if marker_ids and len(ids) >= len(marker_ids):
++                if tuple(ids[-len(marker_ids) :]) == marker_ids:
++                    return ended
++        # No prefill: the model emits its own markers, so the streaming parser
++        # decides position by position.
++        return False
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index a3e8df7924..acd93dbad7 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import copy
++import time
+ from collections.abc import Mapping
+ from typing import Any
+ 
+@@ -8,6 +9,7 @@ import numpy as np
+ import torch
+ import torch.nn as nn
+ 
++from vllm import envs
+ from vllm.config import VllmConfig, replace
+ from vllm.config.compilation import CUDAGraphMode
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+@@ -40,6 +42,12 @@ class DFlashSpeculator(DraftModelSpeculator):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+ 
++        # Diagnostico de tempo do passo de draft (VLLM_M3_TIME_DRAFT=1).
++        self._dbg_t0: float | None = None
++        self._dbg_t_ctx: float = 0.0
++        self._dbg_step: int = 0
++        self._dbg_acc: list[float] = [0.0, 0.0, 0.0]
++
+         self.hidden_states = torch.zeros(
+             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
+         )
+@@ -259,6 +267,33 @@ class DFlashSpeculator(DraftModelSpeculator):
+             )
+         return last_hidden_states
+ 
++    def _debug_aux(
++        self,
++        hidden_states: torch.Tensor,
++        aux_hidden_states: list[torch.Tensor] | None,
++        num_target_tokens: int,
++    ) -> None:
++        """Diagnostico pontual da entrada do drafter (VLLM_M3_DEBUG_DRAFT=1).
++
++        Aceitacao 0 com o alvo coerente quase sempre e' entrada errada, nao
++        peso ruim: este log separa "veio o aux ou caiu no last_hidden_states"
++        e mostra se o estado combinado tem escala absurda (norma errada,
++        ordem dos aux trocada, fc com peso nao carregado).
++        """
++        n = min(num_target_tokens, 8)
++        x = hidden_states[:n].float()
++        logger.info(
++            "M3-DEBUG draft input: aux=%s n_aux=%s ctx_tokens=%d "
++            "absmax=%.3f mean=%.5f std=%.3f first=%s",
++            aux_hidden_states is not None,
++            None if aux_hidden_states is None else len(aux_hidden_states),
++            num_target_tokens,
++            x.abs().max().item(),
++            x.mean().item(),
++            x.std().item(),
++            x[0, :6].tolist(),
++        )
++
+     def _generate_draft(
+         self,
+         num_reqs: int,
+@@ -365,6 +400,8 @@ class DFlashSpeculator(DraftModelSpeculator):
+             )
+         else:
+             hidden_states = last_hidden_states
++        if envs.VLLM_M3_DEBUG_DRAFT and not dummy_run:
++            self._debug_aux(hidden_states, aux_hidden_states, num_target_tokens)
+         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+ 
+         if dummy_run and skip_attn_for_dummy_run:
+@@ -437,11 +474,19 @@ class DFlashSpeculator(DraftModelSpeculator):
+             ]
+         else:
+             context_slots = self._context_slot_mappings[0][:num_target_tokens]
++        self._dbg_t0 = None
++        if envs.VLLM_M3_TIME_DRAFT:
++            torch.cuda.synchronize()
++            self._dbg_t0 = time.perf_counter()
+         self.model.precompute_and_store_context_kv(
+             self.hidden_states[:num_target_tokens],
+             self.context_positions[:num_target_tokens],
+             context_slots,
+         )
++        if self._dbg_t0 is not None:
++            torch.cuda.synchronize()
++            self._dbg_t_ctx = time.perf_counter() - self._dbg_t0
++            self._dbg_t0 = time.perf_counter()
+ 
+         batch_sync, num_batch_tokens = (
+             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+@@ -497,6 +542,26 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 cudagraph_runtime_mode=batch_desc.cg_mode,
+             )
+ 
++        if self._dbg_t0 is not None:
++            torch.cuda.synchronize()
++            t_draft = time.perf_counter() - self._dbg_t0
++            self._dbg_step += 1
++            self._dbg_acc[0] += self._dbg_t_ctx
++            self._dbg_acc[1] += t_draft
++            self._dbg_acc[2] += num_target_tokens
++            if self._dbg_step % 10 == 0:
++                n = self._dbg_step
++                logger.info(
++                    "M3-TIME draft (sync, %d passos): ctx=%.2f ms (%s tok) "
++                    "draft=%.2f ms total_propose=%.2f ms",
++                    n,
++                    1000 * self._dbg_acc[0] / n,
++                    self._dbg_acc[2] / n,
++                    1000 * self._dbg_acc[1] / n,
++                    1000 * (self._dbg_acc[0] + self._dbg_acc[1]) / n,
++                )
++                self._dbg_acc = [0.0, 0.0, 0.0]
++
+         return self.draft_tokens[:num_reqs]
+ 
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+index 82df79ee1c..758e793492 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -25,6 +25,8 @@ backbone forward AND the sequential Markov sampling.
+ 
+ from typing import Any
+ 
++import time
++
+ import torch
+ from torch.profiler import record_function
+ 
+@@ -95,6 +97,8 @@ class DSparkSpeculator(DFlashSpeculator):
+         # Fused Markov chain (greedy vocab-sharded path only); built in
+         # load_draft_model once the head's weights and shard geometry exist.
+         self._fused_markov: FusedMarkovSampler | None = None
++        # Diagnostico de tempo (VLLM_M3_TIME_DRAFT=1): [logits, markov, passos].
++        self._t_dbg: list[float] = [0.0, 0.0, 0.0]
+ 
+     def load_draft_model(
+         self,
+@@ -217,12 +221,32 @@ class DSparkSpeculator(DFlashSpeculator):
+         # only, so `vocab_size` below is the shard width -- nothing in this
+         # method reads it as a vocab id.
+         with record_function("dspark::draft_logits"):
++            _t0 = None
++            if envs.VLLM_M3_TIME_DRAFT and not torch.cuda.is_current_stream_capturing():
++                torch.cuda.synchronize()
++                _t0 = time.perf_counter()
+             if self.use_local_argmax_reduction:
+                 base_logits = self.model.compute_draft_logits_shard(sample_hidden)
+             else:
+                 base_logits = self.model.compute_draft_logits(sample_hidden)
++            if _t0 is not None:
++                torch.cuda.synchronize()
++                self._t_dbg[0] += time.perf_counter() - _t0
++                _t0 = time.perf_counter()
+         vocab_size = base_logits.shape[-1]
+         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
++        if envs.VLLM_M3_DEBUG_DRAFT and not getattr(self, "_dbg_done", False):
++            self._dbg_done = True
++            l0 = base_logits[0].float()
++            logger.info(
++                "M3-DEBUG draft logits: shape=%s absmax=%.3f mean=%.4f "
++                "argmax_per_step=%s anchor_id=%s",
++                tuple(base_logits.shape),
++                l0.abs().max().item(),
++                l0.mean().item(),
++                l0.argmax(dim=-1).tolist(),
++                self.input_buffers.input_ids[self._anchor_idx[:1]].tolist(),
++            )
+ 
+         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+@@ -237,6 +261,8 @@ class DSparkSpeculator(DFlashSpeculator):
+             # three [num_reqs, shard_width] round trips collapsed into one
+             # pass over markov_w2. Writes draft_tokens directly.
+             self._fused_markov.sample(num_reqs, base_logits, prev, self.draft_tokens)
++            if _t0 is not None:
++                self._dbg_markov_time(_t0)
+             return
+ 
+         for i in range(n_spec):
+@@ -270,6 +296,25 @@ class DSparkSpeculator(DFlashSpeculator):
+             self.draft_token_confidence_probs[:num_reqs] = confidence.view(
+                 num_reqs, n_spec
+             )
++        if _t0 is not None:
++            self._dbg_markov_time(_t0)
++
++    def _dbg_markov_time(self, t_markov_start: float) -> None:
++        """Acumula o tempo da cadeia Markov e loga a cada 10 passos."""
++        torch.cuda.synchronize()
++        self._t_dbg[1] += time.perf_counter() - t_markov_start
++        self._t_dbg[2] += 1
++        if self._t_dbg[2] % 10 == 0:
++            n = self._t_dbg[2]
++            logger.info(
++                "M3-TIME draft detail (sync, %d passos): logits_lm_head=%.2f ms "
++                "markov=%.2f ms",
++                n,
++                1000 * self._t_dbg[0] / n,
++                1000 * self._t_dbg[1] / n,
++            )
++            self._t_dbg[0] = 0.0
++            self._t_dbg[1] = 0.0
+ 
+     def _sample_sequential_topk(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         """Apply the sequential Markov head only to top-k base-logit candidates.
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+index 5b13530ef7..813632c61b 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -27,6 +27,20 @@ def _resolve_dspark_attention_backend(
+                 target_backend.name,
+             )
+         return target_backend
++    if "DSparkMiniMaxDraftModel" in (
++        getattr(draft_model_config, "architectures", None) or ()
++    ):
++        # O alvo MiniMax-M3 roda num backend esparso proprio
++        # (MINIMAX_M3_SPARSE_INDEXER): as camadas do drafter nao tem pesos de
++        # indexer nem metadata esparsa, entao herdar esse backend faria a
++        # atencao do drafter rodar no caminho errado (aceitacao 0%). O drafter
++        # e' GQA denso com janela deslizante -> backend denso padrao.
++        logger.info_once(
++            "Using %s for the MiniMax-M3 DSpark drafter (the target's sparse "
++            "indexer backend does not apply to draft layers).",
++            AttentionBackendEnum.FLASH_ATTN.name,
++        )
++        return AttentionBackendEnum.FLASH_ATTN
+     return None
+ 
+ 
