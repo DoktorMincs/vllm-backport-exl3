@@ -1,253 +1,210 @@
-# vLLM Backport
+# vllm-backport-exl3
 
-A vLLM fork that focuses on running frontier models on older cards like A6000, 3090 and A100.
+A fork of [`avtc/vllm-backport`](https://github.com/avtc/vllm-backport) carrying the
+engine work needed to serve **MiniMax-M3.1-Flash-EXL3-EAQ** — an EXL3 trellis-quantized
+MiniMax-M3.1-Flash — on **10× RTX 3090 (sm_86, 24 GB, PCIe, no NVLink)**.
 
-Status:
+Two packs boot and serve on this stack (images and video were verified end to end on the
+3.5 bpw pack; the 3.06 bpw pack was validated for text, pool size and speed):
 
-| Supported Models | Quantization | Status |
-| --- | --- | --- |
-| `DeepSeek-v4-Flash-0731` | Native FP4 | Fully Supported (0.6.0+) |
-| `Qwen3.8-27B` | BF16, AWQ W4A16 | Fully Supported (v0.8.0+) |
-| `Qwen3.8-Flash-Next` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16) | Fully Supported (v0.9.0+) |
-| `GLM-5.3-Flash` | FP8, [AWQ W4A16](https://huggingface.co/wtdcode/GLM-5.3-Flash-AWQ-W4A16) | Fully Supported (v0.11.2+) |
-| `DeepSeek-V4-Flash-Vision-Exp` | Native FP4 | Fully Supported (v0.13.0+) |
-| `DeepSeek-V4.1-Flash` | Native FP4 with Engram | Fully Supported (v0.13.0+) |
-| `MiMo-V2.6-Flash-RL` | Native MXFP4 (fp8 QKV/o_proj) | Fully Supported (main) |
+| pack | size | layers | bits |
+|---|---|---|---|
+| `MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw` | 184 GB | 177.4 GiB | 3.55 avg, 6-bit heads, mixed K3/K4 |
+| `MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.06-bpw` | 160 GB | 153.2 GiB | 3.06 avg, 8-bit heads, uniform K3 |
 
-Note we have a paired [LMCache](https://github.com/wtdcode/LMCache/tree/vllm-backport) fork for production kvcache serving, **which is also built into our docke images.**
+The engine is the upstream backport plus the commits on branch `exl3-mm31-flash`
+(derived from `ced6985fd1`). Quantization comes from the
+[`vllm-exl3`](https://github.com/vcruz305/vllm-exl3) plugin, which needed local
+patches — those are distributed **as diffs only** (`docs/exl3-mm31/patches/`), since the
+plugin is AGPL-3.0. The engineering record — every defect, measurement and dead end — is
+in [`docs/exl3-mm31/`](docs/exl3-mm31/README.md).
 
-## Docker Usage
+This is not a general-purpose serving recipe. It is the record of making a 184 GB model
+that was never meant for 24 GB cards run correctly and fast on ten of them, where
+"correctly" was the hard part: most of what we hit loaded, booted and answered — with the
+wrong number, the wrong text, or zero acceptance.
 
-Prebuilt images are published to Docker Hub on every push:
+## Results
 
-| Image | Target GPUs |
-| --- | --- |
-| `lazymio/vllm-backport:latest-sm86` (also `:latest`) | Ampere sm86 (A6000, RTX 30xx) |
-| `lazymio/vllm-backport:latest-sm80` | Ampere sm80 (A100) |
-| `lazymio/vllm-backport:latest-sm89` | Ada sm89 (RTX 4090, L40S) |
-| `lazymio/vllm-backport:v0.13.0-sm86` / `-sm80` / `-sm89` | pinned release builds |
+TP=2 × PP=5 across the 10 GPUs, fp16 weights, `--kv-cache-dtype fp8_e5m2`,
+`--max-num-batched-tokens 512`, CUDA graphs (`cudagraph_mode=FULL_AND_PIECEWISE`).
 
-Images are single-arch builds (no FA3/Hopper kernels), so pick the tag matching your GPU. The entrypoint is `vllm serve` and `lmcache` is also available within the same image!
+| regime | measured |
+|---|---|
+| decode, single stream | **45.6 tok/s** (128 tokens) · 45.2 (400 tokens) |
+| decode, TP=1 × PP=10 | 21.0 tok/s |
+| decode, eager (no CUDA graphs) | 3.5 tok/s |
+| prefill at 2k / 8k / 32k | **1,491 / 2,126 / 2,357 tok/s** |
+| aggregate, 16 concurrent | **84.1 tok/s** |
+| decode with the DSpark drafter (N=2) | 53.9 tok/s (+20%, single stream only) |
+| decode with vision enabled | 45.5 tok/s (no measurable cost) |
 
-`:latest*` tags track the main branch; each release also ships versioned tags like `:v0.13.0-sm86` if you want to pin. Check [Dockerhub](https://hub.docker.com/r/lazymio/vllm-backport/tags) or [Github](https://github.com/wtdcode/vllm-backport/tags) for available latest tags.
+Prefill is bound by chunk latency and by power, both counter-intuitively.
+`--max-num-batched-tokens 512` beat both the 2048 default and 1024, while 8192 was 2.6×
+worse at 8k: with PP the chunk is one pipeline stage, so a bigger chunk lengthens every
+stage and the bubble. Raising the power cap from 200 to 230 W bought another 21% at 32k
+prefill (1,895 → 2,285 tok/s) at a 2.06 kW total draw; decode is insensitive to it.
 
-### Docker Compose Sample
+## Context and KV cache
 
-Note the sample below includes `LMCache`. If you do not have enough RAM or disk, you could remove the `--kv-transfer-config` and the full `LMCache` section.
+The 3.06 bpw pack is the interesting one for context: 17 GiB less of weights turns into
+KV cache almost one for one.
 
-```yaml
-services:
-  vllm:
-    image: lazymio/vllm-backport:latest
-    depends_on: [lmcache] # Remove this line if you remove the lmcache section below
-    command:
-      - deepseek-ai/DeepSeek-V4-Flash-0731
-      - '--kv-transfer-config={"kv_connector":"LMCacheMPConnector","kv_connector_module_path":"lmcache.integration.vllm.lmcache_mp_connector","kv_role":"kv_both","kv_connector_extra_config":{"lmcache.mp.host":"127.0.0.1","lmcache.mp.port":5556}}'
-      - ... (model specific commands see below)
-    ports:
-      - "8000:8000"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    environment:
-      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-}
-    ipc: host
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-  lmcache:
-    image: lazymio/vllm-backport:latest
-    entrypoint: ["lmcache", "server"]
-    command:
-      - --host=127.0.0.1
-      - --port=5556
-      - --http-port=18556
-      - --chunk-size=1024 # must be a multiple of the model's KV block size, see each model's LMCache note below
-      - --separate-object-groups
-      - --l1-size-gb=1024
-      - --eviction-policy=LRU
-      - --max-workers 16
-      - --l2-adapter '{"type":"fs_native","base_path":"path/to/l2","num_workers":32,"max_capacity_gb":1024,"eviction":{"eviction_policy":"LRU","trigger_watermark":0.8,"eviction_ratio":0.2}}'
-    environment:
-      - PYTHONUNBUFFERED=1
-      - CUDA_DEVICE_ORDER=PCI_BUS_ID
-    restart: unless-stopped
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-```
+| pack | KV dtype | util | max-num-seqs | KV pool | context |
+|---|---|---|---|---|---|
+| 3.5 bpw, no vision | fp16 | 0.92 | 256 | 126,720 | 65,536 |
+| 3.5 bpw, no vision | fp8_e5m2 | 0.92 | 256 | 211,328 | 131,072 |
+| 3.5 bpw, no vision | fp8_e5m2 | 0.95 | 8 | 281,856 | 262,144 |
+| 3.5 bpw, vision + video | fp8_e5m2 | 0.96 | 8 | 223,488 | 131,072 |
+| 3.5 bpw, + DSpark drafter | fp16 | 0.95 | 8 | 51,526 | ~51k |
+| **3.06 bpw, vision + video** | **fp8_e5m2** | **0.96** | **8** | **570,880** | **131,072 (4.36×)** |
 
-Then:
+Two counter-intuitive facts came out of this table. First, at high `--gpu-memory-utilization`
+what runs out is **activation**, not KV: 0.95 with the default `--max-num-seqs 256` OOMs
+during profiling, while 0.95 with `--max-num-seqs 8` boots and gains 33% more pool. Second,
+any vision encoder is replicated on **every** pipeline stage (+0.81 GiB/GPU here), so
+"262k plus vision" does not fit no matter how the layers are partitioned.
 
-```bash
-docker compose up -d
-curl http://localhost:8000/v1/models
-```
+The smaller pack costs nothing in speed — 44.9 tok/s vs 45.4 — because single-stream decode
+at this geometry is bound by per-layer launch/all-reduce overhead, not by weight bandwidth.
 
-## Recommend Setup
+## What had to be built
 
-### General Tips
+The model is a sparse-attention MoE with block-sparse top-k selection, EXL3 trellis weights
+in attention/dense/MoE/`lm_head`, a bf16 vision tower, and an optional DSpark speculator.
+Serving it needed:
 
-- `FULL_AND_PIECEWISE` captures the whole decode step — attention, MoE dispatch, NCCL all-reduce and the DSpark draft loop — into one CUDA graph. This improves decode but prefill is unchanged (compute-bound). Two prerequisites:
-    - Pin NCCL with `NCCL_ALGO=Ring NCCL_PROTO=Simple` (and prefer `--disable-custom-all-reduce`). Graph replay must re-issue the exact captured collective; NCCL's size-adaptive algorithm switching is what made FULL capture "crash on Ampere" — Ampere itself is fine.
-    - Bound `cudagraph_capture_sizes` as shown. FULL graphs keep private memory pools; capturing every batch size up to `--max-num-seqs` can cost >800 MB per GPU and OOM warmup at high `--gpu-memory-utilization`.
-- Adjust your TP (--tensor-parallel-size), PP (--pipeline-parallel-size) and EP (--enable-expert-parallel) accordingly.
+- **EXL3 coverage** for every non-routed projection of the M3 (`VLLM_EXL3_MINIMAX_M3=1`) —
+  without it the loader silently falls back to a routed-experts-only scope and attention
+  weights are read as bf16 when they are trellis.
+- **TP-aware EXL3 sharding**: the plugin's padded geometry, 128-aligned windows for
+  `lm_head`, and a loader that fills the padding without materializing an anonymous copy of
+  the trellis.
+- **A correct MoE kernel choice**: the fused uniform-K kernel is wrong at K=3, so all
+  uniform-K layers are routed through the mixed-K kernel (`EXL3_FORCE_MIXEDK=1`). Both packs
+  contain K=3 layers, and the 3.06 pack is **uniformly K=3** — the flag is mandatory, not a
+  tuning knob.
+- **The DSpark drafter** (`vllm/models/minimax_m3/nvidia/dflash.py`): MXFP8 dequant, fused
+  context-KV buffers, Gemma norms, speculator wiring, aux hidden states across PP.
+- **Vision**: tower built with `quant_config=None`, modality limits restored (the pack's
+  `quantization_config.json` has no vision key and `--language-model-only` zeroes every
+  modality limit), and profiling dummies bounded by `vision_segment_max_frames`.
+- **A reasoning parser** (`vllm/reasoning/minimax_m3_reasoning_parser.py`) for the
+  `<mm:think>` delimiters.
 
-### Model Specific setups
+`exllamav3` also has to be rebuilt for sm_86 with `ACT_SILU_OAI` (act 3) in the non-coop
+path; without it the MoE returns SiLU instead of the intended OAI activation and the text
+degrades into repetition.
 
-#### GLM-5.3-Flash (v0.11.2+)
+## The six silent defects
 
-```bash
-NCCL_ALGO=Ring NCCL_PROTO=Simple
-vllm serve wtdcode/GLM-5.3-Flash-AWQ-W4A16 \
-  --host 0.0.0.0 \
-  --port 8000 \
-  --served-model-name glm-5.3-flash \
-  --tensor-parallel-size 4 \
-  --max-model-len 524288 \
-  --gpu-memory-utilization 0.92 \
-  --max-num-seqs 16 \
-  --max-num-batched-tokens 8192 \
-  --enable-prefix-caching \
-  --enable-prompt-tokens-details \
-  --disable-custom-all-reduce \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16],"max_cudagraph_capture_size":16}' \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
-  --enable-auto-tool-choice \
-  --tool-call-parser glm47 \
-  --reasoning-parser glm45
-```
+Each of these booted and answered. None of them logged an error.
 
-- Verified with MTP-3 on 4x A100-80GB (sm80). On 8x RTX A6000 (sm86) use `--tensor-parallel-size 8` and drop `--gpu-memory-utilization` to 0.85 — with the MTP draft loaded, 0.9+ OOMs during cudagraph warmup on 48 GB cards.
-- Serving directly from the Hugging Face repository ID works; no manual snapshot-path resolution is needed.
-- LMCache: the unified KV block size is 1152, so `--chunk-size` must be a multiple of 1152 (use `--chunk-size 1152 --separate-object-groups`), and add `--prefix-cache-retention-interval 1152 --max-num-batched-tokens 1152` to `vllm serve` (the LMCache fork requires a recurrent-state checkpoint at every chunk boundary and rejects MTP + align mode with a larger batch budget).
+1. **MoE uniform-K kernel wrong at K=3.** `ffn_out` of the first uniform-K3 layer scored
+   cos 0.32 against the oracle while attention, `ffn_in` and routing matched to 1e-6;
+   routing margins were 1e-2, so it was not a tie. Symptom: `etim…` repetition. Fix:
+   `EXL3_FORCE_MIXEDK=1`. Issue draft in
+   [`BUG-exl3-moe-uniform-k3.md`](docs/exl3-mm31/BUG-exl3-moe-uniform-k3.md).
+2. **`lm_head` in TP>1 cut a Hadamard block in half.** 200,064 rows / 2 = 100,032, and
+   EXL3 applies its output Hadamard in blocks of 128 columns: rank 1 decoded against the
+   wrong transform and produced a single spurious logit of 63.9 on token id 99968. Fix:
+   each rank loads the whole 128-aligned window and drops the `lead` before concatenating.
+3. **Host RAM OOM during the load in TP>1.** `.contiguous()` on the sharded trellis
+   materialized an anonymous copy of every expert (≈150 GB over the load) and the
+   OOM-killer took the workers without a traceback. Fix: return the view; watch
+   `AnonPages`, not `free`.
+4. **Drafter with 0% acceptance while everything looked healthy.** Three independent
+   silent faults: the MXFP8 `weight_scale_inv` suffix with a stray dot matched no tensor,
+   so raw `float8_e4m3` values (|w| up to 448) went into fp16 parameters; the drafter
+   inherited the sparse attention backend although its 5 layers are dense; and the probe
+   counted SSE chunks instead of tokens.
+5. **Vision in three layers of failure.** `--language-model-only` zeroed the limits of every
+   modality (`At most 0 image(s) may be provided in one prompt`); the EXL3 plugin claimed
+   the bf16 tower and read it as trellis; and the profiling dummy video was sized from
+   `max_model_len` (500 frames at 262k), blowing up inside the tower's first `layer_norm`.
+6. **Reasoning leaked into `content` while streaming.** `is_reasoning_end(prompt)` scanned
+   the whole prompt for the marker pair, but the chat template's own instruction block
+   contains the literal `<mm:think></mm:think>`. Fix: only the end of the prompt counts.
 
-#### Qwen3.8-Flash-Next (v0.9.0+)
+## Measurement traps
 
-```bash
-VLLM_PLE_CPU_OFFLOAD=1 VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
-vllm serve /path/to/your/qwen3.8 \
-  --host=0.0.0.0 \
-  --port=19088 \
-  --served-model-name=qwen3.8-flash-next \
-  --tensor-parallel-size=4 \
-  --enable-expert-parallel \
-  --max-model-len=1000000 \
-  --max-num-seqs=8 \
-  --max-num-batched-tokens=2048 \
-  --gpu-memory-utilization=0.9 \
-  --disable-custom-all-reduce \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE"}' \
-  --hf-overrides '{"text_config": {"rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "yarn", "rope_theta": 10000000, "partial_rotary_factor": 0.25, "factor": 4.0, "original_max_position_embeddings": 262144}}}' \
-  --enable-auto-tool-choice \
-  --tool-call-parser=qwen3_xml \
-  --reasoning-parser=qwen3 \
-  --enable-prompt-tokens-details \
-  --enable-prefix-caching \
-  --mamba-cache-mode=align \
-  --prefix-match-unit=16
-```
+- Counting **SSE chunks** instead of tokens inflates or deflates results by 2× depending on
+  spec decode and the reasoning parser. Use `usage.completion_tokens`.
+- Comparing runs with a different **number of generated tokens** produced a fake +50% once.
+- `systemctl is-active` does not prove the server works; only a real generation does.
+- `pgrep`/`pkill` of workers: nvidia-smi shows host PIDs, workers appear with comm
+  `VLLM::Worker_PP*`, and killing only the EngineCore leaves workers holding VRAM.
+- `${VAR:-{json}}` in bash eats the JSON's closing brace — the default needs its own
+  assignment.
+- With an encoder in the loop, high `--gpu-memory-utilization` is not the pool ceiling:
+  activation from the profiling dummy is.
+- Any block-transform quantization combined with TP must align the shard boundary to the
+  transform block. Split on the tensor and one rank decodes garbage.
 
-- `VLLM_PLE_CPU_OFFLOAD=1` keeps the 51B n-gram embedding (fp8, ~51 GiB) in pinned host RAM via a separate `PleOffloadWorker` process. Without it the TP-sharded embedding adds ~12.8 GiB per GPU and KV memory goes negative on 48 GB cards.
-- `--enable-expert-parallel` is required, not optional: with plain TP the 640-wide expert intermediate becomes 160 per rank, which is not a multiple of the 128x128 fp8 block, and vLLM then forces the Triton fp8 MoE kernel (no fp8 tensor cores on sm86). With EP the experts stay whole and the Marlin W8A16 backend is used.
-- LMCache: the unified KV block size is 800, so `--chunk-size` must be a multiple of 800 (use `--chunk-size 800 --separate-object-groups`), and add `--prefix-cache-retention-interval 800 --max-num-batched-tokens 800` to `vllm serve` (same MTP + align-mode rule as GLM-5.3-Flash).
-- AWQ W4A16 ([`wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16`](https://huggingface.co/wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16), compressed-tensors `pack-quantized`, routed experts INT4 g128, everything else BF16): MTP speculative decoding works (the BF16 MTP draft is kept unquantized automatically). Verified on 4x A100-80GB: `VLLM_PLE_CPU_OFFLOAD=1 vllm serve wtdcode/Qwen3.8-Flash-Next-AWQ-W4A16 --tensor-parallel-size 4 --enable-expert-parallel --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' --speculative-config '{"method":"mtp","num_speculative_tokens":3}'`. This achieves up to 936 tps.
-- `--prefix-match-unit=16` is effectively mandatory. Prefix cache reuses whole blocks only, and this flag sets the block size; the remainder is never reused. It defaults to the mamba block size (800 here), and MTP drops one more block, so nothing under 1600 tokens can ever be reused and the hit rate reads a flat 0.0% no matter how often a prompt repeats. Setting it to 16 drops that floor to 32 tokens. The value must divide 800, so use 16 (or 25/40/50/80/100) -- 64 is rejected at startup. `--enable-mamba-fine-grained-prefix-cache` is optional on top; it only improves the worst-case hit.
+## Reproducing
 
-#### DeepSeek V4 Flash (Preview, 0731, Vision-Exp)
+The engine changes are already in the branch; the cumulative diff exists so the delta
+against upstream can be read (and applied to a clean `avtc/vllm-backport` checkout).
 
 ```bash
-vllm serve /path/to/your/deepseek \
-  --tensor-parallel-size 8 \
-  --max-model-len 1048576 \
-  --gpu-memory-utilization 0.90 \
-  --kv-cache-dtype fp8_ds_mla \
-  --trust-remote-code \
-  --disable-custom-all-reduce \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[1,2,4,8,16,32,64],"max_cudagraph_capture_size":64}' \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
-  --enable-auto-tool-choice --tool-call-parser deepseek_v4 \
-  --host 0.0.0.0 --port 8000 \
-  --served-model-name deepseek-v4-flash
+git clone https://github.com/DoktorMincs/vllm-backport-exl3 && cd vllm-backport
+git checkout exl3-mm31-flash
 ```
 
-- Keep `num_speculative_tokens` at 5 on Ampere. Values below 5 (the checkpoint's `dspark_block_size`) are rejected, and 7 needs ~200 KB of shared memory vs the 163 KB Ampere limit (`triton OutOfResources` error). 6 does start, but draft positions past the native block are almost never accepted (3–13% in our measurements), so it only wastes draft compute — output quality and speed are the same as 5.
-- Requests that set neither `thinking` nor `reasoning_effort` now get thinking mode with high effort, matching the official 0731 API mapping (`reasoning_effort: "none"` restores plain chat mode). Agentic/tool-calling clients should pass a `reasoning_effort` explicitly from the first turn of a session — sessions that run without the effort prefix gradually stop thinking and can enter self-reinforcing reasoning loops.
-- `--hf-overrides '{"head_dtype": "float32"}'` once helped reduce garbage outputs by improving precisions but might be not compulsory.
-- LMCache: the KV block size is 256 (DeepSeek-V4-Flash and Vision-Exp), so `--chunk-size 1024` works for all three; add `--prefix-cache-retention-interval 1024` to `vllm serve` (the LMCache fork requires a state checkpoint at every chunk boundary for the sliding-window groups).
-
-#### DeepSeek V4.1 Flash
+Plugin and runtime (AGPL-3.0 — patch, do not vendor):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-vllm serve /path/to/DeepSeek-V4.1-Flash \
-  --host 0.0.0.0 --port 18005 \
-  --served-model-name deepseek-v4.1-flash \
-  --tensor-parallel-size 8 \
-  --max-num-batched-tokens 16384 \
-  --gpu-memory-utilization 0.90 \
-  --kv-cache-dtype fp8_ds_mla \
-  --engram-config '{"cpu_offload": true}' \
-  --enable-prefix-caching \
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,12,24,48,96,192,384],"max_cudagraph_capture_size":384}' \
-  --speculative-config '{"method":"dspark","num_speculative_tokens":5,"use_local_argmax_reduction":true}' \
-  --tokenizer-mode deepseek_v41 \
-  --enable-auto-tool-choice --tool-call-parser deepseek_v41 --reasoning-parser deepseek_v41
+git clone https://github.com/vcruz305/vllm-exl3 ~/vllm-exl3 && cd ~/vllm-exl3
+git apply /path/to/vllm-backport/docs/exl3-mm31/patches/plugin-exl3-local-cumulative.diff
+# rebuild exllamav3 for sm_86 with ACT_SILU_OAI (act 3) in the non-coop path
 ```
 
-- Expert parallel also works.
-- LMCache: Note that the KV block size is 128.
-
-#### MiMo-V2.6-Flash-RL
+Boot (the flags that matter, TP=2 × PP=5 on 10 GPUs):
 
 ```bash
-VLLM_MM_DISABLE_PINNED_H2D=1 \
-vllm serve /home/ubuntu/models/MiMo-V2.6-Flash-RL-XiaomiMiMo \
-  -tp 8 \
-  --pipeline-parallel-size 1 \
-  --trust-remote-code \
-  --generation-config vllm \
-  --reasoning-parser mimo \
-  --tool-call-parser mimo \
-  --enable-auto-tool-choice \
-  --served-model-name mimo-v2.6-flash \
-    --port 8000 \
-    --host 0.0.0.0 \
-    --uvicorn-log-level info \
-    --max-num-seqs 8 \
-    --seed 1234 \
-    --max-model-len auto \
-    -O3 \
-    --no-use-tqdm-on-load \
-    --performance-mode balanced \
-    --enable-chunked-prefill \
-    --max-num-batched-tokens 512 \
-    --enable-prefix-caching \
-    --chat-template /home/ubuntu/models/MiMo-V2.6-Flash-RL-XiaomiMiMo/chat_template_fixed.jinja \
-    --default-chat-template-kwargs '{"interleaved_thinking": true,"preserve_thinking": true}' \
-    --gpu-memory-utilization 0.94 \
-    --generation-config vllm \
-    --attention-backend TRITON_ATTN_DIFFKV \
-    --enable-prompt-tokens-details \
-    --kv-cache-dtype fp8 \
-    --skip-mm-profiling \
-    --limit-mm-per-prompt '{"audio": 0, "image": 4, "video": 0}' \
-    --speculative-config '{"method":"mtp","num_speculative_tokens":3}'
+# 3.5 bpw: 12,12,14,12,10 | 3.06 bpw: 13,12,12,12,11 (max 16.16 GiB/GPU)
+VLLM_PP_LAYER_PARTITION=12,12,14,12,10 \
+EXL3_FORCE_MIXEDK=1 VLLM_EXL3_MINIMAX_M3=1 \
+VLLM_EXL3_MOE_TP_ALIGN=128 EXL3_ALLOW_TP_INDEXER=1 \
+vllm serve <pack> \
+  --quantization exl3 --dtype float16 \
+  --tensor-parallel-size 2 --pipeline-parallel-size 5 \
+  --max-model-len 131072 --gpu-memory-utilization 0.96 \
+  --max-num-seqs 8 --max-num-batched-tokens 512 \
+  --kv-cache-dtype fp8_e5m2 \
+  --reasoning-parser minimax_m3 \
+  --limit-mm-per-prompt '{"image": 2, "video": 1}'
 ```
 
-- Verified on 8x RTX 3090 (sm86, TP8) with MTP-3 and fp8 KV: single-stream decode ~177 t/s at 33K context (159 t/s with bf16 o_proj), prefill ~1840 tok/s at 33K prompts and ~2400 tok/s incremental on 20K chained-prefix context; 462 t/s aggregate at 16 concurrent streams; GSM8K 82.7%. The fused-fp8-QKV NB=4 sharding, MTP loader and sliding-window fixes are required for any serving of this checkpoint: TP8 previously produced garbage output (row-scrambled SWA layers), TP2/TP4 crashed at weight load.
-- `--max-num-batched-tokens 512` is the measured sweet spot on this rig for single-stream latency (+15-29% incremental prefill vs 1024 at 20-50K context; 2048+ loses). At 512 the chunked-prefill all-reduces stay under the stock 8 MiB custom-AR cutoff, so no all-reduce tuning is needed. For multi-stream throughput raise `--max-num-seqs` instead (capture sizes auto-follow).
-- `VLLM_MIMO_OPROJ_FP8=1` (opt-in): quantizes the 48 bf16 o_proj layers to online per-tensor fp8 (Marlin W8A16 on sm86) for +7-19% decode and +9% prefill at MNBT 1024; GSM8K parity measured (82.7% vs 82.0%). It is lossy (not bit-exact), hence opt-in. Clear `~/.cache/vllm/torch_compile_cache` once when toggling it, and keep the chunk budget below 2048 (Marlin W8A16 loses to bf16 cuBLAS at large chunk M).
-- fp8 KV on sm<89 works on this path: the DiffKV kernels dequantize E4M3 through a LUT (no native fp8 math) and the store path quantizes via torch; the KV pool roughly doubles (787K tokens at 0.96 / MNBT 512 vs 331K fp16).
-- The example shape (mm towers loaded — vision and audio load even at `audio: 0` — plus util 0.94) yields a ~433K-token fp8 KV pool; one live image costs ~150 MB on top. For text-only serving drop `--skip-mm-profiling` / `--limit-mm-per-prompt`, add `--language-model-only` and raise `--gpu-memory-utilization` to 0.96: the towers free ~1 GiB/card and the pool grows to ~650K+ tokens. Alternatively pin the pool size directly with `--kv-cache-memory` (the startup log prints the suggested value to fully utilize the card).
-- `VLLM_CUSTOM_AR_ENFORCE=1` (opt-in, model-independent): auto-sizes the custom-all-reduce cutoff to the largest activation all-reduce so chunked prefill stays on the custom P2P path instead of falling back to NCCL above the 8 MiB default — measured +18-46% prefill at 13-21K prompts at MNBT 1024. Only relevant at chunk budgets >= 1024; unset keeps upstream behavior byte-for-byte.
-- The `chat_template_fixed.jinja` patch adds `reasoning_content` round-trip and pre-opened thinking; `chat_utils` now also accepts `reasoning_content` on input for any model when `reasoning` is absent.
+Neither small value is arbitrary. `--max-num-seqs 8` is what makes util 0.96 boot at all —
+at the default 256 the profiling activation reservation OOMs before any KV exists — and
+`512` is the measured prefill optimum on these cards.
+
+## Repository layout
+
+```
+vllm/models/minimax_m3/nvidia/dflash.py          DSpark drafter (new)
+vllm/reasoning/minimax_m3_reasoning_parser.py    <mm:think> parser
+vllm/models/minimax_m3/nvidia/model.py           vision tower built without EXL3
+vllm/models/minimax_m3/common/mm_preprocess.py   dummy video bounded by the segment cap
+vllm/models/minimax_m3/common/sparse_attention.py
+docs/exl3-mm31/README.md                         the defect catalogue (start here)
+docs/exl3-mm31/STATUS.md                         chronological record with every number
+docs/exl3-mm31/FINDINGS-20261027.md              component-by-component investigation
+docs/exl3-mm31/BUG-exl3-moe-uniform-k3.md        issue draft for the plugin
+docs/exl3-mm31/RUNBOOK.md                        how the environment is built and run
+docs/exl3-mm31/patches/                          engine + plugin diffs, AGPL notice
+README-upstream.md                               the original vllm-backport README
+```
+
+## Scope and licensing
+
+- The engine changes here inherit **Apache-2.0** from vLLM and `avtc/vllm-backport`.
+- The diffs under `docs/exl3-mm31/patches/` that touch `vllm-exl3` are derivative works of
+  an **AGPL-3.0** project and remain under that license; see
+  [`patches/NOTICE-plugin.md`](docs/exl3-mm31/patches/NOTICE-plugin.md). Credits to
+  [`vcruz305/vllm-exl3`](https://github.com/vcruz305/vllm-exl3) and
+  [`turboderp-org/exllamav3`](https://github.com/turboderp-org/exllamav3).
+- **No model weights are distributed here.** The packs are third-party artifacts.
+- Hardware-specific by design: this was tuned on 10× RTX 3090 with PCIe only. Numbers on
+  other cards will differ, and the sm_86 kernel rebuild is required.
