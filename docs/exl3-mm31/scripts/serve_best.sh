@@ -37,12 +37,14 @@ WATCHDOG_UNIT="${WATCHDOG_UNIT:-}"
 #     antes de subir e volte ao seu cap normal depois. Decode e' insensivel.
 #   EAGER=0 : CUDA graphs; 6,1x o eager no TP=1 e ~7x no TP=2 (6,6 -> 45,3).
 #
-# Contexto: MAXLEN 131072 com KV fp8_e5m2 (pool 211.328 tokens, 1,61x de
-# concorrencia) e' a config medida; a 105k o decode ainda faz 42,4 tok/s e o
-# prefill 2297 tok/s. fp16 KV vai ate' 65536 (pool 126.720). fp8 e4m3 NAO
-# compila no Triton de sm_86. 262k NAO fecha: com util 0.945 o pool calculado
-# chega a 270.208 tokens (1,03x), mas um worker morre com CUDA OOM no startup;
-# 0.96 idem. Nao insistir sem reduzir o ativacao (MB/cudagraph).
+# Contexto: MAXLEN 131072 com KV fp8_e5m2 (pool 211.328 tokens no modo texto,
+# LANGUAGE_MODEL_ONLY=1; com a torre de visao o pool e' menor) e' a config
+# medida; a 105k o decode ainda faz 42,4 tok/s e o prefill 2297 tok/s. fp16 KV
+# vai ate' 65536 (pool 126.720). fp8 e4m3 NAO compila no Triton de sm_86. 262k
+# com --max-num-seqs 256 NAO fecha: com util 0.945 o pool calculado chega a
+# 270.208 tokens (1,03x), mas um worker morre com CUDA OOM no startup; 0.96
+# idem. Com --max-num-seqs 8 e util 0.95 o pool vai a 281.856 e 262k cabe (modo
+# texto; ver README). Nao insistir sem reduzir o ativacao (MB/cudagraph).
 set -uo pipefail
 export MAXLEN="${MAXLEN:-131072}"
 export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}"

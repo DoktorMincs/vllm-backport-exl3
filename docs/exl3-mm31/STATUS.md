@@ -6,7 +6,7 @@ exercitados); os números válidos são os do topo e do README.
 
 Atualizado: 2026-10-27 23:30 (America/Sao_Paulo)
 
-## DSpark (drafter do MiniMax-M3) — FUNCIONA: 51,6 tok/s vs 44,8 (+15%)
+## DSpark (drafter do MiniMax-M3) — FUNCIONA: 53,95 tok/s vs 44,8 (+20%, N=2)
 
 Implementado em `vllm/models/minimax_m3/nvidia/dflash.py`
 (`DSparkMiniMaxDraftModel` → `DSparkMiniMaxM3ForCausalLM`), registrado em
@@ -120,8 +120,9 @@ do backport varria o prompt inteiro procurando o par de marcadores, mas o bloco
 raciocínio e o servidor mandava tudo como `content`, tag inclusive. O
 não-streaming nunca sofreu (ele só olha a saída).
 
-Correção (`vllm/reasoning/minimax_m3_reasoning_parser.py`, diff em
-`patches/backport-local-reasoning-m3.diff`): só importa o que o template
+Correção (`vllm/reasoning/minimax_m3_reasoning_parser.py`, recorte em
+`patches/backport-local-reasoning-m3.diff`; é um subconjunto do diff cumulativo,
+não aplicar em separado): só importa o que o template
 **prefila no fim do prompt** — `</mm:think>` (thinking desligado) → resposta,
 `<mm:think>` (ligado) → raciocínio, nada (adaptive) → o parser decide posição a
 posição. Validado nos 4 modos offline e no servidor (streaming e não-streaming).

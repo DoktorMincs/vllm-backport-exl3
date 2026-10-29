@@ -41,6 +41,9 @@ CLASSES = {
 
 
 def main() -> int:
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) != 3:
         print(__doc__)
         return 2

@@ -35,6 +35,8 @@ PORT="${1:-3001}"
 MAXLEN="${2:-8192}"
 TP="${3:-1}"
 PP="${4:-10}"
+HOST="${HOST:-0.0.0.0}"
+API_KEY="${API_KEY:-}"
 
 # Balanceamento por bytes reais do pack (60 camadas, contiguas):
 # 0-6 7 | 7-11 5 | 12-16 5 | 17-23 7 | 24-30 7 | 31-37 7 | 38-44 7 |
@@ -190,6 +192,11 @@ else
   MM_ARGS=(--limit-mm-per-prompt "$MM_LIMIT_SPEC")
 fi
 
+# Bind e autenticacao: o default e' 0.0.0.0 sem API key. Em rede compartilhada,
+# defina HOST=127.0.0.1 (ou API_KEY=...) ou coloque um proxy/firewall na frente.
+AUTH_ARGS=()
+if [ -n "$API_KEY" ]; then AUTH_ARGS=(--api-key "$API_KEY"); fi
+
 exec "${NSYS_ARGS[@]}" "$PY" -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" \
   --served-model-name "${SERVED_NAME:-minimax-m3.1-flash}" \
@@ -203,5 +210,6 @@ exec "${NSYS_ARGS[@]}" "$PY" -m vllm.entrypoints.openai.api_server \
   "${EAGER_ARGS[@]}" \
   "${MM_ARGS[@]}" \
   --port "$PORT" \
-  --host 0.0.0.0 \
+  --host "$HOST" \
+  "${AUTH_ARGS[@]}" \
   "${EXTRA[@]}"

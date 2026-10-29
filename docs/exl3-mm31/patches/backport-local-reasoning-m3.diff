@@ -1,3 +1,5 @@
+# Recorte de leitura: subconjunto de backport-exl3-mm31-cumulative.diff.
+# NAO aplicar em separado (o arquivo ja esta incluido no diff cumulativo).
 diff --git a/vllm/reasoning/minimax_m3_reasoning_parser.py b/vllm/reasoning/minimax_m3_reasoning_parser.py
 index d49f9311f4..a1b23f3e1a 100644
 --- a/vllm/reasoning/minimax_m3_reasoning_parser.py

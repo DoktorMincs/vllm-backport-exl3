@@ -20,6 +20,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -62,9 +63,7 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 # --- instrumentacao de depuracao (VLLM_M3_DEBUG_ATTN=1; inerte quando off) ---
-import os as _os
-
-_M3_ATTN_DBG = _os.environ.get("VLLM_M3_DEBUG_ATTN", "")
+_M3_ATTN_DBG = envs.VLLM_M3_DEBUG_ATTN
 _M3_ATTN_DBG_N = 0
 
 

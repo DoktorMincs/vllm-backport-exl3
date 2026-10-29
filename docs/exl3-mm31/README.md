@@ -172,7 +172,7 @@ git checkout ced6985fd1
 git apply /caminho/para/vllm-backport-exl3/docs/exl3-mm31/patches/backport-exl3-mm31-cumulative.diff
 ```
 
-O plugin EXL3 precisa dos patches correspondentes (AGPL-3.0 — ver
+O plugin EXL3 precisa dos patches correspondentes (AGPL-3.0-only — ver
 `patches/NOTICE-plugin.md` e `patches/LICENSE-AGPL-3.0`), aplicados sobre o
 commit `053c634`:
 
@@ -182,7 +182,9 @@ git apply .../patches/plugin-exl3-local-cumulative.diff
 ```
 
 E do `exllamav3` reconstruído para sm_86 com `ACT_SILU_OAI` (act 3) no caminho
-não-coop — sem isso o MoE devolve SILU no lugar do OAI e o texto degrada.
+não-coop — sem isso o MoE devolve SILU no lugar do OAI e o texto degrada. Use o
+fork `vcruz305/exllamav3` em `329e051` ou posterior, que fornece
+`exl3_moe_mixedk`.
 
 As ferramentas de medição e operação citadas no RUNBOOK estão em
 [`scripts/`](scripts/README.md), na versão sanitizada (caminhos e unidades de
@@ -192,7 +194,7 @@ produção vêm do ambiente).
 
 - O código deste fork herda **Apache-2.0** do vLLM/`wtdcode/vllm-backport`.
 - Os arquivos em `patches/` que tocam `vllm-exl3` são derivados de um projeto
-  **AGPL-3.0** e permanecem sob essa licença; ver `patches/NOTICE-plugin.md` e
+  **AGPL-3.0-only** e permanecem sob essa licença; ver `patches/NOTICE-plugin.md` e
   o texto completo em `patches/LICENSE-AGPL-3.0`.
 - Os scripts em `scripts/` seguem a licença do repositório (Apache-2.0).
 - Nenhum peso de modelo é distribuído aqui; o modelo base usa a **MiniMax

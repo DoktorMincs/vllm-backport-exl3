@@ -2,23 +2,23 @@
 
 `plugin-exl3-local-cumulative.diff` é um diff sobre
 [`vcruz305/vllm-exl3`](https://github.com/vcruz305/vllm-exl3), distribuído sob
-**GNU Affero General Public License v3.0 (AGPL-3.0)**.
+**GNU Affero General Public License v3.0 (AGPL-3.0-only)**.
 
 Este diff é uma obra derivada daquele projeto e, como tal, permanece licenciado
-sob **AGPL-3.0**. O texto completo está em
+sob **AGPL-3.0-only**. O texto completo está em
 [`LICENSE-AGPL-3.0`](LICENSE-AGPL-3.0) neste diretório (cópia da licença do
 plugin), no repositório original e em
 <https://www.gnu.org/licenses/agpl-3.0.html>. O diff foi gerado contra o plugin
 no commit `053c634`; aplique nesse commit.
 
 In English: `plugin-exl3-local-cumulative.diff` is a derivative work of
-`vcruz305/vllm-exl3` and is distributed under **AGPL-3.0**. The full license
+`vcruz305/vllm-exl3` and is distributed under **AGPL-3.0-only**. The full license
 text is in `LICENSE-AGPL-3.0`. The patch applies at commit `053c634`. The plugin
 source itself is not vendored in this repository.
 
 Créditos: plugin original de `vcruz305`; os motores de quantização EXL3 vêm de
 [`turboderp-org/exllamav3`](https://github.com/turboderp-org/exllamav3)
-(MIT/Apache conforme o projeto original).
+(MIT, conforme o `LICENSE` do projeto original).
 
 ## O que o diff muda
 

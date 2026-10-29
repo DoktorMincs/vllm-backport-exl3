@@ -1,5 +1,5 @@
-blank_issues_enabled: false
+blank_issues_enabled: true
 contact_links:
-  - name: Questions
-    url: https://discuss.vllm.ai
-    about: Ask questions and discuss with other vLLM community members
+  - name: Upstream vLLM issues
+    url: https://github.com/vllm-project/vllm/issues
+    about: Bugs in the vLLM engine that this fork did not introduce

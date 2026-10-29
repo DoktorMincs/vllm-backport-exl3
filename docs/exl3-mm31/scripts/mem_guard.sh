@@ -17,8 +17,8 @@ WATCHDOG_UNIT="${WATCHDOG_UNIT:-}"
 # (a producao fica de pe') e registra o pico no log.
 #
 # Uso: mem_guard.sh <tag> [piso_MB=8000] [intervalo_s=5] [porta=3001]
-# A porta entra no pgrep que decide se o servidor ainda existe (o experimental
-# agora sobe na 3000 com --served-model-name minimax-m2.7).
+# A porta entra no pgrep que decide se o servidor experimental ainda existe
+# (o default do serve_m3.sh e' 3001).
 set -uo pipefail
 TAG="${1:-mem}"
 FLOOR="${2:-8000}"

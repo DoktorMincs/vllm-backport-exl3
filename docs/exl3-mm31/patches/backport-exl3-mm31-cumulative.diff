@@ -74,19 +74,25 @@ index 0a22b51b3c..260cf36c04 100644
                      if self.num_speculative_tokens is None:
                          # Default to max value defined in draft model config.
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 5ceb4c5ecd..ee010819dd 100755
+index 5ceb4c5ecd..9932b82f99 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
-@@ -328,6 +328,8 @@ if TYPE_CHECKING:
+@@ -328,6 +328,14 @@ if TYPE_CHECKING:
      VLLM_MHC_FIXED_NUM_SPLIT: int = 0
      VLLM_TOKEN_BUCKET_PAD: bool = True
      VLLM_DSPARK_FUSED_MARKOV: bool = True
 +    VLLM_M3_DEBUG_DRAFT: bool = False
 +    VLLM_M3_TIME_DRAFT: bool = False
++    VLLM_M3_DEBUG: str = ""
++    VLLM_M3_DEBUG_MAX: int = 2
++    VLLM_M3_DEBUG_ATTN: str = ""
++    VLLM_M3_DUMP: str = ""
++    VLLM_M3_DUMP_MAXT: int = 64
++    VLLM_M3_DUMP_T: int = 0
      VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
      VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
      VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
-@@ -2301,6 +2303,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -2301,6 +2309,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
      "VLLM_DSPARK_FUSED_MARKOV": lambda: (
          os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
      ),
@@ -96,6 +102,15 @@ index 5ceb4c5ecd..ee010819dd 100755
 +    "VLLM_M3_TIME_DRAFT": lambda: (
 +        os.environ.get("VLLM_M3_TIME_DRAFT", "0") == "1"
 +    ),
++    # Debug instrumentation for the MiniMax-M3 engine path (model.py and
++    # sparse_attention.py). Registered here so they follow the same rules as
++    # every other knob: typed access, envs cache and centralized documentation.
++    "VLLM_M3_DEBUG": lambda: os.environ.get("VLLM_M3_DEBUG", ""),
++    "VLLM_M3_DEBUG_MAX": lambda: int(os.environ.get("VLLM_M3_DEBUG_MAX", "2")),
++    "VLLM_M3_DEBUG_ATTN": lambda: os.environ.get("VLLM_M3_DEBUG_ATTN", ""),
++    "VLLM_M3_DUMP": lambda: os.environ.get("VLLM_M3_DUMP", ""),
++    "VLLM_M3_DUMP_MAXT": lambda: int(os.environ.get("VLLM_M3_DUMP_MAXT", "64")),
++    "VLLM_M3_DUMP_T": lambda: int(os.environ.get("VLLM_M3_DUMP_T", "0")),
      # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
      # the batch-adaptive heuristic, which picks splits from the query count and
      # batch-average KV lengths so a request's reduction order can depend on the
@@ -180,17 +195,23 @@ index 9f1d08011a..9e019f1b23 100644
              max_total_frames // max(max_videos, 1), max_frames_per_video
          )
 diff --git a/vllm/models/minimax_m3/common/sparse_attention.py b/vllm/models/minimax_m3/common/sparse_attention.py
-index 50c03dd9bf..81c1064fe6 100644
+index 50c03dd9bf..fb66221296 100644
 --- a/vllm/models/minimax_m3/common/sparse_attention.py
 +++ b/vllm/models/minimax_m3/common/sparse_attention.py
-@@ -61,6 +61,35 @@ from vllm.v1.kv_cache_interface import (
+@@ -20,6 +20,7 @@ from typing import ClassVar
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from vllm._aiter_ops import rocm_aiter_ops
+ from vllm.config import VllmConfig
+ from vllm.config.cache import CacheDType
+@@ -61,6 +62,33 @@ from vllm.v1.kv_cache_interface import (
  
  logger = init_logger(__name__)
  
 +# --- instrumentacao de depuracao (VLLM_M3_DEBUG_ATTN=1; inerte quando off) ---
-+import os as _os
-+
-+_M3_ATTN_DBG = _os.environ.get("VLLM_M3_DEBUG_ATTN", "")
++_M3_ATTN_DBG = envs.VLLM_M3_DEBUG_ATTN
 +_M3_ATTN_DBG_N = 0
 +
 +
@@ -219,7 +240,7 @@ index 50c03dd9bf..81c1064fe6 100644
  
  def _minimax_m3_aiter_sparse_pa_requested() -> bool:
      return rocm_aiter_ops.is_enabled() and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
-@@ -469,6 +498,12 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
+@@ -469,6 +497,12 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
              else topk_buffer[:num_tokens].transpose(0, 1)
          )
          assert topk is not None
@@ -704,10 +725,10 @@ index 0000000000..b68bd52d4d
 +
 +        return super().load_weights(_fix(weights))
 diff --git a/vllm/models/minimax_m3/nvidia/model.py b/vllm/models/minimax_m3/nvidia/model.py
-index 970b06d407..f0da9ee89e 100644
+index 970b06d407..f4326d1d89 100644
 --- a/vllm/models/minimax_m3/nvidia/model.py
 +++ b/vllm/models/minimax_m3/nvidia/model.py
-@@ -14,6 +14,8 @@ The MiniMax-M3-preview config selects a single set of branches:
+@@ -14,10 +14,13 @@ The MiniMax-M3-preview config selects a single set of branches:
  
  from collections.abc import Iterable
  
@@ -716,13 +737,18 @@ index 970b06d407..f0da9ee89e 100644
  import torch
  from torch import nn
  from transformers import PretrainedConfig
-@@ -111,6 +113,102 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
+ 
++import vllm.envs as envs
+ from vllm import _custom_ops as ops
+ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
+@@ -111,6 +114,102 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
      return moe_layer_freq[layer_id] != 0
  
  
 +# --- instrumentacao de depuracao (VLLM_M3_DEBUG=1; inerte quando desligada) ---
-+_M3_DBG = _os.environ.get("VLLM_M3_DEBUG", "")
-+_M3_DBG_MAX = int(_os.environ.get("VLLM_M3_DEBUG_MAX", "2"))
++_M3_DBG = envs.VLLM_M3_DEBUG
++_M3_DBG_MAX = envs.VLLM_M3_DEBUG_MAX
 +_M3_DBG_N: dict[str, int] = {}
 +
 +
@@ -749,9 +775,9 @@ index 970b06d407..f0da9ee89e 100644
 +
 +
 +# --- dump de tensores para comparacao com o oraculo (VLLM_M3_DUMP=<dir>) ---
-+_M3_DUMP = _os.environ.get("VLLM_M3_DUMP", "")
-+_M3_DUMP_MAXT = int(_os.environ.get("VLLM_M3_DUMP_MAXT", "64"))
-+_M3_DUMP_T = int(_os.environ.get("VLLM_M3_DUMP_T", "0"))
++_M3_DUMP = envs.VLLM_M3_DUMP
++_M3_DUMP_MAXT = envs.VLLM_M3_DUMP_MAXT
++_M3_DUMP_T = envs.VLLM_M3_DUMP_T
 +# Portao de armacao: os forwards de profiling do boot (batch de tokens
 +# identicos) tem o mesmo T do request. O dump so vale depois que o arquivo
 +# <dir>/ARM existe, entao o primeiro forward pequeno APOS o ARM e o request.
@@ -819,7 +845,7 @@ index 970b06d407..f0da9ee89e 100644
  class MiniMAXGemmaRMSNorm(nn.Module):
      """Gemma-style RMS normalization backed by FlashInfer kernels.
  
-@@ -498,8 +596,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
+@@ -498,8 +597,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
          set_default_quant_scales(self, register_buffer=True)
          # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
          # cache (--attention-config '{"indexer_kv_dtype": ...}').
@@ -835,7 +861,7 @@ index 970b06d407..f0da9ee89e 100644
          )
  
          # Shared top-k buffer: the indexer writes the selected blocks into it and
-@@ -767,16 +871,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
+@@ -767,16 +872,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
                  hidden_states = self.input_layernorm(hidden_states)
              else:
                  hidden_states, residual = self.input_layernorm(hidden_states, residual)
@@ -862,7 +888,7 @@ index 970b06d407..f0da9ee89e 100644
          return hidden_states, residual
  
      @property
-@@ -790,6 +904,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
+@@ -790,6 +905,10 @@ class MiniMaxM3DecoderLayer(nn.Module):
  
  class MiniMaxM3Model(nn.Module, EagleModelMixin):
      fall_back_to_pt_during_load = False
@@ -873,7 +899,7 @@ index 970b06d407..f0da9ee89e 100644
  
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
-@@ -875,22 +993,36 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
+@@ -875,22 +994,36 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
              else:
                  hidden_states = self.embed_input_ids(input_ids)
              residual = None
@@ -915,7 +941,7 @@ index 970b06d407..f0da9ee89e 100644
              )
  
          if self.fuse_final_norm_allreduce:
-@@ -899,6 +1031,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
+@@ -899,6 +1032,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
              )
          else:
              hidden_states, _ = self.norm(hidden_states, residual)
@@ -923,7 +949,7 @@ index 970b06d407..f0da9ee89e 100644
  
          if len(aux_hidden_states) > 0:
              return hidden_states, aux_hidden_states
-@@ -1057,7 +1190,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
+@@ -1057,7 +1191,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
          return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
  
      def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
@@ -942,7 +968,7 @@ index 970b06d407..f0da9ee89e 100644
  
      def compute_logits_local(self, hidden_states: torch.Tensor) -> torch.Tensor:
          return self.logits_processor(self.lm_head, hidden_states, skip_gather=True)
-@@ -1133,7 +1276,14 @@ class MiniMaxM3SparseForConditionalGeneration(
+@@ -1133,7 +1277,14 @@ class MiniMaxM3SparseForConditionalGeneration(
                  config=PretrainedConfig.from_dict(vision_config),
                  text_hidden_size=text_hidden_size,
                  projector_hidden_size=projector_hidden_size,

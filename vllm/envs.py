@@ -330,6 +330,12 @@ if TYPE_CHECKING:
     VLLM_DSPARK_FUSED_MARKOV: bool = True
     VLLM_M3_DEBUG_DRAFT: bool = False
     VLLM_M3_TIME_DRAFT: bool = False
+    VLLM_M3_DEBUG: str = ""
+    VLLM_M3_DEBUG_MAX: int = 2
+    VLLM_M3_DEBUG_ATTN: str = ""
+    VLLM_M3_DUMP: str = ""
+    VLLM_M3_DUMP_MAXT: int = 64
+    VLLM_M3_DUMP_T: int = 0
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -2309,6 +2315,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_M3_TIME_DRAFT": lambda: (
         os.environ.get("VLLM_M3_TIME_DRAFT", "0") == "1"
     ),
+    # Debug instrumentation for the MiniMax-M3 engine path (model.py and
+    # sparse_attention.py). Registered here so they follow the same rules as
+    # every other knob: typed access, envs cache and centralized documentation.
+    "VLLM_M3_DEBUG": lambda: os.environ.get("VLLM_M3_DEBUG", ""),
+    "VLLM_M3_DEBUG_MAX": lambda: int(os.environ.get("VLLM_M3_DEBUG_MAX", "2")),
+    "VLLM_M3_DEBUG_ATTN": lambda: os.environ.get("VLLM_M3_DEBUG_ATTN", ""),
+    "VLLM_M3_DUMP": lambda: os.environ.get("VLLM_M3_DUMP", ""),
+    "VLLM_M3_DUMP_MAXT": lambda: int(os.environ.get("VLLM_M3_DUMP_MAXT", "64")),
+    "VLLM_M3_DUMP_T": lambda: int(os.environ.get("VLLM_M3_DUMP_T", "0")),
     # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
     # the batch-adaptive heuristic, which picks splits from the query count and
     # batch-average KV lengths so a request's reduction order can depend on the

@@ -38,6 +38,9 @@ def load_tool():
 
 
 def main(argv):
+    if any(a in ("-h", "--help") for a in argv[1:]):
+        print(__doc__)
+        return 0
     ks = [int(a) for a in argv[1:]] or [3, 4]
     mod = load_tool()
     # geometria real do MiniMax-M3.1-Flash (hidden 6144, intermediate 3072,

@@ -29,6 +29,9 @@ TOOL = EXL3_ROOT + '/pkgs/vllm-exl3/tools/gb10_minimax_m3_parity.py'
 
 
 def main() -> int:
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__)
+        return 0
     spec = importlib.util.spec_from_file_location("parity_m3", TOOL)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

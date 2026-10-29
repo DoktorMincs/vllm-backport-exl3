@@ -20,6 +20,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
@@ -114,8 +115,8 @@ def _is_moe_layer(config: PretrainedConfig, layer_id: int) -> bool:
 
 
 # --- instrumentacao de depuracao (VLLM_M3_DEBUG=1; inerte quando desligada) ---
-_M3_DBG = _os.environ.get("VLLM_M3_DEBUG", "")
-_M3_DBG_MAX = int(_os.environ.get("VLLM_M3_DEBUG_MAX", "2"))
+_M3_DBG = envs.VLLM_M3_DEBUG
+_M3_DBG_MAX = envs.VLLM_M3_DEBUG_MAX
 _M3_DBG_N: dict[str, int] = {}
 
 
@@ -142,9 +143,9 @@ def _m3_dbg(tag: str, t: torch.Tensor) -> None:
 
 
 # --- dump de tensores para comparacao com o oraculo (VLLM_M3_DUMP=<dir>) ---
-_M3_DUMP = _os.environ.get("VLLM_M3_DUMP", "")
-_M3_DUMP_MAXT = int(_os.environ.get("VLLM_M3_DUMP_MAXT", "64"))
-_M3_DUMP_T = int(_os.environ.get("VLLM_M3_DUMP_T", "0"))
+_M3_DUMP = envs.VLLM_M3_DUMP
+_M3_DUMP_MAXT = envs.VLLM_M3_DUMP_MAXT
+_M3_DUMP_T = envs.VLLM_M3_DUMP_T
 # Portao de armacao: os forwards de profiling do boot (batch de tokens
 # identicos) tem o mesmo T do request. O dump so vale depois que o arquivo
 # <dir>/ARM existe, entao o primeiro forward pequeno APOS o ARM e o request.

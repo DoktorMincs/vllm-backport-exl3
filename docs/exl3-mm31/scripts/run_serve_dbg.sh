@@ -17,7 +17,19 @@ WATCHDOG_UNIT="${WATCHDOG_UNIT:-}"
 set -uo pipefail
 TAG="${1:-boot3}"
 DUMP="${DUMPDIR:-${EXL3_ROOT}/logs/dump3}"
-rm -rf "$DUMP"
+# Guarda: o dump e' apagado e recriado. Sem ALLOW_ANY_DUMPDIR=1, so aceita
+# caminhos sob ${EXL3_ROOT}/logs, para um DUMPDIR errado nao apagar outro
+# diretorio.
+if [ "${ALLOW_ANY_DUMPDIR:-0}" != "1" ]; then
+  case "$DUMP" in
+    "${EXL3_ROOT}/logs/"*) ;;
+    *)
+      echo "ERRO: DUMPDIR='$DUMP' fora de ${EXL3_ROOT}/logs; use ALLOW_ANY_DUMPDIR=1 para permitir." >&2
+      exit 2
+      ;;
+  esac
+fi
+rm -rf -- "$DUMP"
 mkdir -p "$DUMP"
 export VLLM_M3_DEBUG="${VLLM_M3_DEBUG:-1}"
 export VLLM_M3_DEBUG_MAX="${VLLM_M3_DEBUG_MAX:-8}"

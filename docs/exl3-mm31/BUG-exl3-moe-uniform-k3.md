@@ -1,7 +1,7 @@
 # Rascunho de issue: `exl3_moe` (K uniforme) produz saída errada com K=3
 
 Rascunho de issue para o repositório `vcruz305/vllm-exl3`. O plugin é
-AGPL-3.0; este documento e o diff em `patches/` são publicados sob essa
+AGPL-3.0-only; este documento e o diff em `patches/` são publicados sob essa
 licença (ver `patches/NOTICE-plugin.md` e `patches/LICENSE-AGPL-3.0`).
 
 ## Resumo

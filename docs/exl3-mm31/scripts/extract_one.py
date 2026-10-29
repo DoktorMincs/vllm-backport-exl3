@@ -32,6 +32,9 @@ from safetensors import safe_open
 
 
 def main() -> int:
+    if any(a in ("-h", "--help") for a in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if len(sys.argv) < 4:
         print(__doc__)
         return 2

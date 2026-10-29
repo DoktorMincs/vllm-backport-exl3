@@ -74,7 +74,12 @@ instrumentação).
    decodificado contra a transformada errada e o último bloco do rank 0 fabrica
    um logit de 63,9 no id 99968 ('etim'). Ver STATUS.md (topo).
 
-Os patches são um diff sobre o plugin em `053c634` e estão sob AGPL-3.0
+O diff cumulativo inclui ainda duas mudanças de suporte que não são correções
+numeradas: `_narrow_tp` devolve view (evita a cópia anônima do trellis em TP>1)
+e o caminho de TP do indexer (`EXL3_ALLOW_TP_INDEXER`, `VLLM_EXL3_MOE_TP_ALIGN`).
+Ver `patches/NOTICE-plugin.md`.
+
+Os patches são um diff sobre o plugin em `053c634` e estão sob AGPL-3.0-only
 (`patches/NOTICE-plugin.md` e `patches/LICENSE-AGPL-3.0`).
 
 ## Subir o servidor

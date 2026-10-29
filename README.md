@@ -19,7 +19,7 @@ The engine is the upstream backport plus the commits on branch `exl3-mm31-flash`
 (derived from `ced6985fd1`). Quantization comes from the
 [`vllm-exl3`](https://github.com/vcruz305/vllm-exl3) plugin, which needed local
 patches — those are distributed **as diffs only** (`docs/exl3-mm31/patches/`), since the
-plugin is AGPL-3.0. The engineering record — every defect, measurement and dead end — is
+plugin is AGPL-3.0-only. The engineering record — every defect, measurement and dead end — is
 in [`docs/exl3-mm31/`](docs/exl3-mm31/README.md).
 
 This is not a general-purpose serving recipe. It is the record of making a 184 GB model
@@ -160,14 +160,19 @@ git checkout ced6985fd1
 git apply /path/to/vllm-backport-exl3/docs/exl3-mm31/patches/backport-exl3-mm31-cumulative.diff
 ```
 
-Plugin and runtime (AGPL-3.0 — patch, do not vendor). The diff is generated against
-`vcruz305/vllm-exl3` at `053c634`; check that commit out first:
+Plugin and runtime (AGPL-3.0-only — patch, do not vendor). The diff is generated against
+`vcruz305/vllm-exl3` at `053c634`; check that commit out first. The scripts read
+`EXL3_PORT` (default `~/exl3-port`) as the environment root and expect the plugin at
+`$EXL3_ROOT/pkgs/vllm-exl3`:
 
 ```bash
-git clone https://github.com/vcruz305/vllm-exl3 ~/vllm-exl3 && cd ~/vllm-exl3
+EXL3_ROOT="${EXL3_PORT:-$HOME/exl3-port}"
+git clone https://github.com/vcruz305/vllm-exl3 "$EXL3_ROOT/pkgs/vllm-exl3"
+cd "$EXL3_ROOT/pkgs/vllm-exl3"
 git checkout 053c634
 git apply /path/to/vllm-backport-exl3/docs/exl3-mm31/patches/plugin-exl3-local-cumulative.diff
-# rebuild exllamav3 for sm_86 with ACT_SILU_OAI (act 3) in the non-coop path
+# rebuild exllamav3 (vcruz305 fork, 329e051 or later, which provides
+# exl3_moe_mixedk) for sm_86 with ACT_SILU_OAI (act 3) in the non-coop path
 ```
 
 The measurement and runbook tooling is in `docs/exl3-mm31/scripts/` (sanitized; see its
@@ -193,6 +198,11 @@ vllm serve <pack> \
 Neither small value is arbitrary. `--max-num-seqs 8` is what makes util 0.96 boot at all —
 at the default 256 the profiling activation reservation OOMs before any KV exists — and
 `512` is the measured prefill optimum on these cards.
+
+`docs/exl3-mm31/scripts/serve_best.sh` boots the same geometry with the more conservative
+0.92/256 setting and vision enabled by default. The 211,328-token figure in its header is
+the text-only row above (`LANGUAGE_MODEL_ONLY=1`); with the vision tower the pool is
+smaller. The 0.96/8 recipe above is the measured vision + video row (223,488 tokens).
 
 ## Repository layout
 
@@ -220,8 +230,8 @@ Almost none of what runs here is ours. In rough order of how much this repo owes
 |---|---|---|
 | [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) — MiniMax | the model itself (official MXFP8 checkpoint), the DSpark speculative draft and the vision tower, copied verbatim into the packs | follow MiniMax's model terms |
 | **Mia-AiLab** — the EXL3 packs | `MiniMax-M3.1-Flash-EXL3-EAQ-v1` at 3.55 and 3.06 bpw: the trellis quantization of every body linear, the 8/6-bit `lm_head`, and the packing this engine is written against | derivative of the base model; same terms |
-| [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) — turboderp | the EXL3 format (`trellis`/`suh`/`svh`, `mul1` codebook, `out_scales`), the quantizer and the dequant/GEMM kernels everything decodes through | MIT / Apache-2.0 per the upstream project |
-| [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3) — vcruz305 | the vLLM EXL3 plugin: weight loading, MoE and linear methods, TP geometry. Our work there exists only as the diffs in `patches/` | **AGPL-3.0** |
+| [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) — turboderp | the EXL3 format (`trellis`/`suh`/`svh`, `mul1` codebook, `out_scales`), the quantizer and the dequant/GEMM kernels everything decodes through | MIT |
+| [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3) — vcruz305 | the vLLM EXL3 plugin: weight loading, MoE and linear methods, TP geometry. Our work there exists only as the diffs in `patches/` | **AGPL-3.0-only** |
 | [vllm-project/vllm](https://github.com/vllm-project/vllm) and its contributors | the engine everything else is a fork of — including the MiniMax-M3 model itself: block-sparse attention, the top-k indexer, the fused MoE and the multimodal preprocessor that this work builds on | Apache-2.0 |
 | [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) — lazymio | the backport this tree is a fork of: sm_86 support and the model bring-ups (DeepSeek-V4, Qwen3.8, GLM-5.3, MiMo) | Apache-2.0 |
 | [avtc/vllm-backport](https://github.com/avtc/vllm-backport) — avtc | author of the base commit `ced6985fd1`; their fork of `wtdcode/vllm-backport` is where that commit was written | Apache-2.0 |
@@ -239,7 +249,7 @@ credit the projects above first.
 - The engine changes here inherit **Apache-2.0** from vLLM, `wtdcode/vllm-backport` and
   `avtc/vllm-backport`.
 - The diffs under `docs/exl3-mm31/patches/` that touch `vllm-exl3` are derivative works of
-  an **AGPL-3.0** project and remain under that license; see
+  an **AGPL-3.0-only** project and remain under that license; see
   [`patches/NOTICE-plugin.md`](docs/exl3-mm31/patches/NOTICE-plugin.md) and the full text in
   [`patches/LICENSE-AGPL-3.0`](docs/exl3-mm31/patches/LICENSE-AGPL-3.0). The plugin source
   itself is **not** vendored here — patch it in place.
@@ -247,8 +257,6 @@ credit the projects above first.
   Apache-2.0 license of the tree.
 - The base model is distributed under the **MiniMax Community License** (commercial terms
   and use restrictions apply); the EXL3 packs are derivatives of it and carry the same
-  terms. No model weights are distributed here.
-- **No model weights are distributed here.** The packs belong to their authors and carry the
-  base model's terms.
+  terms. The packs belong to their authors; **no model weights are distributed here**.
 - Hardware-specific by design: this was tuned on 10× RTX 3090 with PCIe only. Numbers on
   other cards will differ, and the sm_86 `exllamav3` rebuild is required.
