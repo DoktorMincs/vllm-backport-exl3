@@ -1,8 +1,11 @@
 # vllm-backport-exl3
 
-A fork of [`avtc/vllm-backport`](https://github.com/avtc/vllm-backport) carrying the
-engine work needed to serve **MiniMax-M3.1-Flash-EXL3-EAQ** — an EXL3 trellis-quantized
-MiniMax-M3.1-Flash — on **10× RTX 3090 (sm_86, 24 GB, PCIe, no NVLink)**.
+A fork of [`wtdcode/vllm-backport`](https://github.com/wtdcode/vllm-backport) carrying
+the engine work needed to serve **MiniMax-M3.1-Flash-EXL3-EAQ** — an EXL3
+trellis-quantized MiniMax-M3.1-Flash — on **10× RTX 3090 (sm_86, 24 GB, PCIe, no
+NVLink)**. It branches from `ced6985fd1`, a commit authored in
+[`avtc/vllm-backport`](https://github.com/avtc/vllm-backport) (itself a fork of
+`wtdcode/vllm-backport`) and present in both.
 
 Two packs boot and serve on this stack (images and video were verified end to end on the
 3.5 bpw pack; the 3.06 bpw pack was validated for text, pool size and speed):
@@ -143,21 +146,32 @@ Each of these booted and answered. None of them logged an error.
 
 ## Reproducing
 
-The engine changes are already in the branch; the cumulative diff exists so the delta
-against upstream can be read (and applied to a clean `avtc/vllm-backport` checkout).
+The engine changes are already in the branch, so a plain clone is enough. The cumulative
+diff exists so the delta against upstream can be read — and applied to a clean checkout of
+`wtdcode/vllm-backport` at `ced6985fd1`:
 
 ```bash
-git clone https://github.com/DoktorMincs/vllm-backport-exl3 && cd vllm-backport
+git clone https://github.com/DoktorMincs/vllm-backport-exl3 && cd vllm-backport-exl3
 git checkout exl3-mm31-flash
+
+# alternatively, apply the delta to a clean upstream checkout
+git clone https://github.com/wtdcode/vllm-backport && cd vllm-backport
+git checkout ced6985fd1
+git apply /path/to/vllm-backport-exl3/docs/exl3-mm31/patches/backport-exl3-mm31-cumulative.diff
 ```
 
-Plugin and runtime (AGPL-3.0 — patch, do not vendor):
+Plugin and runtime (AGPL-3.0 — patch, do not vendor). The diff is generated against
+`vcruz305/vllm-exl3` at `053c634`; check that commit out first:
 
 ```bash
 git clone https://github.com/vcruz305/vllm-exl3 ~/vllm-exl3 && cd ~/vllm-exl3
-git apply /path/to/vllm-backport/docs/exl3-mm31/patches/plugin-exl3-local-cumulative.diff
+git checkout 053c634
+git apply /path/to/vllm-backport-exl3/docs/exl3-mm31/patches/plugin-exl3-local-cumulative.diff
 # rebuild exllamav3 for sm_86 with ACT_SILU_OAI (act 3) in the non-coop path
 ```
+
+The measurement and runbook tooling is in `docs/exl3-mm31/scripts/` (sanitized; see its
+`README.md` for the environment variables it expects).
 
 Boot (the flags that matter, TP=2 × PP=5 on 10 GPUs):
 
@@ -193,7 +207,8 @@ docs/exl3-mm31/STATUS.md                         chronological record with every
 docs/exl3-mm31/FINDINGS-20261027.md              component-by-component investigation
 docs/exl3-mm31/BUG-exl3-moe-uniform-k3.md        issue draft for the plugin
 docs/exl3-mm31/RUNBOOK.md                        how the environment is built and run
-docs/exl3-mm31/patches/                          engine + plugin diffs, AGPL notice
+docs/exl3-mm31/patches/                          engine + plugin diffs, AGPL notice + text
+docs/exl3-mm31/scripts/                          sanitized measurement/runbook tooling
 README-upstream.md                               the original vllm-backport README
 ```
 
@@ -208,8 +223,8 @@ Almost none of what runs here is ours. In rough order of how much this repo owes
 | [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3) — turboderp | the EXL3 format (`trellis`/`suh`/`svh`, `mul1` codebook, `out_scales`), the quantizer and the dequant/GEMM kernels everything decodes through | MIT / Apache-2.0 per the upstream project |
 | [vcruz305/vllm-exl3](https://github.com/vcruz305/vllm-exl3) — vcruz305 | the vLLM EXL3 plugin: weight loading, MoE and linear methods, TP geometry. Our work there exists only as the diffs in `patches/` | **AGPL-3.0** |
 | [vllm-project/vllm](https://github.com/vllm-project/vllm) and its contributors | the engine everything else is a fork of — including the MiniMax-M3 model itself: block-sparse attention, the top-k indexer, the fused MoE and the multimodal preprocessor that this work builds on | Apache-2.0 |
-| [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) — lazymio | the backport this tree descends from: sm_86 support and the model bring-ups (DeepSeek-V4, Qwen3.8, GLM-5.3, MiMo) | Apache-2.0 |
-| [avtc/vllm-backport](https://github.com/avtc/vllm-backport) — avtc | the fork this branch is based on (`ced6985fd1`) | Apache-2.0 |
+| [wtdcode/vllm-backport](https://github.com/wtdcode/vllm-backport) — lazymio | the backport this tree is a fork of: sm_86 support and the model bring-ups (DeepSeek-V4, Qwen3.8, GLM-5.3, MiMo) | Apache-2.0 |
+| [avtc/vllm-backport](https://github.com/avtc/vllm-backport) — avtc | author of the base commit `ced6985fd1`; their fork of `wtdcode/vllm-backport` is where that commit was written | Apache-2.0 |
 
 And to the usual stack underneath all of it: PyTorch, Triton, FlashInfer, NCCL and CUDA.
 
@@ -225,8 +240,14 @@ credit the projects above first.
   `avtc/vllm-backport`.
 - The diffs under `docs/exl3-mm31/patches/` that touch `vllm-exl3` are derivative works of
   an **AGPL-3.0** project and remain under that license; see
-  [`patches/NOTICE-plugin.md`](docs/exl3-mm31/patches/NOTICE-plugin.md). The plugin source
+  [`patches/NOTICE-plugin.md`](docs/exl3-mm31/patches/NOTICE-plugin.md) and the full text in
+  [`patches/LICENSE-AGPL-3.0`](docs/exl3-mm31/patches/LICENSE-AGPL-3.0). The plugin source
   itself is **not** vendored here — patch it in place.
+- The tooling under `docs/exl3-mm31/scripts/` is part of this repository and follows the
+  Apache-2.0 license of the tree.
+- The base model is distributed under the **MiniMax Community License** (commercial terms
+  and use restrictions apply); the EXL3 packs are derivatives of it and carry the same
+  terms. No model weights are distributed here.
 - **No model weights are distributed here.** The packs belong to their authors and carry the
   base model's terms.
 - Hardware-specific by design: this was tuned on 10× RTX 3090 with PCIe only. Numbers on

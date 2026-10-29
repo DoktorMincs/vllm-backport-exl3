@@ -1,22 +1,34 @@
 # RUNBOOK — MiniMax-M3.1-Flash EXL3 no vllm-backport (venv isolado)
 
-Tudo aqui vive em `/root/exl3-port/`. A produção (`maya-ds4` + `maya-watchdog`,
-venv `/root/vllm/.venv`) **não é tocada** por nenhum destes passos, exceto pela
-janela de GPU, que para e religa os dois serviços.
+Este runbook descreve o ambiente experimental que ficou **separado** do stack
+de produção. Os caminhos abaixo são placeholders: copie os scripts de
+[`scripts/`](scripts/README.md) para `$EXL3_ROOT/scripts` e ajuste as variáveis.
+
+| variável | default | o que é |
+|---|---|---|
+| `EXL3_ROOT` (`EXL3_PORT`) | `~/exl3-port` | raiz do ambiente experimental (venv, logs, artefatos) |
+| `MODEL_DIR` | `~/models/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw` | pack EXL3 |
+| `VLLM_REPO` | `~/vllm-backport` | checkout do engine |
+| `MM3_REF` | `~/mm3-oracle/ref.py` | oráculo F32 (não distribuído) |
+| `PROD_UNIT` / `WATCHDOG_UNIT` | vazio | unidades systemd que `window_*` para/religa |
+
+A produção (se você tiver uma) **não é tocada** por nenhum destes passos, exceto
+pela janela de GPU, que para e religa `PROD_UNIT`/`WATCHDOG_UNIT` quando
+definidas.
 
 ## O que está instalado
 
 | Item | Onde | Versão/SHA |
 |---|---|---|
-| vLLM backport (editable) | `/root/vllm-backport` | `0.13.2.dev4+gced6985fd` (wtdcode, v0.13.1-4-gced6985fd1) |
-| venv isolado | `/root/exl3-port/venv-028` | torch 2.13.0+cu130, Python 3.12.13 |
-| plugin EXL3 (editable) | `/root/exl3-port/pkgs/vllm-exl3` | `053c634` + 2 patches locais |
+| vLLM backport (editable) | `$VLLM_REPO` | `0.13.2.dev4+gced6985fd` (wtdcode, v0.13.1-4-gced6985fd1) |
+| venv isolado | `$EXL3_ROOT/venv-028` | torch 2.13.0+cu130, Python 3.12.13 |
+| plugin EXL3 (editable) | `$EXL3_ROOT/pkgs/vllm-exl3` | `053c634` + 5 patches locais (abaixo) |
 | exllamav3 (wheel sm86) | venv-028 | `1.5.0`, `329e051`, com `exl3_moe_mixedk` |
-| pack | `/root/models/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw` | 184 GB, 25 shards + visão |
+| pack | `$MODEL_DIR` | 184 GB, 25 shards + visão |
 
-Rollback do venv para a wheel 0.28.0: `builds/vllm-028-sitepkg/` (pacote + dist-info).
-O diretório residual `builds/vllm-028-leftover-sitepkg/` são só os `.bak-*` de patch
-da produção (não importa).
+Rollback do venv para a wheel 0.28.0: `builds/vllm-028-sitepkg/` (pacote +
+dist-info). O diretório residual `builds/vllm-028-leftover-sitepkg/` são só os
+`.bak-*` de patch (não importa).
 
 ## Patches locais no backport (obrigatórios para fp16)
 
@@ -34,7 +46,8 @@ Sem isso o boot morre em
 `fused_minimax_m3_qknorm_rope_kv_insert ... insert mode requires index_cache
 matching qkv dtype or fp8 e4m3` — o kernel fundido grava o index-K no dtype do
 qkv, então cache bf16 sob modelo fp16 é incompatível.
-Diff salvo em `patches/backport-local-*.diff` (inclui também a instrumentação).
+Diff em `patches/backport-exl3-mm31-cumulative.diff` (inclui também a
+instrumentação).
 
 ## Patches locais no plugin (obrigatórios para este pack)
 
@@ -61,44 +74,49 @@ Diff salvo em `patches/backport-local-*.diff` (inclui também a instrumentação
    decodificado contra a transformada errada e o último bloco do rank 0 fabrica
    um logit de 63,9 no id 99968 ('etim'). Ver STATUS.md (topo).
 
+Os patches são um diff sobre o plugin em `053c634` e estão sob AGPL-3.0
+(`patches/NOTICE-plugin.md` e `patches/LICENSE-AGPL-3.0`).
+
 ## Subir o servidor
 
 ```bash
-/root/exl3-port/scripts/run_serve.sh boot1     # log: logs/boot1.log, exit: logs/boot1.exit
+$EXL3_ROOT/scripts/run_serve.sh boot1     # log: logs/boot1.log, exit: logs/boot1.exit
 ```
+
 Parâmetros por ambiente: `PORT` (3001), `MAXLEN` (8192), `TP` (1), `PP` (10),
 `GPU_UTIL` (0.93), `DTYPE` (**float16** por padrão; `DTYPE=bf16` volta ao antigo),
 `EXL3_FORCE_MIXEDK` (**1** por padrão — correção do MoE K3, ver acima),
-`EAGER` (1 = mantém `--enforce-eager`; **0** liga torch.compile + CUDA graphs).
+`EAGER` (0 = torch.compile + CUDA graphs; 1 = `--enforce-eager`).
 
-### Velocidade: `EAGER=0` é a alavanca (medido 27/10)
+### Velocidade
 
-`EAGER=0` leva o decode de **3,5 → 21 tok/s (6,1×)** em TP=1 × PP=10, sem mudar a
-numérica (prefill `<mm:think>` −0,014, igual ao run eager; consistência prefill ×
-decode top-1 idêntico em 4 passos). O backport liga
-`VLLM_USE_BREAKABLE_CUDAGRAPH=1` sozinho. Subir com
-`scripts/boot_graphs.sh <tag>` ou `EAGER=0 scripts/run_serve.sh <tag>`.
+`EAGER=0` é a alavanca: em TP=1 × PP=10 o decode vai de **3,5 → 21 tok/s**
+(6,1×), sem mudar a numérica. O backport liga `VLLM_USE_BREAKABLE_CUDAGRAPH=1`
+sozinho. Suba com `scripts/boot_graphs.sh <tag>` ou
+`EAGER=0 scripts/run_serve.sh <tag>`.
 
-Não vale procurar velocidade em paralelismo: **PP 10→5 e TP 1→2 foram medidos e
-não mudaram nada** (3,40 tok/s no TP=2), então o custo é fixo por camada
-(~4,8 ms/camada/token) — é overhead de lançamento, e grafo é o que ataca isso.
+O segundo salto é o TP=2 × PP=5 **depois** do PATCH #5: o TP=2 estava quebrado
+pelo corte da Hadamard do `lm_head`, não pelo paralelismo. Corrigido, a config
+vencedora é `TP=2 × PP=5` com **45,3 tok/s** de decode, prefill
+1.491/2.126/2.357 tok/s em 2k/8k/32k e 84,1 tok/s agregados com C=16
+(`scripts/serve_best.sh` / `scripts/boot_tp2pp5.sh`).
 
-### RAM do host: `_narrow_tp` e o OOM de 27/10
+### RAM do host: `_narrow_tp` e o OOM
 
 Boot em TP>1 encheu 96 GB + swap e o OOM-killer matou os workers (log corta no
 meio de um expert, sem traceback). Causa: `_narrow_tp()` terminava em
 `.contiguous()`, copiando o trellis de cada expert para RAM **anônima** em TP>1, e
 esse staging vive até o fim do load (~150 GB nos 10 ranks). Agora devolve *view*
-do mmap (page cache); `EXL3_TP_COPY_SHARD=1` restaura o antigo. Pico medido depois
-da correção: 23,4 GB anônimos. Guarda de RAM durante o load:
+do mmap (page cache); `EXL3_TP_COPY_SHARD=1` restaura o antigo. Pico medido
+depois da correção: 23,4 GB anônimos. Guarda de RAM durante o load:
 `scripts/mem_guard.sh <tag> [piso_MB] [intervalo_s]` (mata **só** o venv
 experimental se `MemAvailable` cair abaixo do piso duas amostras seguidas).
 
-Desempenho medido com a configuração final (10×3090, fp16, TP1×PP10):
-prefill ~210 tokens em 0,5–0,9 s; geração **~3,5 tok/s** (limite do PP=10 em
-modo eager, não do plugin).
-Geometria padrão **TP=1 × PP=10** com
-`VLLM_PP_LAYER_PARTITION=7,5,5,7,7,7,7,5,5,5` (máx 19,41 GiB/estágio).
+Configuração final (10×3090, fp16): prefill 1.491/2.126/2.357 tok/s e decode
+45,3 tok/s em TP=2 × PP=5 (`EAGER=0`, MB=512, KV `fp8_e5m2`, cap 230 W).
+Geometria padrão TP=1 × PP=10 com
+`VLLM_PP_LAYER_PARTITION=7,5,5,7,7,7,7,5,5,5` (máx 19,41 GiB/estágio); no
+TP=2 × PP=5: `12,12,14,12,10` (máx 18,74 GiB/GPU).
 
 Verificação: `scripts/watch_log.sh logs/boot1.log "Application startup complete" 3000`
 (sai no primeiro sinal), depois `scripts/smoke_chat.py --port 3001`.
@@ -106,16 +124,17 @@ Verificação: `scripts/watch_log.sh logs/boot1.log "Application startup complet
 ## Janela de GPU (parar/religar a produção)
 
 ```bash
-/root/exl3-port/scripts/window_open.sh      # snapshot + sentinela + backstop + para produção
-/root/exl3-port/scripts/window_keepalive.sh # heartbeat (rodar como tarefa da sessão)
-/root/exl3-port/scripts/window_close.sh     # derruba experimental, espera VRAM, religa
+$EXL3_ROOT/scripts/window_open.sh      # snapshot + sentinela + backstop + para produção
+$EXL3_ROOT/scripts/window_keepalive.sh # heartbeat (rodar como tarefa da sessão)
+$EXL3_ROOT/scripts/window_close.sh     # derruba experimental, espera VRAM, religa
 ```
 
 - O backstop é uma unidade transiente (`systemd-run --unit=exl3-window-backstop`),
   **sobrevive à morte da sessão**; dispara por estado: sentinela ausente, sentinela
   com idade > 20 min (heartbeat parado) ou deadline duro de 10 h.
-- Ao disparar: `pkill` **só** do venv experimental (`/root/exl3-port/venv-028/bin/python`),
-  espera a VRAM cair e sobe `maya-ds4` + `maya-watchdog`.
+- Ao disparar: `pkill` **só** do venv experimental (`$EXL3_ROOT/venv-028/bin/python`),
+  espera a VRAM cair e sobe `PROD_UNIT` + `WATCHDOG_UNIT` (se definidas; sem
+  elas, só encerra o experimental).
 - Estado/snapshot em `logs/window.log`, `logs/window-backstop.log`,
   `logs/snapshot-pre-janela-*.txt`.
 
@@ -131,32 +150,37 @@ Verificação: `scripts/watch_log.sh logs/boot1.log "Application startup complet
 
 ## Ferramentas
 
+A versão sanitizada de todas elas está em [`scripts/`](scripts/README.md)
+(copie para `$EXL3_ROOT/scripts`). As principais:
+
 - `scripts/dryrun_config.py` — valida config/arquitetura/quant/PP **sem GPU**.
 - `scripts/pp_budget.py` — orçamento de VRAM por estágio pelos bytes reais do pack.
 - `scripts/pp_balance.py --stages N --tp T` — melhor partição PP contígua (DP) e
   valor por GPU; foi ele que achou `12,12,14,12,10` = 18,74 GiB/GPU no TP=2×PP=5.
-- `scripts/speed_probe.py` — TTFT e decode por SSE (nonce anti-cache de prefixo).
+- `scripts/speed_probe2.py` — TTFT e decode por SSE **contando tokens do usage**
+  (o `speed_probe.py` conta chunks e subestima com spec decode).
 - `scripts/mem_guard.sh <tag> [piso_MB]` — vigia de `MemAvailable` durante o load;
-  mata só o venv experimental (não a produção).
+  mata só o venv experimental.
 - `scripts/prod_chain_tp.sh <tag>` — prefill-only por ids + chat temp 1,0 +
   consistência prefill×decode, gravando em `logs/prod_chain_<tag>.out`.
-- `scripts/boot_graphs.sh <tag>` — TP=1×PP=10 com `EAGER=0` (config rápida).
-- `scripts/serve_best.sh <tag>` — **config vencedora da campanha de 27/10:
-  TP=2 × PP=5**, MB=512, EAGER=0, 131k com KV fp8_e5m2, cap 230 W (decode
-  45,3 tok/s). Números e justificativa no cabeçalho e em `STATUS.md`.
+- `scripts/boot_graphs.sh <tag>` — TP=1×PP=10 com `EAGER=0`.
+- `scripts/serve_best.sh <tag>` — **config vencedora: TP=2 × PP=5**, MB=512,
+  EAGER=0, 131k com KV fp8_e5m2, cap 230 W (decode 45,3 tok/s). Números e
+  justificativa no cabeçalho e em `STATUS.md`.
 - `scripts/cmp_dump.py <dirA> <dirB>` — compara dumps `VLLM_M3_DUMP` tag a tag
   (cos/relerr por componente, tolera sufixo `.rN` de rank e o batch paddado).
   Foi ele que isolou o defeito do `lm_head`: o corpo em TP=2 batia 0,9999.
 - `scripts/head_check.py --mode local|state` — confere os logits locais de cada
   rank (ou o `final_normed`) contra o oráculo `ref_big.npz`.
 - `scripts/set_cap.sh [230]` — powercap em todas as GPUs (sem lista fixa).
-  Produção roda a 190 W; restaurar depois.
+  O stack de referência rodava a 190 W; restaurar depois.
 - `scripts/eval_boot.sh <tag>` — bateria padrão por boot (coerência, decode
   128/400, prefill 2k/8k/32k, concorrência 1/4/16) → `logs/eval_<tag>.txt`.
 - `scripts/bench_prefill.py` — **vazão de prefill** (prompt grande, nonce,
   `cached_tokens` conferido, desconta um passo de decode).
 - `scripts/bench_ctx.py` — TTFT e decode com o contexto já carregado (curva).
-- `scripts/bench_concurrency.py` — curva latência × vazão agregada.
+- `scripts/bench_concurrency2.py` — curva latência × vazão agregada (conta
+  tokens do usage, não chunks).
 - `scripts/needle.py` — agulha no palheiro (qualidade de KV quantizado).
 - `scripts/prof_window.py --db t.sqlite --window nome=epoch_ini:epoch_fim` —
   soma tempo de kernel por nome dentro de janelas de um trace nsys exportado
@@ -167,14 +191,15 @@ Verificação: `scripts/watch_log.sh logs/boot1.log "Application startup complet
 - `scripts/smoke_chat.py` — 3 sondas de conteúdo + bench TTFT por contexto.
 - `scripts/verify_env.py` — ambiente (torch, vllm, plugin, extensões).
 - `scripts/ref_big.py` + `scripts/compare_big.py` — oráculo vs VLLM em prompt longo
-  (por posição, por camada); `scripts/compare_vllm_ref.py` compara um dump com o
-  oracle de referência.
+  (por posição, por camada); `scripts/compare_ref.py` compara um dump com o
+  oráculo de referência.
 - `scripts/request_ids.py` — prompt por ids com logprobs por passo (separa prefill
   de decode: passo 0 vem do prefill, passos ≥1 do decode).
+- `scripts/request_ref.py` — request determinístico para comparar com o oráculo.
 - `scripts/replay_from_dump.py` — roda o oráculo a partir do estado que o VLLM
   dumpou (`--source vllm --start N`); é o teste que separa "kernel errado" de
   "o modelo amplifica ruído".
-- `scripts/gate_check.py` — recalcula a escolha de experts com a fórmula do oráculo
+- `scripts/route_cmp.py` — recalcula a escolha de experts com a fórmula do oráculo
   sobre o `ffn_in` do VLLM (isola bug de gate).
 - `scripts/chat_sample.py` — sondas de chat com a amostragem recomendada
   (`generation_config.json`: temp 1.0, top_p 0.95).

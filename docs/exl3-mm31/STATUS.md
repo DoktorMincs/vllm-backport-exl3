@@ -1,10 +1,14 @@
 # EXL3 no vllm-backport — status da execução autônoma
 
-Atualizado: 2026-10-27 19:50 (America/Sao_Paulo)
+Log cronológico, **mais recente primeiro**. Seções antigas descrevem estados já
+superados (o rodapé, por exemplo, ainda cita 3,5 tok/s e DSpark/visão não
+exercitados); os números válidos são os do topo e do README.
+
+Atualizado: 2026-10-27 23:30 (America/Sao_Paulo)
 
 ## DSpark (drafter do MiniMax-M3) — FUNCIONA: 51,6 tok/s vs 44,8 (+15%)
 
-Implementado em `/root/vllm-backport/vllm/models/minimax_m3/nvidia/dflash.py`
+Implementado em `vllm/models/minimax_m3/nvidia/dflash.py`
 (`DSparkMiniMaxDraftModel` → `DSparkMiniMaxM3ForCausalLM`), registrado em
 `registry.py`, com três ajustes de config em `vllm/config/speculative.py`
 (exclusão da reescrita DSV4, `draft_hf_overrides={}` e `quantization=None`) e o
@@ -386,8 +390,8 @@ Detalhe completo em `FINDINGS-20261027.md` (seções 10 e 11); a conclusão
 
 ## Configuração (`scripts/serve_m3.sh`)
 
-- `DTYPE=float16` — o pack declara bf16, mas o oráculo e o Project Maya rodam
-  fp16; bf16 injeta ~0,5% de erro até a L15 e piora o 1º token.
+- `DTYPE=float16` — o pack declara bf16, mas o oráculo e o stack de referência
+  rodam fp16; bf16 injeta ~0,5% de erro até a L15 e piora o 1º token.
 - `EXL3_FORCE_MIXEDK=1` — ver acima (obrigatório).
 - `VLLM_EXL3_FAT_THRESHOLD=1e8` — o tier "fat" mediu cos 0,12; desligado.
 - `VLLM_EXL3_Q4KV=0`, `VLLM_EXL3_INDEXER_MXFP8=0` (GB10/sm_121).
@@ -442,4 +446,4 @@ Detalhe completo em `FINDINGS-20261027.md` (seções 10 e 11); a conclusão
   decode está em 45 tok/s (≈2 tokens aceitos/passo = 70–110 tok/s), mas não é
   uma flag.
 - Rascunho de issue para o autor do plugin em `BUG-exl3-moe-uniform-k3.md`
-  (não publicado).
+  (publicado neste repositório).

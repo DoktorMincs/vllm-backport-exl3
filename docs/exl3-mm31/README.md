@@ -1,7 +1,7 @@
 # MiniMax-M3.1-Flash EXL3 no vllm-backport — o que aprendemos
 
 Registro de engenharia de rodar `MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw`
-(184 GB, 3,55 bpw) no [`avtc/vllm-backport`](https://github.com/avtc/vllm-backport)
+(184 GB, 3,55 bpw) no [`wtdcode/vllm-backport`](https://github.com/wtdcode/vllm-backport)
 com o plugin [`vcruz305/vllm-exl3`](https://github.com/vcruz305/vllm-exl3),
 em **10× RTX 3090 (24 GB, sm_86)**.
 
@@ -17,6 +17,7 @@ contra outra configuração.
 | `BUG-exl3-moe-uniform-k3.md` | rascunho de issue para o autor do plugin (kernel MoE K uniforme) |
 | `RUNBOOK.md` | como o ambiente está montado e como operá-lo |
 | `patches/` | diffs aplicáveis sobre o upstream limpo |
+| `scripts/` | ferramentas de medição/operação, versão sanitizada |
 
 ## Números
 
@@ -29,6 +30,10 @@ TP=2 × PP=5, CUDA graphs, KV `fp8_e5m2`, `--max-num-batched-tokens 512`.
 | agregado C=16 | **84,1 tok/s** |
 | decode com drafter DSpark (N=2) | **53,9 tok/s** (+20%) |
 | decode com o drafter, C=4 (agregado) | 48,5 (−23% vs sem drafter) |
+
+O decode single-stream aparece como 45,3–45,6 tok/s conforme a execução (README
+45,6; este documento 45,5; STATUS 45,3) — é a mesma configuração, medida em
+momentos diferentes.
 
 Contexto máximo, por configuração:
 
@@ -151,24 +156,44 @@ prompt**.
 
 ## Como reproduzir
 
+O branch já contém o engine; para usar, basta clonar este repositório:
+
 ```bash
-git clone https://github.com/avtc/vllm-backport && cd vllm-backport
-git apply docs/exl3-mm31/patches/backport-exl3-mm31-cumulative.diff   # já aplicado neste branch
+git clone https://github.com/DoktorMincs/vllm-backport-exl3 && cd vllm-backport-exl3
+git checkout exl3-mm31-flash
+```
+
+Para aplicar o delta sobre um upstream limpo (`wtdcode/vllm-backport` em
+`ced6985fd1`):
+
+```bash
+git clone https://github.com/wtdcode/vllm-backport && cd vllm-backport
+git checkout ced6985fd1
+git apply /caminho/para/vllm-backport-exl3/docs/exl3-mm31/patches/backport-exl3-mm31-cumulative.diff
 ```
 
 O plugin EXL3 precisa dos patches correspondentes (AGPL-3.0 — ver
-`patches/NOTICE-plugin.md`):
+`patches/NOTICE-plugin.md` e `patches/LICENSE-AGPL-3.0`), aplicados sobre o
+commit `053c634`:
 
 ```bash
-cd vllm-exl3 && git apply .../patches/plugin-exl3-local-cumulative.diff
+cd vllm-exl3 && git checkout 053c634
+git apply .../patches/plugin-exl3-local-cumulative.diff
 ```
 
 E do `exllamav3` reconstruído para sm_86 com `ACT_SILU_OAI` (act 3) no caminho
 não-coop — sem isso o MoE devolve SILU no lugar do OAI e o texto degrada.
 
+As ferramentas de medição e operação citadas no RUNBOOK estão em
+[`scripts/`](scripts/README.md), na versão sanitizada (caminhos e unidades de
+produção vêm do ambiente).
+
 ## Licenças
 
-- O código deste fork herda **Apache-2.0** do vLLM/`avtc/vllm-backport`.
+- O código deste fork herda **Apache-2.0** do vLLM/`wtdcode/vllm-backport`.
 - Os arquivos em `patches/` que tocam `vllm-exl3` são derivados de um projeto
-  **AGPL-3.0** e permanecem sob essa licença; ver `patches/NOTICE-plugin.md`.
-- Nenhum peso de modelo é distribuído aqui.
+  **AGPL-3.0** e permanecem sob essa licença; ver `patches/NOTICE-plugin.md` e
+  o texto completo em `patches/LICENSE-AGPL-3.0`.
+- Os scripts em `scripts/` seguem a licença do repositório (Apache-2.0).
+- Nenhum peso de modelo é distribuído aqui; o modelo base usa a **MiniMax
+  Community License**.

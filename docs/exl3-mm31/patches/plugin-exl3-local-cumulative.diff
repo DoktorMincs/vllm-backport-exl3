@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Derivative work of vcruz305/vllm-exl3 (AGPL-3.0). Apply at commit 053c634.
+# Full license text: LICENSE-AGPL-3.0 in this directory; see NOTICE-plugin.md.
 diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
 index d2be348..b3bafdb 100644
 --- a/src/vllm_exl3/exl3.py

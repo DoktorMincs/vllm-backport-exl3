@@ -1,7 +1,8 @@
 # Rascunho de issue: `exl3_moe` (K uniforme) produz saída errada com K=3
 
-Rascunho para o repositório `vcruz305/vllm-exl3` (não publicado). Escopo: uso
-interno; o plugin é AGPL-3.0 e não deve ser distribuído.
+Rascunho de issue para o repositório `vcruz305/vllm-exl3`. O plugin é
+AGPL-3.0; este documento e o diff em `patches/` são publicados sob essa
+licença (ver `patches/NOTICE-plugin.md` e `patches/LICENSE-AGPL-3.0`).
 
 ## Resumo
 
@@ -67,7 +68,7 @@ roteamento top-4 do gate BF16; comparar `apply_exl3_fused_moe` com
 2. `mul1` codebook em K3 nesse kernel (o dense K3 mul1 funciona).
 3. Montagem de `token_sorted`/`expert_count`/`m_tile` para K3.
 
-## Contorno usado em produção interna
+## Contorno usado neste branch
 
 `EXL3_FORCE_MIXEDK=1` (patch de 8 linhas em `exl3.py`: força `mixed_k=True` em
 layers uniformes e desliga `_exl3_coop_compat` nelas). Resultado correto em
