@@ -195,6 +195,30 @@ aquecida): `NCCL_PROTO=LL` 51,70 tok/s / 78,4 ms contra 51,75 / 78,3 do base
 `CUDA_DEVICE_MAX_CONNECTIONS` 8 = 1. A alavanca que sobra é sobrepor
 microbatches (DBO), não ajustar coletivo.
 
+### Grafo FULL para passos microbatched (port do PR #51700)
+
+O `[2/2]` do DBO está no tree (`Ported-from: 73d2a8cf86`): `UBatchRunner` ganhou
+`capture_stream`, `begin_capturable_run()`/`finish()`/`abort_pending_run()`, o
+`CudaGraphManager` ganhou `ubatch_runner` + `_maybe_ubatch_twin()` (gêmeo de
+captura por bucket de decode uniforme) e `_capture_stream(desc)`, e o gate
+`_get_dbo_unsupported_features` deixou de recusar DBO com **qualquer** grafo
+para recusar só com `PIECEWISE` (DBO captura FULL).
+
+**Continua inerte nesta topologia**: com `dp_size=1` o `maybe_build_ubatch_runner`
+devolve `None`, `dispatch_cg_and_sync_dp` sai em `dp_size == 1` e
+`use_ubatching` exige `deepep_*`/`nixl_ep` (não instalados). Nenhum caminho novo
+é alcançado; a config de produção fica bit-identical.
+
+Duas notas para quando o DBO for ligado (degraus 2–4):
+- `VLLM_DSPARK_REST`/`VLLM_DSPARK_CONF_CUT` expandem `decode_query_lens`; com o
+  gêmeo, cada bucket passa a gerar **dois** grafos — conferir
+  `_capture_mem_samples` e o pool antes de ligar as duas coisas juntas.
+- `is_current_stream_capturing()` (usado pelo plugin EXL3 para a rota
+  capture-legal) é **thread-local**: durante a captura microbatched o
+  `torch.cuda.graph` roda na thread principal e o modelo nas threads de
+  microbatch, então os kernels EXL3 dessas threads não se veem "capturando".
+  Revisar antes de confiar em `_CAPTURE_SPLIT` sob DBO.
+
 ## Estado
 
 Funcional e validado contra o motor Maya (paridade de prefill; decode 4x pior
