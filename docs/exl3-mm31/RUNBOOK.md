@@ -30,6 +30,21 @@ Rollback do venv para a wheel 0.28.0: `builds/vllm-028-sitepkg/` (pacote +
 dist-info). O diretório residual `builds/vllm-028-leftover-sitepkg/` são só os
 `.bak-*` de patch (não importa).
 
+### Venv do DeepSeek-V4.1 (novo, 04/11 — Plano B)
+
+O `venv-028` original foi apagado na limpeza de disco. O ambiente agora é:
+
+| Item | Onde |
+|---|---|
+| venv | `/root/vllm-backport/.venv` (Python 3.12.12 do pyenv, isolado) |
+| atalho | `/root/exl3-port/venv-028` → symlink para o venv acima (os scripts de janela casam esse caminho no `pkill`) |
+| conteúdo | `torch==2.13.0+cu130` (índice `download.pytorch.org/whl/cu130`), `tilelang==0.1.12`, `flashinfer-python==0.6.18.post1`, plugin `vllm-exl3` editable |
+| log do setup | `/root/exl3-port/logs/setup_ds41_env.log` (`scripts/setup_ds41_env.sh`) |
+
+Os 3 patches de fp16 abaixo são **do MiniMax M3** e não valem para o V4.1: o
+mHC do V4.1 tem asserts duros de `bfloat16`, então o boot do DS4.1 usa
+`--dtype bfloat16` (`scripts/serve_ds41.sh`).
+
 ## Patches locais no backport (obrigatórios para fp16)
 
 O pack declara `bfloat16` no config, então o vLLM auto-escolhe bf16. Rodar fp16

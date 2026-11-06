@@ -266,10 +266,19 @@ def resolve_kv_cache_layout(
     assert supported_layouts and all(supported_layouts), (
         "No worker reported supported KV cache layouts."
     )
-    assert all(names == supported_layouts[0] for names in supported_layouts[1:]), (
-        f"Workers disagree on supported KV cache layouts: {supported_layouts}."
+    # Pipeline ranks can host different subsets of a model's cache types
+    # (e.g. DeepSeek V4.1 ranks without an indexer cache support more
+    # layouts than ranks with one), so take the layouts every worker
+    # supports, in the first worker's preference order.
+    common = [
+        name
+        for name in supported_layouts[0]
+        if all(name in names for names in supported_layouts[1:])
+    ]
+    assert common, (
+        f"Workers share no supported KV cache layout: {supported_layouts}."
     )
-    candidates = [_layout_from_name(name) for name in supported_layouts[0]]
+    candidates = [_layout_from_name(name) for name in common]
 
     # A block-compact layout means the block is densely packed in memory, so any mix of
     # specs can re-interpret HNC with different sizes as long as the total number of

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -9,6 +10,11 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
+
+# A/B de 04/11: ver o uso em DeepseekV41DecoderLayer.forward.
+_ENGRAM_DISABLED = os.environ.get("VLLM_DS41_ENGRAM_ZERO", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
@@ -49,6 +55,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -68,13 +75,19 @@ from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v4_1.pp_share import PPSharePlan
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..common.engram import (
+    Engram,
+    EngramLayout,
+    NgramHashState,
+    ParallelEngramEmbedding,
+)
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -349,7 +362,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
         else:
             residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
-            if self.engram is not None and engram_hashes is not None:
+            # A/B de 04/11: `VLLM_DS41_ENGRAM_ZERO=1` tira a injecao do Engram
+            # (e o gather, porque ele nem roda). Serve para separar "Engram de
+            # disco errado" de "resto do modelo errado" num boot.
+            if (
+                self.engram is not None
+                and engram_hashes is not None
+                and not _ENGRAM_DISABLED
+            ):
                 # Engram injection happens between the previous sublayer's
                 # post and this block's pre, on the full hc stream, so the
                 # mix coefficients see the injected stream.
@@ -400,6 +420,13 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    # Sem esta flag o `verify_supports_aux_hidden_states_over_pp` recusa o boot
+    # de DSpark com PP>1. O V4 ja a declara; o V4.1 herda o mesmo plumbing de
+    # `EagleModelMixin` (captura em `idx+1 in aux_hidden_state_layers`) e, na
+    # particao 8,8,8,8,8, os taps 37-39 caem no ULTIMO estagio, entao o relay
+    # entre estagios e' vazio.
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -450,7 +477,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        # Com drafter (eagle3/dspark/dflash) e PP>1 o ULTIMO rank tambem precisa
+        # do embedding do alvo: `maybe_share_target_embed` o repassa ao draft,
+        # que nao tem um proprio (`has_own_embed_tokens = False`). O V4 ja faz
+        # isso em v4/nvidia/model.py:1361; o V4.1 so' olhava o primeiro rank e
+        # por isso o draft morria com "needs the target input embedding, but it
+        # is unavailable on this PP stage".
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -461,6 +494,26 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         self.engram_layout = EngramLayout.from_config(config)
+
+        # Pipeline parallelism across kv-sharing groups: host stand-in caches
+        # for sources that live on earlier ranks (must exist before the
+        # consumer layers below resolve them) and plan the per-step row
+        # shipping. See pp_share.py.
+        self.pp_share: PPSharePlan | None = None
+        if get_pp_group().world_size > 1:
+            plan = PPSharePlan(vllm_config)
+            if plan.active:
+                plan.create_replicas(
+                    vllm_config, f"{prefix}.layers", _select_dsv4_attn_cls(vllm_config)
+                )
+                plan.bind_static_context(
+                    vllm_config.compilation_config.static_forward_context
+                )
+                plan.alloc_buffers(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    torch.device(torch.accelerator.current_device_index()),
+                )
+                self.pp_share = plan
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -474,6 +527,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ),
             prefix=f"{prefix}.layers",
         )
+
+        # Under PP every rank walks the whole checkpoint; the two Engram
+        # tables (94 GiB each, 384M x 256) must never be materialised by
+        # ``safe_open().get_tensor`` on a rank that does not own their layer
+        # -- a single one exceeds this host's RAM (40 GB) and overflows the
+        # safetensors storage path. Disk-backed tables register their own
+        # skip in ParallelEngramEmbedding; here we skip the non-local ones.
+        if self.engram_layout is not None:
+            from vllm.model_executor.model_loader.weight_utils import (
+                register_skip_weight_names,
+            )
+
+            local_layers = range(self.start_layer, self.end_layer)
+            register_skip_weight_names(
+                f"layers.{layer_id}.engram.embed.{suffix}"
+                for layer_id in self.engram_layout.layer_ids
+                if layer_id not in local_layers
+                for suffix in ("weight", "scale")
+            )
 
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
@@ -529,20 +601,61 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
-                    dtype=dtype,
-                    device=device,
-                ),
-                "pre_mix": torch.zeros(
-                    (batch_size, self.hc_mult),
-                    dtype=torch.float32,
-                    device=device,
-                ),
-            }
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+            "pre_mix": torch.zeros(
+                (batch_size, self.hc_mult),
+                dtype=torch.float32,
+                device=device,
+            ),
+        }
+        if self.pp_share is not None:
+            tensors.update(self.pp_share.recv_tensors(batch_size, device))
+        return IntermediateTensors(tensors)
+
+    @property
+    def has_disk_engram(self) -> bool:
+        """Any local engram layer whose table is served from disk."""
+        return self.engram_hash is not None and any(
+            getattr(layer, "engram", None) is not None
+            and layer.engram.rows_staged_by_runner
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
         )
+
+    def stage_engram_rows(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        lookback_token_ids: torch.Tensor,
+    ) -> None:
+        """Runner-side (eager, pre-forward) row staging for disk-backed engram
+        tables: recompute the batch's n-gram hashes from the same inputs the
+        forward will see and gather the rows into each layer's ``staged_rows``.
+        The forward then reads them in place, so nothing here has to survive
+        CUDA graph capture."""
+        assert self.engram_hash is not None
+        if not self.engram_hash.ensure_cache():
+            return  # KV cache unbound (profile run): the forward skips engram too
+        image_mask = image_sentinel_mask(input_ids)
+        engram_hashes = self.engram_hash(
+            input_ids,
+            positions,
+            query_start_loc,
+            image_mask,
+            lookback_token_ids,
+            image_sentinel_mask(lookback_token_ids),
+            None,
+            None,
+        )
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None and engram.rows_staged_by_runner:
+                engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
 
     def forward(
         self,
@@ -560,6 +673,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if self.pp_share is not None:
+                # Place the upstream sources' rows for this step into the
+                # local replicas before any consumer layer reads them.
+                self.pp_share.receive(
+                    intermediate_tensors.tensors,
+                    positions,
+                    self.topk_indices_buffer,
+                    self.candidate_block_buffer,
+                )
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -609,9 +731,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.block_table,
                 )
                 # Gather all Engram rows before entering the decoder layers.
+                # Disk-backed tables were staged by the model-state hook
+                # (stage_engram_rows) before this forward began.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
-                    if engram is not None:
+                    if engram is not None and not engram.rows_staged_by_runner:
                         engram.prepare_embeddings(
                             engram_hashes[:, engram.layer_hash_index]
                         )
@@ -654,6 +778,35 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     hidden_states, residual, post_mix, res_mix
                 )
                 aux_hidden_state = aux_recon.mean(dim=1)
+                if envs.VLLM_M3_DEBUG_DRAFT:
+                    # DIAGNOSTICO TEMPORARIO: o aux que chega ao draft sai NaN;
+                    # separa "estado da camada ja' NaN" de "o mhc_post devolve
+                    # NaN com entrada finita".
+                    _k = getattr(self, "_dbg_auxcap_n", 0)
+                    if _k < 6:
+                        self._dbg_auxcap_n = _k + 1
+
+                        def _st(t):
+                            if t is None:
+                                return "None"
+                            f = t.float()
+                            return "abs%.2f/nan%d" % (
+                                f.abs().max().item(),
+                                int(torch.isnan(f).sum()),
+                            )
+
+                        logger.error(
+                            "M3-DEBUG auxcap#%d idx=%d hid[%s] res[%s] "
+                            "post[%s] resmix[%s] recon[%s] mean[%s]",
+                            _k,
+                            idx,
+                            _st(hidden_states),
+                            _st(residual),
+                            _st(post_mix),
+                            _st(res_mix),
+                            _st(aux_recon),
+                            _st(aux_hidden_state),
+                        )
                 if self.use_sequence_parallel:
                     aux_hidden_state = sp_all_gather(aux_hidden_state)[:full_num_tokens]
                 aux_hidden_states.append(aux_hidden_state)
@@ -668,9 +821,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
-            )
+            tensors = {"hidden_states": hidden_states, "pre_mix": pre_mix}
+            if self.pp_share is not None:
+                tensors.update(
+                    self.pp_share.send(
+                        positions, self.topk_indices_buffer, self.candidate_block_buffer
+                    )
+                )
+            return IntermediateTensors(tensors)
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.
@@ -1113,9 +1271,12 @@ class DeepseekV41LLMForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        self.process_weights_after_loading()
-        return loaded_params
+        # No finalisation here: the loader may hand this method several
+        # non-contiguous runs of weights (the stream is not sorted, see
+        # vl_model.load_weights), and finalising after a partial load would
+        # fuse half-filled tensors. The model-level
+        # process_weights_after_loading() hook runs once, after everything.
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()

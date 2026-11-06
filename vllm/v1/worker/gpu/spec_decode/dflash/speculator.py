@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
+import struct
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -402,6 +404,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             hidden_states = last_hidden_states
         if envs.VLLM_M3_DEBUG_DRAFT and not dummy_run:
             self._debug_aux(hidden_states, aux_hidden_states, num_target_tokens)
+        if os.environ.get("VLLM_DSPARK_TAPS_DUMP") and not dummy_run:
+            # Diagnostico: grava os taps crus + o main_x de cada passo para o
+            # oraculo do drafter (scripts/dspark_oracle.py) avaliar offline as
+            # janelas de tap e conferir a matematica do bloco.
+            self._dump_taps(aux_hidden_states, hidden_states, num_target_tokens)
         self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
 
         if dummy_run and skip_attn_for_dummy_run:
@@ -520,6 +527,12 @@ class DFlashSpeculator(DraftModelSpeculator):
             step=self.num_query_per_req,
             causal=self._group_causal,
         )
+        if (
+            envs.VLLM_M3_DEBUG_DRAFT
+            and not dummy_run
+            and hasattr(self, "_debug_draft_attn")
+        ):
+            self._debug_draft_attn(draft_attn_metadata, num_reqs)
         draft_slot_mappings_by_layer = build_slot_mappings_by_layer(
             self.block_tables.slot_mappings[:, :num_tokens_padded],
             self.kv_cache_config,

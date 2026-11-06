@@ -336,22 +336,23 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+        # Apply the mapper lazily and stream: materialising the checkpoint
+        # here (e.g. sorting it so that "language_model." arrives as one
+        # contiguous block) costs O(checkpoint) host RAM in *every* worker,
+        # which does not fit in this host's 40 GiB container.
+        # AutoWeightsLoader groups with itertools.groupby, so a prefix may
+        # arrive in several runs; that is safe because the child's per-layer
+        # loader is stateless and its post-load finalisation is deferred to
+        # process_weights_after_loading() below, which the loader calls
+        # exactly once after all weights are in.
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
-        # The child's load_weights already ran its post-load finalization.
-        self._weights_finalized = True
-        return loaded_params
+        return loader.load_weights(self.hf_to_vllm_mapper.apply(weights))
 
     def process_weights_after_loading(self) -> None:
         # Model-level post-load hook (called by the loader after any load
-        # format). Under DummyModelLoader the child's load_weights — and
-        # hence its finalize step — is bypassed, so run it here instead.
+        # format). Under DummyModelLoader the child's load_weights is
+        # bypassed, so run its finalize step here as well.
         if getattr(self, "_weights_finalized", False):
             return
         self.language_model.process_weights_after_loading()
+        self._weights_finalized = True

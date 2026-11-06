@@ -25,6 +25,8 @@ backbone forward AND the sequential Markov sampling.
 
 from typing import Any
 
+import os
+import struct
 import time
 
 import torch
@@ -33,6 +35,7 @@ from torch.profiler import record_function
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -206,6 +209,116 @@ class DSparkSpeculator(DFlashSpeculator):
             "(communication: O(2*tp_size) vs O(vocab_size) per draft position)."
         )
 
+    def _debug_draft_attn(self, attn_metadata, num_reqs: int) -> None:
+        """Mostra o que a atencao do draft vai ler (janela x ring gravado).
+
+        Se `seq_lens` for pequeno (so' o bloco) ou o `block_table` nao tiver as
+        posicoes do contexto, o draft esta' prevendo so' a partir do token
+        ancora -- que e' o que uma aceitacao de ~17% sugere.
+        """
+        n = getattr(self, "_dbg_attn_n", 0)
+        if n >= 6:
+            return
+        self._dbg_attn_n = n + 1
+        md = attn_metadata
+        if isinstance(md, (list, tuple)):
+            md = md[0] if md else None
+        if not isinstance(md, dict) or not md:
+            logger.info("M3-DEBUG draft attn#%d: metadata vazio (%s)", n, type(md))
+            return
+        parts = []
+        for prefix, meta in list(md.items())[:3]:
+            seq = getattr(meta, "seq_lens", None)
+            bt = getattr(meta, "block_table", None)
+            sl = getattr(meta, "slot_mapping", None)
+            parts.append(
+                "%s: seq_len=%s bt=%s slots=%s"
+                % (
+                    str(prefix)[-40:],
+                    None if seq is None else seq[:num_reqs].tolist(),
+                    None if bt is None else tuple(bt.shape),
+                    None if sl is None else int(sl.numel()),
+                )
+            )
+        logger.info(
+            "M3-DEBUG draft attn#%d reqs=%d groups=%d %s",
+            n,
+            num_reqs,
+            len(md),
+            " | ".join(parts),
+        )
+
+    def _dump_taps(
+        self,
+        aux_hidden_states: list[torch.Tensor] | None,
+        main_x: torch.Tensor,
+        num_target_tokens: int,
+    ) -> None:
+        """Grava (taps crus, main_x) por passo para o oraculo do drafter.
+
+        Formato (little endian), concatenado no mesmo arquivo:
+            int32 n_targets, n_taps, hidden, step
+            int32[n_targets]              positions
+            float32[n_targets*n_taps*hidden]  aux
+            float32[n_targets*hidden]     main_x
+        Um <prefix>.meta.json ao lado descreve `tap_layer_ids`.
+        """
+        import json
+
+        import numpy as np
+
+        if not aux_hidden_states:
+            return
+        if get_tensor_model_parallel_rank() != 0:
+            return
+        prefix = os.environ["VLLM_DSPARK_TAPS_DUMP"]
+        n = int(num_target_tokens)
+        if n <= 0:
+            return
+        aux = torch.cat(aux_hidden_states, dim=-1)[:n].float()
+        mx = main_x[:n].float()
+        pos = self.context_positions[:n].to(torch.int32)
+        n_taps = int(aux.shape[-1] // self.draft_model_config.get_hidden_size())
+        hidden = int(aux.shape[-1] // n_taps)
+        step = getattr(self, "_dbg_dump_n", 0)
+        self._dbg_dump_n = step + 1
+        a = aux.cpu().numpy()
+        m = mx.cpu().numpy()
+        p = pos.cpu().numpy()
+        meta = prefix + ".meta.json"
+        if not os.path.exists(meta):
+            with open(meta, "w") as f:
+                json.dump(
+                    {
+                        "tap_layer_ids": list(
+                            getattr(self.draft_model_config.hf_config,
+                                    "eagle_aux_hidden_state_layer_ids", [])
+                        ),
+                        "hidden": hidden,
+                        "n_taps": n_taps,
+                        "window_env": os.environ.get("DSPARK_TAP_WIN", "1,2,3"),
+                    },
+                    f,
+                )
+        with open(prefix, "ab") as f:
+            f.write(struct.pack("<4i", n, n_taps, hidden, step))
+            f.write(p.tobytes())
+            f.write(a.tobytes())
+            f.write(m.tobytes())
+        big = int((a.__abs__() > 65504.0).sum())
+        logger.info(
+            "M3-DUMP step=%d n=%d n_taps=%d taps_absmax=%.1f gt65504=%d "
+            "main_x[absmax=%.3f std=%.3f] pos0=%s",
+            step,
+            n,
+            n_taps,
+            float(np.abs(a).max()),
+            big,
+            float(np.abs(m).max()),
+            float(m.std()),
+            p[:4].tolist(),
+        )
+
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
         if self._draft_topk is not None:
             self._sample_sequential_topk(num_reqs, head_hidden)
@@ -235,18 +348,47 @@ class DSparkSpeculator(DFlashSpeculator):
                 _t0 = time.perf_counter()
         vocab_size = base_logits.shape[-1]
         base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
-        if envs.VLLM_M3_DEBUG_DRAFT and not getattr(self, "_dbg_done", False):
-            self._dbg_done = True
+        # Contador (nao one-shot): o warmup consumia o diagnostico antes da
+        # primeira requisicao real.
+        _n_dbg = getattr(self, "_dbg_n", 0)
+        if envs.VLLM_M3_DEBUG_DRAFT and _n_dbg < int(
+            os.environ.get("VLLM_DSPARK_LOGITS_N", "6")
+        ):
+            self._dbg_n = _n_dbg + 1
             l0 = base_logits[0].float()
             logger.info(
-                "M3-DEBUG draft logits: shape=%s absmax=%.3f mean=%.4f "
+                "M3-DEBUG draft logits#%d: shape=%s absmax=%.3f mean=%.4f "
                 "argmax_per_step=%s anchor_id=%s",
+                _n_dbg,
                 tuple(base_logits.shape),
                 l0.abs().max().item(),
                 l0.mean().item(),
                 l0.argmax(dim=-1).tolist(),
                 self.input_buffers.input_ids[self._anchor_idx[:1]].tolist(),
             )
+
+        # So' o rank 0 do TP escreve: os dois ranks apendam no mesmo arquivo e
+        # os registros se intercalam (o leitor perde o alinhamento).
+        if (
+            os.environ.get("VLLM_DSPARK_TAPS_DUMP")
+            and get_tensor_model_parallel_rank() == 0
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # Par do dump dos taps: os head_hidden e os drafts que o vLLM
+            # realmente produziu, para o oraculo comparar linha a linha.
+            _prefix = os.environ["VLLM_DSPARK_TAPS_DUMP"] + ".draft.bin"
+            _step = getattr(self, "_dbg_draft_n", 0)
+            self._dbg_draft_n = _step + 1
+            _anchor = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+            _toks = self.draft_tokens[:num_reqs]
+            with open(_prefix, "ab") as f:
+                f.write(
+                    struct.pack("<4i", _step, num_reqs, n_spec,
+                                sample_hidden.shape[-1])
+                )
+                f.write(_anchor.to(torch.int32).cpu().numpy().tobytes())
+                f.write(_toks.to(torch.int32).cpu().numpy().tobytes())
+                f.write(sample_hidden.float().cpu().numpy().tobytes())
 
         idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)

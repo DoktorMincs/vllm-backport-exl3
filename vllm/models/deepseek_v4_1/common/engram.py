@@ -34,6 +34,13 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
   cache for the rest.
 """
 
+import concurrent.futures
+import functools
+import json
+import os
+import re
+import struct
+import time
 import weakref
 
 import numpy as np
@@ -584,8 +591,10 @@ def _engram_lookup_kernel(
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA. `weight` is
-    the uint8 view of the e4m3 rows so the decode also compiles below SM89.
+    `weight`/`scales` may address pinned host memory through UVA. `weight`
+    is the e4m3 table viewed as uint8: Triton has no fp8 convert below SM89,
+    so the bytes are decoded by ``_decode_fp8_f32`` (hardware convert where
+    it exists, ALU decode on SM8x).
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -602,12 +611,12 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
+        values_u8 = tl.load(
             weight + local[:, None] * DIM + cols[None, :],
             mask=owned[:, None],
             other=0,
         )
-        values = _decode_fp8_f32(values, False)
+        values = _decode_fp8_f32(values_u8, False)
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -620,6 +629,345 @@ def _engram_lookup_kernel(
             (values * scale).to(tl.bfloat16),
             mask=valid[:, None],
         )
+
+
+_ENGRAM_EMBED_KEY_RE = re.compile(r"(layers\.\d+\.engram)\b")
+
+
+def _hf_engram_prefix(prefix: str) -> str:
+    """``model.layers.1.engram`` (vLLM prefix) -> ``layers.1.engram`` (checkpoint)."""
+    m = _ENGRAM_EMBED_KEY_RE.search(prefix)
+    if m is None:
+        raise ValueError(f"cannot derive the checkpoint engram key from {prefix!r}")
+    return m.group(1)
+
+
+_ENGRAM_PREAD_C = r"""
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+
+typedef struct {
+    int fd_w, fd_s;
+    int64_t base_w, base_s;
+    const int64_t *rows;
+    int64_t lo, hi;
+    uint8_t *vals, *scales;
+    int dim, sdim;
+    int64_t short_reads;
+} job_t;
+
+static void *worker(void *arg) {
+    job_t *j = (job_t *)arg;
+    for (int64_t i = j->lo; i < j->hi; i++) {
+        int64_t r = j->rows[i];
+        ssize_t a = pread(j->fd_w, j->vals + i * j->dim, j->dim, j->base_w + r * j->dim);
+        ssize_t b = pread(j->fd_s, j->scales + i * j->sdim, j->sdim, j->base_s + r * j->sdim);
+        if (a != j->dim || b != j->sdim) j->short_reads++;
+    }
+    return NULL;
+}
+
+/* Gather rows[0..n) of a (values, scales) table with `threads` pthreads.
+   Returns the number of short/failed reads (0 = success). */
+int64_t engram_gather(int fd_w, int fd_s, int64_t base_w, int64_t base_s,
+                      const int64_t *rows, int64_t n, uint8_t *vals,
+                      uint8_t *scales, int dim, int sdim, int threads) {
+    if (n <= 0) return 0;
+    if (threads < 1) threads = 1;
+    if (threads > n) threads = (int)n;
+    pthread_t tid[256];
+    job_t jobs[256];
+    if (threads > 256) threads = 256;
+    int64_t per = (n + threads - 1) / threads;
+    int started = 0;
+    for (int t = 0; t < threads; t++) {
+        int64_t lo = t * per, hi = lo + per > n ? n : lo + per;
+        if (lo >= hi) break;
+        jobs[t] = (job_t){fd_w, fd_s, base_w, base_s, rows, lo, hi, vals, scales, dim, sdim, 0};
+        if (pthread_create(&tid[t], NULL, worker, &jobs[t]) != 0) {
+            worker(&jobs[t]);
+            continue;
+        }
+        started = t + 1;
+    }
+    int64_t bad = 0;
+    for (int t = 0; t < started; t++) {
+        pthread_join(tid[t], NULL);
+        bad += jobs[t].short_reads;
+    }
+    return bad;
+}
+"""
+
+
+@functools.cache
+def _engram_pread_lib():
+    """Compile (once per host, cached on disk) and load the C gather helper.
+
+    The Python ``preadv`` loop caps at ~125k syscalls/s regardless of thread
+    count (per-call interpreter overhead under the GIL), which made a
+    4096-token prefill chunk cost 1.6 s on the ranks owning an Engram layer
+    and capped prefill at ~2.5k tok/s. The C loop issues the same reads
+    from pthreads with the GIL released.
+    """
+    import ctypes
+    import hashlib
+    import subprocess
+    import tempfile
+
+    cache_dir = os.path.join(
+        os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")),
+        "engram_pread",
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    digest = hashlib.sha256(_ENGRAM_PREAD_C.encode()).hexdigest()[:16]
+    so_path = os.path.join(cache_dir, f"engram_pread_{digest}.so")
+    if not os.path.exists(so_path):
+        # Build inside the cache directory: /tmp is a tmpfs on the Maya host, so
+        # os.replace() from a tempfile.TemporaryDirectory() fails with EXDEV
+        # ("Invalid cross-device link") and every worker silently fell back to the
+        # Python thread pool. On the 2D7 port that fallback cost ~70 ms per engram
+        # layer per decode step (64 serial preads on 2 threads).
+        with tempfile.TemporaryDirectory(dir=cache_dir) as tmp:
+            src = os.path.join(tmp, "engram_pread.c")
+            with open(src, "w") as f:
+                f.write(_ENGRAM_PREAD_C)
+            out = os.path.join(tmp, "engram_pread.so")
+            subprocess.run(
+                ["gcc", "-O2", "-shared", "-fPIC", "-pthread", src, "-o", out],
+                check=True,
+                capture_output=True,
+            )
+            os.replace(out, so_path)
+    lib = ctypes.CDLL(so_path)
+    lib.engram_gather.restype = ctypes.c_int64
+    lib.engram_gather.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ]
+    return lib
+
+
+class _DiskEngramTable:
+    """Rows of one engram table gathered straight from the safetensors shard.
+
+    ``storage="disk"``: nothing of the ~98 GiB table is ever loaded. A lookup
+    takes the batch's hash ids to the host, deduplicates them, reads each
+    unique row (256 e4m3 bytes + 8 UE8M0 scale bytes) with ``pread`` from a
+    thread pool -- NVMe queue depth is what makes this fast -- into pinned
+    staging buffers, copies them to the device and dequantizes there with the
+    same Triton kernel the resident tables use (the staged rows are simply a
+    tiny table addressed by the inverse-unique index).
+
+    Costs: one device sync per lookup (the ids must reach the host) and NVMe
+    random-read latency, both once per step per engram layer. Meant for the
+    eager model-state hook that runs before the forward, never inside a
+    captured CUDA graph.
+    """
+
+    HEADER_PREFIX = 8  # safetensors: u64 header length, then the JSON header
+
+    def __init__(
+        self,
+        model_path: str,
+        hf_prefix: str,
+        num_embeddings: int,
+        dim: int,
+        block_size: int,
+        vocab_start: int,
+        vocab_end: int,
+        num_threads: int,
+        device: torch.device,
+        staging_rows: int,
+    ) -> None:
+        if not os.path.isdir(model_path):
+            raise ValueError(
+                "engram storage='disk' needs a local checkpoint directory "
+                f"(got {model_path!r}); download the checkpoint first."
+            )
+        self.dim = dim
+        self.scale_dim = dim // block_size
+        self.vocab_start = vocab_start
+        self.vocab_end = vocab_end
+        self.num_threads = max(1, num_threads)
+        self.device = device
+        self.weight_key = f"{hf_prefix}.embed.weight"
+        self.scale_key = f"{hf_prefix}.embed.scale"
+        (self.weight_path, self.weight_base) = self._locate(
+            model_path, self.weight_key, (num_embeddings, dim), "F8_E4M3"
+        )
+        (self.scale_path, self.scale_base) = self._locate(
+            model_path, self.scale_key, (num_embeddings, self.scale_dim), "F8_E8M0"
+        )
+        self._fds: dict[str, int] = {}
+        # Pinned host + device staging for at most ``staging_rows`` unique
+        # rows per lookup (batch tokens x local hash columns). ~26 MiB each
+        # at 4096 x 24 rows.
+        self.capacity = max(1, staging_rows)
+        # Explicit device: model init runs under a ``torch.device("cuda")``
+        # context, under which a bare ``torch.empty`` is not a CPU tensor.
+        self.host_vals = torch.empty(
+            (self.capacity, dim), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+        self.host_scales = torch.empty(
+            (self.capacity, self.scale_dim),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.dev_vals = torch.empty((self.capacity, dim), dtype=torch.uint8, device=device)
+        self.dev_scales = torch.empty(
+            (self.capacity, self.scale_dim), dtype=torch.uint8, device=device
+        )
+        self._np_vals = self.host_vals.numpy()
+        self._np_scales = self.host_scales.numpy()
+        self._pool = concurrent.futures.ThreadPoolExecutor(self.num_threads)
+        try:
+            self._lib = _engram_pread_lib()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "engram disk gather: C helper unavailable (%s); using the slower "
+                "Python thread pool", e
+            )
+            self._lib = None
+        logger.info(
+            "Engram table %s served from disk (%s, %.1f GiB never loaded); "
+            "%d reader threads, staging %d rows",
+            hf_prefix,
+            os.path.basename(self.weight_path),
+            num_embeddings * (dim + self.scale_dim) / 1024**3,
+            self.num_threads,
+            self.capacity,
+        )
+
+    @staticmethod
+    def _locate(
+        model_path: str, key: str, shape: tuple[int, int], dtype: str
+    ) -> tuple[str, int]:
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        shard = None
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                shard = json.load(f)["weight_map"].get(key)
+        candidates = (
+            [os.path.join(model_path, shard)]
+            if shard is not None
+            else sorted(
+                os.path.join(model_path, f)
+                for f in os.listdir(model_path)
+                if f.endswith(".safetensors")
+            )
+        )
+        for path in candidates:
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(header_len))
+            meta = header.get(key)
+            if meta is None:
+                continue
+            if tuple(meta["shape"]) != tuple(shape) or meta["dtype"] != dtype:
+                raise ValueError(
+                    f"{key} in {path} is {meta['dtype']} {meta['shape']}, expected "
+                    f"{dtype} {list(shape)}"
+                )
+            start, end = meta["data_offsets"]
+            assert end - start == shape[0] * shape[1], (key, start, end, shape)
+            return path, _DiskEngramTable.HEADER_PREFIX + header_len + start
+        raise ValueError(f"{key} not found in the safetensors shards under {model_path}")
+
+    def _fd(self, path: str) -> int:
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            self._fds[path] = fd
+        return fd
+
+    def _read_rows(self, rows: np.ndarray) -> None:
+        """Fill host staging rows [0, len(rows)) with table rows ``rows``."""
+        n = len(rows)
+        if n == 0:
+            return
+        wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
+        lib = self._lib
+        if lib is not None:
+            rows64 = np.ascontiguousarray(rows, dtype=np.int64)
+            # A decode step stages ~128 rows (a prefill chunk 6144): past one
+            # thread per two rows the preads just queue against themselves.
+            # Measured on the Maya NVMe, n=128: 64 threads 3.0 ms, 128 threads
+            # 5.0 ms; n=6144: 128 threads 103 ms, 64 threads 160 ms.
+            threads = min(self.num_threads, max(8, (n + 1) // 2))
+            bad = lib.engram_gather(
+                wfd, sfd, self.weight_base, self.scale_base,
+                rows64.ctypes.data, n,
+                self._np_vals.ctypes.data, self._np_scales.ctypes.data,
+                self.dim, self.scale_dim, threads,
+            )
+            if bad:
+                raise RuntimeError(f"engram disk gather: {bad} short reads")
+            return
+        vals, scales = self._np_vals, self._np_scales
+        dim, sdim = self.dim, self.scale_dim
+        wbase, sbase = self.weight_base, self.scale_base
+
+        def work(lo: int, hi: int) -> None:
+            for i in range(lo, hi):
+                r = int(rows[i])
+                os.preadv(wfd, [memoryview(vals[i])], wbase + r * dim)
+                os.preadv(sfd, [memoryview(scales[i])], sbase + r * sdim)
+
+        # One task per thread. The old floor of 64 rows per task left a decode
+        # batch (a few hundred rows) on 2 threads, i.e. 64 serial NVMe preads,
+        # ~70 ms per step per layer; preads are latency-bound, so parallelism is
+        # the whole cost.
+        step = max(1, -(-n // self.num_threads))
+        futures = [
+            self._pool.submit(work, lo, min(lo + step, n)) for lo in range(0, n, step)
+        ]
+        for fut in futures:
+            fut.result()
+
+    def gather(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """indices: [T, local_heads] global hash ids -> (dev_vals, dev_scales,
+        inverse ids [T, local_heads] int32 (-1 = not owned), num_unique)."""
+        ids = indices.to("cpu", torch.int64).numpy()  # one sync per lookup
+        local = ids - self.vocab_start
+        valid = (local >= 0) & (local < self.vocab_end - self.vocab_start)
+        uniq, inv = np.unique(local[valid], return_inverse=True)
+        n = len(uniq)
+        if n > self.capacity:
+            raise RuntimeError(
+                f"engram disk staging too small: {n} unique rows > {self.capacity}"
+            )
+        self._read_rows(uniq)
+        inv_ids = np.full(ids.shape, -1, dtype=np.int32)
+        inv_ids[valid] = inv.astype(np.int32)
+        if n > 0:
+            self.dev_vals[:n].copy_(self.host_vals[:n], non_blocking=True)
+            self.dev_scales[:n].copy_(self.host_scales[:n], non_blocking=True)
+        inv_dev = torch.from_numpy(inv_ids).to(self.device, non_blocking=True)
+        return self.dev_vals, self.dev_scales, inv_dev, n
+
+
+def _pinned_exact(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A CPU tensor pinned at its exact size (cudaHostRegister on a plain
+    allocation), bypassing the caching host allocator's power-of-two rounding.
+    Registered memory is page-locked and UVA-addressable like cudaHostAlloc
+    memory (``is_pinned()`` is true, ``get_cuda_view_from_cpu_tensor`` works).
+    Never unregistered: the tables live for the whole process."""
+    t = torch.empty(shape, dtype=dtype, device="cpu")
+    nbytes = t.numel() * t.element_size()
+    if nbytes:
+        err = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 0)
+        if int(err) != 0:
+            raise RuntimeError(
+                f"cudaHostRegister of {nbytes / 1024**3:.1f} GiB failed with {err}"
+            )
+        assert t.is_pinned()
+    return t
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -637,8 +985,16 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        storage: str | None = None,
+        hf_prefix: str | None = None,
+        disk_threads: int = 32,
+        staging_rows: int | None = None,
     ):
         super().__init__()
+        if storage is None:
+            storage = "cpu" if cpu_offload else "gpu"
+        assert storage in ("cpu", "gpu", "disk"), storage
+        cpu_offload = storage == "cpu"
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -657,30 +1013,90 @@ class ParallelEngramEmbedding(nn.Module):
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.tp_size = tp_size
         self.cpu_offload = cpu_offload
+        self.storage = storage
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         self._num_sms = torch.cuda.get_device_properties(
             torch.accelerator.current_device_index()
         ).multi_processor_count
 
+        if storage == "disk":
+            # No parameters at all: the loader never sees these tensors (they
+            # are registered as skipped by name), the "weights not
+            # initialized" check has nothing to miss, and rows are gathered
+            # from the shard per step (see _DiskEngramTable).
+            assert hf_prefix is not None
+            from vllm.model_executor.model_loader.weight_utils import (
+                register_skip_weight_names,
+            )
+
+            register_skip_weight_names(
+                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
+            )
+            self.weight = None
+            self.weight_scale_inv = None
+            vllm_config = get_current_vllm_config()
+            self.disk = _DiskEngramTable(
+                vllm_config.model_config.model,
+                hf_prefix,
+                num_embeddings,
+                dim,
+                block_size,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                disk_threads,
+                torch.device(torch.accelerator.current_device_index()),
+                staging_rows
+                if staging_rows is not None
+                else vllm_config.scheduler_config.max_num_batched_tokens
+                * self.part_n_hash_cols,
+            )
+            return
+        self.disk = None
+
+        # cpu mode: the generic loader would materialise the whole 98 GiB
+        # table in host RAM (safe_open().get_tensor copies) before copy_()
+        # into the pinned parameter -- ~200 GiB per table at peak, which is
+        # what OOM-killed the workers on a 278 GB host. Skip the tensors in
+        # the loader and fill the pinned buffers straight from the shard in
+        # chunks after loading (fill_pinned_from_checkpoint).
+        self._pinned_fill: tuple[str, str] | None = None
+        if cpu_offload and hf_prefix is not None:
+            from vllm.model_executor.model_loader.weight_utils import (
+                register_skip_weight_names,
+            )
+
+            register_skip_weight_names(
+                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
+            )
+            self._pinned_fill = (get_current_vllm_config().model_config.model, hf_prefix)
+
         # Explicit device: model init runs under a `torch.device("cuda")`
-        # context, which would otherwise put the shard in HBM.
-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
-            ),
-            requires_grad=False,
-        )
-        self.weight_scale_inv = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                dim // block_size,
-                dtype=torch.uint8,
-                **kwargs,
-            ),
-            requires_grad=False,
-        )
+        # context, which would otherwise put the shard in HBM. In cpu mode
+        # the buffers are pinned with cudaHostRegister at their exact size:
+        # torch's pinned allocator rounds every block up to a power of two,
+        # which turns a 98.3 GB table into a 128 GiB pinned block (the two
+        # tables would need 264 GiB of host memory before anything else).
+        if cpu_offload:
+            self.weight = nn.Parameter(
+                _pinned_exact((self.part_num_embeddings, dim), torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                _pinned_exact((self.part_num_embeddings, dim // block_size), torch.uint8),
+                requires_grad=False,
+            )
+        else:
+            self.weight = nn.Parameter(
+                torch.empty(self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.empty(
+                    self.part_num_embeddings, dim // block_size, dtype=torch.uint8
+                ),
+                requires_grad=False,
+            )
         for param in (self.weight, self.weight_scale_inv):
             set_weight_attrs(
                 param,
@@ -698,18 +1114,72 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
             )
 
+    def needs_checkpoint_fill(self) -> bool:
+        return self._pinned_fill is not None
+
+    def fill_pinned_from_checkpoint(self, threads: int = 8) -> None:
+        """Read this rank's rows of the two table tensors from the safetensors
+        shard straight into the pinned parameters (chunked ``preadv``, no
+        intermediate copy). The page cache the reads leave behind is
+        evictable, so the only resident cost is the parameters themselves."""
+        assert self._pinned_fill is not None
+        model_path, hf_prefix = self._pinned_fill
+        t0 = time.perf_counter()
+        for key, param, width, dtype in (
+            (f"{hf_prefix}.embed.weight", self.weight, self.dim, "F8_E4M3"),
+            (
+                f"{hf_prefix}.embed.scale",
+                self.weight_scale_inv,
+                self.dim // self.block_size,
+                "F8_E8M0",
+            ),
+        ):
+            path, base = _DiskEngramTable._locate(
+                model_path, key, (self.num_embeddings, width), dtype
+            )
+            dst = param.data.view(torch.uint8).reshape(-1).numpy()
+            nbytes = dst.nbytes
+            assert nbytes == self.part_num_embeddings * width
+            start = base + self.vocab_start_idx * width
+            step = 256 << 20
+            fd = os.open(path, os.O_RDONLY)
+            try:
+
+                def read_chunk(off: int) -> None:
+                    end = min(off + step, nbytes)
+                    view = memoryview(dst)[off:end]
+                    pos = 0
+                    while pos < end - off:
+                        pos += os.preadv(fd, [view[pos:]], start + off + pos)
+
+                with concurrent.futures.ThreadPoolExecutor(threads) as pool:
+                    list(pool.map(read_chunk, range(0, nbytes, step)))
+            finally:
+                os.close(fd)
+        self._pinned_fill = None
+        logger.info(
+            "Engram table %s: %.1f GiB read into pinned host memory in %.0f s",
+            hf_prefix,
+            (self.weight.numel() + self.weight_scale_inv.numel()) / 1024**3,
+            time.perf_counter() - t0,
+        )
+
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Parameters when resident, else cached UVA views of the pinned shard.
 
         Rebuilt if anything swaps `.data`, so a stale device pointer cannot
         survive silently.
         """
+        # The lookup kernel takes the e4m3 table as bytes (no fp8 convert
+        # below SM89); a uint8 view shares storage, so nothing is copied.
         if not self.cpu_offload:
-            return self.weight.data, self.weight_scale_inv.data
+            return self.weight.data.view(torch.uint8), self.weight_scale_inv.data
         src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr())
         if self._view_src != src:
             self._views = (
-                get_accelerator_view_from_cpu_tensor(self.weight.data),
+                get_accelerator_view_from_cpu_tensor(
+                    self.weight.data.view(torch.uint8)
+                ),
                 get_accelerator_view_from_cpu_tensor(self.weight_scale_inv.data),
             )
             self._view_src = src
@@ -726,13 +1196,16 @@ class ParallelEngramEmbedding(nn.Module):
         rows = indices.shape[0] * self.part_n_hash_cols
         if not rows:
             return
+        if self.disk is not None:
+            self._lookup_from_disk(indices, out, background)
+            return
         weight, scales = self._storage()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
         _engram_lookup_kernel[(grid,)](
-            weight.view(torch.uint8),
+            weight,
             scales,
             indices,
             out,
@@ -744,6 +1217,42 @@ class ParallelEngramEmbedding(nn.Module):
             HEAD_START=self.head_start,
             LOCAL_HEADS=self.part_n_hash_cols,
             TOTAL_HEADS=self.n_hash_cols,
+            DIM=self.dim,
+            QUANT_BLOCK=self.block_size,
+            BLOCK_R=16,
+            GRID=grid,
+        )
+
+    def _lookup_from_disk(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool
+    ) -> None:
+        """``storage="disk"``: stage the batch's unique rows from the shard,
+        then run the ordinary lookup kernel over that staged mini-table with
+        the inverse-unique ids (padded/unowned heads map to -1 -> zeros)."""
+        assert self.disk is not None
+        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        local = indices[:, self.head_start : head_end]
+        vals, scales, inv_ids, num_unique = self.disk.gather(local)
+        if inv_ids.shape[1] != self.part_n_hash_cols:
+            padded = inv_ids.new_full((inv_ids.shape[0], self.part_n_hash_cols), -1)
+            padded[:, : inv_ids.shape[1]] = inv_ids
+            inv_ids = padded
+        rows = indices.shape[0] * self.part_n_hash_cols
+        tiles = triton.cdiv(rows, 16)
+        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        _engram_lookup_kernel[(grid,)](
+            vals,
+            scales,
+            inv_ids,
+            out,
+            0,
+            num_unique,
+            rows,
+            inv_ids.stride(0),
+            inv_ids.stride(1),
+            HEAD_START=0,
+            LOCAL_HEADS=self.part_n_hash_cols,
+            TOTAL_HEADS=self.part_n_hash_cols,
             DIM=self.dim,
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
@@ -914,7 +1423,9 @@ class Engram(nn.Module):
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
-            cpu_offload=engram_config.cpu_offload if engram_config else True,
+            storage=engram_config.resolved_storage() if engram_config else "cpu",
+            hf_prefix=_hf_engram_prefix(prefix),
+            disk_threads=engram_config.disk_threads if engram_config else 32,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -942,6 +1453,13 @@ class Engram(nn.Module):
             layout.head_dim,
             dtype=torch.bfloat16,
         )
+
+    @property
+    def rows_staged_by_runner(self) -> bool:
+        """``storage="disk"``: rows are gathered by the model-state hook before
+        the forward (host round trip; illegal inside graph capture), so the
+        forward must not call :meth:`prepare_embeddings` itself."""
+        return self.embed_tokens.storage == "disk"
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather this layer's rows on the main stream before decoder layers."""

@@ -10,6 +10,7 @@ To implement non-causal attention, we leverage the sparse attention implementati
 include the future query tokens in the top-k indices for each query token.
 """
 
+import os
 from collections.abc import Iterable
 
 import regex as re
@@ -150,7 +151,65 @@ class DSparkDeepseekV4Model(nn.Module):
 
         ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
         """
-        return self.main_norm(self.main_proj(aux_hidden_states))
+        # As linhas de padding do batch chegam aqui como NaN (o buffer de
+        # entrada do grafo e' torch.empty e o target propaga NaN nelas sem se
+        # importar -- so' le as linhas reais). No draft isso nao e' inofensivo:
+        # `precompute_and_store_context_kv` grava KV para TODAS as linhas, e uma
+        # unica linha NaN envenena qualquer query que atenda nesses slots.
+        # Medido em 05/11 (boot dsp12): combine#1 in rows_nan=[0,0,1,1,...],
+        # 14 de 16 linhas NaN, argmax do draft constante e aceitacao ~0.
+        dbg = False
+        if envs.VLLM_M3_DEBUG_DRAFT:
+            # Contador, nao one-shot: a primeira chamada e' do dummy run (tudo
+            # zero) e consumia o diagnostico antes da requisicao real.
+            n = getattr(self, "_dbg_combine_n", 0)
+            if n < 8:
+                self._dbg_combine_n = n + 1
+                dbg = True
+                raw = aux_hidden_states.float()
+                n_aux = max(raw.shape[-1] // self.hidden_size, 1)
+                h = raw.shape[-1] // n_aux
+                per = [
+                    int(torch.isnan(raw[:, i * h : (i + 1) * h]).sum())
+                    for i in range(n_aux)
+                ]
+                rows = torch.isnan(raw).any(dim=-1).to(torch.int8).tolist()[:32]
+                logger.error(
+                    "M3-DEBUG combine#%d PRE in[absmax=%.2f nan=%d per_aux=%s "
+                    "rows_nan=%s]",
+                    n,
+                    raw.abs().max().item(),
+                    int(torch.isnan(raw).sum()),
+                    per,
+                    rows,
+                )
+        aux_hidden_states = torch.nan_to_num(aux_hidden_states)
+        # O dump de diagnostico captura mais taps do que o draft consome (para
+        # varrer as janelas de 3 offline com o oraculo). `DSPARK_TAP_WIN`
+        # escolhe quais indices entram no `main_proj` (padrao: a janela do meio,
+        # = entrar nas camadas 0-based 37,38,39, que e' o que o checkpoint diz).
+        n_taps = aux_hidden_states.shape[-1] // self.hidden_size
+        if n_taps > len(self.target_layer_ids):
+            win = os.environ.get("DSPARK_TAP_WIN", "1,2,3")
+            idx = [int(x) for x in win.split(",")]
+            D = self.hidden_size
+            aux_hidden_states = torch.cat(
+                [aux_hidden_states[:, i * D : (i + 1) * D] for i in idx], dim=-1
+            )
+        proj = self.main_proj(aux_hidden_states)
+        out = self.main_norm(proj)
+        if dbg:
+            p = proj.float()
+            y = out.float()
+            logger.error(
+                "M3-DEBUG combine POST proj[absmax=%.2f nan=%d] "
+                "out[absmax=%.2f nan=%d]",
+                p.abs().max().item(),
+                int(torch.isnan(p).sum()),
+                y.abs().max().item(),
+                int(torch.isnan(y).sum()),
+            )
+        return out
 
     @torch.inference_mode()
     def precompute_and_store_context_kv(
@@ -528,6 +587,33 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(name)
 
+        if envs.VLLM_M3_DEBUG_DRAFT:
+            # DIAGNOSTICO TEMPORARIO: o combinado do draft sai NaN. Separa
+            # "peso do main_proj nao carregado" (trellis zerado -> RMSNorm com
+            # eps 1e-20 divide por ~0 -> NaN) de "aux ruim".
+            rows = []
+            for n, p in params_dict.items():
+                if "main_proj" in n or "main_norm" in n or n.endswith(
+                    "model.norm.weight"
+                ):
+                    d = p.data
+                    if d.numel() == 0:
+                        rows.append((n, str(d.dtype), tuple(d.shape), "vazio", 0,
+                                     n in loaded_params))
+                        continue
+                    f = d.float()
+                    rows.append(
+                        (
+                            n,
+                            str(d.dtype),
+                            tuple(d.shape),
+                            round(float(f.abs().max()), 4),
+                            int(torch.isnan(f).sum()),
+                            n in loaded_params,
+                        )
+                    )
+            logger.error("M3-DEBUG draft head params: %s", rows)
+
         if self.model.confidence_head is not None and not loaded_confidence_head:
             self.model.confidence_head = None
         self.process_weights_after_loading()
@@ -574,4 +660,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             head_prefixes
         ):
             return f"model.{rest}"
+        # O `nn.ModuleList` nomeia os filhos POR INDICE (layers.0, layers.1, ...),
+        # independente do `prefix=` passado na construcao -- aquele offset
+        # (`layers.{num_hidden_layers+i}`) existe so para o plugin EXL3 casar a
+        # config de quant. Confirmado no boot dsp3: os params registrados sao
+        # `model.layers.{0,1,2}.attn.wo_a.weight`. Somar o offset aqui da KeyError.
         return f"model.layers.{stage}.{rest}"

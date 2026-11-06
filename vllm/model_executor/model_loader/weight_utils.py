@@ -9,6 +9,7 @@ import glob
 import hashlib
 import json
 import os
+import struct
 import tempfile
 import threading
 import time
@@ -863,6 +864,70 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
+# Tensor names the safetensors iterators must never materialize. Registered
+# by modules that source a tensor themselves at runtime (e.g. DeepSeek V4.1
+# Engram tables with ``--engram-config '{"storage": "disk"}'``: two 98 GiB
+# tensors that ``safe_open().get_tensor`` would otherwise copy into host RAM).
+_SKIP_WEIGHT_NAMES: set[str] = set()
+
+
+def register_skip_weight_names(names) -> None:
+    """Skip these checkpoint tensor names in the safetensors iterators."""
+    _SKIP_WEIGHT_NAMES.update(names)
+
+
+def _skip_registered_weight(name: str) -> bool:
+    return bool(_SKIP_WEIGHT_NAMES) and name in _SKIP_WEIGHT_NAMES
+
+
+_SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": getattr(torch, "float8_e8m0fnu", torch.uint8),
+}
+
+
+def _safetensors_header(path: str) -> tuple[dict, int]:
+    """Return the safetensors header and data offset without mapping the file."""
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    header.pop("__metadata__", None)
+    return header, 8 + header_len
+
+
+def _read_tensors_without_mmap(
+    path: str, header: dict, data_start: int, names: list[str]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield selected tensors with plain pread (no mmap of the whole shard)."""
+    with open(path, "rb") as f:
+        for name in names:
+            meta = header[name]
+            start, end = meta["data_offsets"]
+            dtype = _SAFETENSORS_DTYPES[meta["dtype"]]
+            tensor = torch.empty(meta["shape"], dtype=dtype)
+            f.seek(data_start + start)
+            # Read straight into the tensor's storage. A bytes/bytearray
+            # round-trip would double the peak host RAM of the big tensors
+            # (lm_head / embed are ~1.2 GiB each) in every worker.
+            flat = tensor.view(torch.uint8).reshape(-1)
+            if flat.numel():
+                got = f.readinto(memoryview(flat.numpy()))
+                if got != end - start:
+                    raise OSError(f"{path}: short read for {name}")
+            yield name, tensor
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -959,8 +1024,11 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 state_dict = load(f.read())
             for name, param in state_dict.items():
-                if not should_skip_weight(name, local_expert_ids):
-                    yield name, param
+                if should_skip_weight(name, local_expert_ids):
+                    continue
+                if _skip_registered_weight(name):
+                    continue
+                yield name, param
         elif safetensors_load_strategy == "torchao":
             # we can't load flattened torchao tensor subclasses directly into the model
             # instead we reconstruct the subclasses here before returning
@@ -978,6 +1046,8 @@ def safetensors_weights_iterator(
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
+                    if _skip_registered_weight(name):
+                        continue
                     state_dict[name] = f.get_tensor(name)
 
                 # update with leftover tensor data from previous iteration, if any
@@ -992,13 +1062,52 @@ def safetensors_weights_iterator(
                 )
             yield from unflattened_state_dict.items()
         else:
+            if _SKIP_WEIGHT_NAMES and os.path.getsize(st_file) > avail_bytes:
+                # safe_open maps the whole shard privately; for a file that
+                # is mostly one huge skipped tensor (the 94 GiB V4.1 Engram
+                # tables) the kernel's overcommit heuristic refuses that
+                # mapping on hosts with less RAM+swap than the file. Only
+                # such shards take the pread path: for ordinary shards the
+                # mmap is both faster and much friendlier to a memory
+                # cgroup, because its pages are file-backed and evictable,
+                # while pread materialises anonymous copies.
+                header, data_start = _safetensors_header(st_file)
+                if any(_skip_registered_weight(n) for n in header):
+                    wanted = [
+                        n
+                        for n in header
+                        if not _skip_registered_weight(n)
+                        and not should_skip_weight(n, local_expert_ids)
+                    ]
+                    yield from _read_tensors_without_mmap(
+                        st_file, header, data_start, wanted
+                    )
+                    continue
             with safe_open(st_file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
                     if should_skip_weight(name, local_expert_ids):
                         continue
-                    param = f.get_tensor(name)
-                    yield name, param
+                    if _skip_registered_weight(name):
+                        continue
+                    try:
+                        param = f.get_tensor(name)
+                    except Exception:
+                        # Diagnostico do 'UntypedStorage' intermitente (boots
+                        # 8c3/9b/9c): precisamos saber QUAL tensor e QUAL
+                        # arquivo, que o traceback do safetensors nao diz.
+                        import traceback as _tb
 
+                        logger.error(
+                            "get_tensor falhou: name=%r file=%s size=%s "
+                            "header_shape=%r",
+                            name,
+                            st_file,
+                            os.path.getsize(st_file),
+                            _safetensors_header(st_file)[0].get(name),
+                        )
+                        logger.error("%s", _tb.format_exc())
+                        raise
+                    yield name, param
 
 def multi_thread_safetensors_weights_iterator(
     hf_weights_files: list[str],

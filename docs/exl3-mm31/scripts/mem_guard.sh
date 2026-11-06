@@ -25,7 +25,7 @@ FLOOR="${2:-8000}"
 STEP="${3:-5}"
 PORT_PAT="${4:-3001}"
 LOG=${EXL3_ROOT}/logs/mem_guard_${TAG}.log
-PY_PAT=${EXL3_ROOT}/venv-028/bin/python
+PY_PAT="(${EXL3_ROOT}/venv-028|${VLLM_REPO}/.venv)/bin/python"
 
 peak=0
 low=0

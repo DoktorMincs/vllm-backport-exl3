@@ -1728,8 +1728,15 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
-            for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+            # Only this worker's layers: a pipeline rank that owns no layer
+            # of the group still carries the global UniformTypeKVCacheSpecs
+            # (projection leaves it untouched when the layer list is empty),
+            # and emitting tensors for foreign layers makes allocate_kv_cache
+            # fail to find them in any group.
+            for layer_name in group.layer_names:
+                layers_by_spec[group_spec.kv_cache_specs[layer_name]].append(
+                    layer_name
+                )
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 

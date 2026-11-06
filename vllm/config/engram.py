@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
 
@@ -49,6 +49,26 @@ class EngramConfig:
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica.
     Only honored by the Qwen4Exp PLE implementation."""
+
+    storage: Literal["cpu", "gpu", "disk"] | None = None
+    """Where the n-gram hash tables live. ``cpu``: pinned host memory read
+    over UVA (the ``cpu_offload=True`` default; ~203 GiB of host RAM for
+    DeepSeek V4.1). ``gpu``: resident in device memory (``cpu_offload=False``;
+    ~98 GiB per engram layer, on the PP rank that owns it). ``disk``: the
+    tables are never loaded -- rows are gathered per step straight from the
+    safetensors shards with many parallel ``pread`` calls, dequantized on the
+    GPU. Zero VRAM/RAM for the tables at the cost of NVMe random-read latency
+    per step; the only option on hosts without ~200 GiB of RAM. Needs a local
+    checkpoint directory and the default (lazy) safetensors load strategy."""
+
+    disk_threads: int = 32
+    """Reader threads for ``storage="disk"``. Each row is a 256-byte random
+    read; NVMe queue depth is what makes the gather fast, so keep this high."""
+
+    def resolved_storage(self) -> str:
+        if self.storage is not None:
+            return self.storage
+        return "cpu" if self.cpu_offload else "gpu"
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
         """Reject Engram configuration for models without supported embeddings."""
