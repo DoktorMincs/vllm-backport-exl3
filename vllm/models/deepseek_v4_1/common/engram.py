@@ -40,6 +40,7 @@ import json
 import os
 import re
 import struct
+import threading
 import time
 import weakref
 
@@ -66,6 +67,148 @@ logger = init_logger(__name__)
 
 # Cache value for tokens that take no part in an n-gram (image spans).
 DEAD_ID = -1
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+# --- Frente 3 experiments (all default off, behaviour is unchanged) ---------
+# None of these is read on the default path: every call site is behind a
+# module-level boolean, so the disabled code is the pre-existing code.
+_ENGRAM_TIME = _env_flag("VLLM_DS41_ENGRAM_TIME")
+"""A2: per-phase wall-clock accounting on the disk engram hot path."""
+
+try:
+    _ENGRAM_REUSE_HASH = int(os.environ.get("VLLM_DS41_ENGRAM_REUSE_HASH", "0"))
+    if _ENGRAM_REUSE_HASH not in (0, 1, 2):
+        raise ValueError("must be 0, 1 or 2")
+except ValueError as _e:
+    logger.warning("ignoring VLLM_DS41_ENGRAM_REUSE_HASH: %s", _e)
+    _ENGRAM_REUSE_HASH = 0
+"""3.1: 0 = hash twice per step (today), 1 = reuse the staged hashes,
+2 = reuse but recompute and compare (verification mode)."""
+
+_ENGRAM_OVERLAP = _env_flag("VLLM_DS41_ENGRAM_OVERLAP")
+"""3.2: gather the disk rows of every engram layer on worker threads and join
+them only right before each layer's lookup kernel.
+
+The fallback allowed by the plan is what is implemented here: all host work
+stays in the eager model-state hook (``stage_engram_rows``). Moving the join
+into ``Engram.forward`` would overlap the preads with the decoder-layer
+compute of the same step, but that forward is CUDA-graph capturable and a
+host round trip inside it is illegal (see ``rows_staged_by_runner``). What we
+do overlap is the per-layer gathers with each other -- submit layer 0..N, then
+join+launch kernel 0..N -- and with GPU work still in flight from the previous
+step. Generic over any number of engram layers; no layer count is assumed.
+"""
+
+_ENGRAM_ASYNC_D2H = _env_flag("VLLM_DS41_ENGRAM_ASYNC_D2H")
+"""3.3: copy the hash ids to a pinned host buffer on a side CUDA stream."""
+
+_ENGRAM_THREADS: int | None
+try:
+    _ENGRAM_THREADS = int(os.environ["VLLM_DS41_ENGRAM_THREADS"])
+    if _ENGRAM_THREADS < 1:
+        raise ValueError("must be >= 1")
+except KeyError:
+    _ENGRAM_THREADS = None
+except ValueError as _e:  # bad value: fall back to the built-in formula
+    logger.warning("ignoring VLLM_DS41_ENGRAM_THREADS: %s", _e)
+    _ENGRAM_THREADS = None
+
+_ENGRAM_THREAD_FLOOR = _env_flag("VLLM_DS41_ENGRAM_THREAD_FLOOR")
+"""3.4: cap the reader threads at 2 when a lookup stages fewer than 256 rows."""
+
+
+class _EngramTimer:
+    """Opt-in (``VLLM_DS41_ENGRAM_TIME=1``) decomposition of the engram cost.
+
+    ``record`` is called from the timed branches only; ``tick`` closes one
+    model step and emits, every ``REPORT_EVERY`` steps, one line per layer
+    with the per-step mean of each phase. Tags are the engram layer id
+    (``layer=14``) or ``hash`` for the n-gram hash launches.
+    """
+
+    REPORT_EVERY = 20
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self._window = 0
+        self._fields: dict[tuple[str, str], list[float]] = {}
+        self._rows: dict[str, int] = {}
+        self._tokens = 0
+        # 3.2 records from the gather worker threads.
+        self._lock = threading.Lock()
+
+    def record(self, tag: str, phase: str, seconds: float) -> None:
+        with self._lock:
+            acc = self._fields.get((tag, phase))
+            if acc is None:
+                self._fields[(tag, phase)] = [seconds, 1.0]
+            else:
+                acc[0] += seconds
+                acc[1] += 1.0
+
+    def add_rows(self, tag: str, rows: int, tokens: int | None = None) -> None:
+        with self._lock:
+            if rows:
+                self._rows[tag] = self._rows.get(tag, 0) + rows
+            if tokens is not None:
+                self._tokens = tokens
+
+    def tick(self) -> None:
+        """Close one model step; flush every ``REPORT_EVERY`` steps."""
+        self.steps += 1
+        self._window += 1
+        if self._window >= self.REPORT_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        window = self._window
+        if window == 0:
+            return
+        tags = sorted({tag for tag, _ in self._fields} | set(self._rows), key=str)
+        hash_parts = [
+            f"{phase}={self._mean('hash', phase) * 1e3:.2f}ms"
+            for phase in ("stage", "fwd")
+            if ("hash", phase) in self._fields
+        ]
+        for tag in tags:
+            phases = (
+                ("stage", "fwd")
+                if tag == "hash"
+                else ("d2h", "uniq", "preads", "h2d", "wait")
+            )
+            parts = [
+                f"{phase}={self._mean(tag, phase) * 1e3:.2f}ms"
+                for phase in phases
+                if (tag, phase) in self._fields
+            ]
+            if tag != "hash" and hash_parts:
+                parts.extend(hash_parts)  # the hash covers every layer
+            if tag in self._rows:
+                parts.append(f"rows={self._rows[tag] / window:.1f}")
+            if self._tokens:
+                parts.append(f"tokens={self._tokens}")
+            if parts:
+                logger.info(
+                    "ENGRAM-TIME steps=%d layer=%s %s",
+                    self.steps,
+                    tag,
+                    " ".join(parts),
+                )
+        self._fields.clear()
+        self._rows.clear()
+        self._tokens = 0
+        self._window = 0
+
+    def _mean(self, tag: str, phase: str) -> float:
+        total, count = self._fields[(tag, phase)]
+        return total / count
+
+
+_ENGRAM_TIMER = _EngramTimer()
 
 
 def _is_prime(n: int) -> bool:
@@ -781,6 +924,7 @@ class _DiskEngramTable:
         num_threads: int,
         device: torch.device,
         staging_rows: int,
+        layer_tag: int | None = None,
     ) -> None:
         if not os.path.isdir(model_path):
             raise ValueError(
@@ -824,6 +968,47 @@ class _DiskEngramTable:
         self._np_vals = self.host_vals.numpy()
         self._np_scales = self.host_scales.numpy()
         self._pool = concurrent.futures.ThreadPoolExecutor(self.num_threads)
+        # --- 3.1/3.2/3.3 experiment state (unused on the default path) ------
+        # Tag used by the A2 timer; set by ParallelEngramEmbedding.
+        self.layer_tag = str(layer_tag) if layer_tag is not None else "?"
+        # 3.2: a second staging set, so a gather submitted on a worker thread
+        # never writes the set a previous lookup kernel may still read. Kept
+        # out of the default path because it doubles ~26 MiB of pinned host
+        # memory (plus the device mirror) per engram layer per rank.
+        # (host_vals, host_scales, dev_vals, dev_scales, np_vals, np_scales)
+        self._alt: tuple | None = None
+        self._slot = 0
+        self._prefetch_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        if _ENGRAM_OVERLAP:
+            host_vals2 = torch.empty(
+                (self.capacity, dim), dtype=torch.uint8, device="cpu",
+                pin_memory=True,
+            )
+            host_scales2 = torch.empty(
+                (self.capacity, self.scale_dim), dtype=torch.uint8,
+                device="cpu", pin_memory=True,
+            )
+            self._alt = (
+                host_vals2,
+                host_scales2,
+                torch.empty((self.capacity, dim), dtype=torch.uint8, device=device),
+                torch.empty(
+                    (self.capacity, self.scale_dim), dtype=torch.uint8,
+                    device=device,
+                ),
+                host_vals2.numpy(),
+                host_scales2.numpy(),
+            )
+            # Dedicated pool: a prefetch task must not queue behind (or ahead
+            # of) the Python pread tasks on ``self._pool``.
+            self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(4)
+        # 3.3: side stream + event for the non-blocking D2H of the hash ids.
+        self._d2h_stream: torch.cuda.Stream | None = None
+        self._d2h_event: torch.cuda.Event | None = None
+        self._host_ids: torch.Tensor | None = None
+        if _ENGRAM_ASYNC_D2H:
+            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._d2h_event = torch.cuda.Event()
         try:
             self._lib = _engram_pread_lib()
         except Exception as e:  # noqa: BLE001
@@ -884,8 +1069,27 @@ class _DiskEngramTable:
             self._fds[path] = fd
         return fd
 
-    def _read_rows(self, rows: np.ndarray) -> None:
-        """Fill host staging rows [0, len(rows)) with table rows ``rows``."""
+    def _reader_threads(self, n: int) -> int:
+        """Reader thread count for ``n`` rows (3.4 overrides, default formula)."""
+        if _ENGRAM_THREADS is not None:
+            threads = max(1, min(_ENGRAM_THREADS, n))
+        else:
+            threads = min(self.num_threads, max(8, (n + 1) // 2))
+        if _ENGRAM_THREAD_FLOOR and n < 256:
+            threads = min(threads, 2)
+        return threads
+
+    def _read_rows(
+        self,
+        rows: np.ndarray,
+        np_vals: np.ndarray | None = None,
+        np_scales: np.ndarray | None = None,
+    ) -> None:
+        """Fill host staging rows [0, len(rows)) with table rows ``rows``.
+
+        ``np_vals``/``np_scales`` select a staging set; None means the primary
+        one (the only one that exists unless the overlap experiment is on).
+        """
         n = len(rows)
         if n == 0:
             return
@@ -893,21 +1097,31 @@ class _DiskEngramTable:
         lib = self._lib
         if lib is not None:
             rows64 = np.ascontiguousarray(rows, dtype=np.int64)
-            # A decode step stages ~128 rows (a prefill chunk 6144): past one
-            # thread per two rows the preads just queue against themselves.
-            # Measured on the Maya NVMe, n=128: 64 threads 3.0 ms, 128 threads
-            # 5.0 ms; n=6144: 128 threads 103 ms, 64 threads 160 ms.
-            threads = min(self.num_threads, max(8, (n + 1) // 2))
+            if _ENGRAM_THREADS is None and not _ENGRAM_THREAD_FLOOR:
+                # A decode step stages ~128 rows (a prefill chunk 6144): past
+                # one thread per two rows the preads just queue against
+                # themselves. Measured on the Maya NVMe, n=128: 64 threads
+                # 3.0 ms, 128 threads 5.0 ms; n=6144: 128 threads 103 ms,
+                # 64 threads 160 ms.
+                threads = min(self.num_threads, max(8, (n + 1) // 2))
+            else:
+                threads = self._reader_threads(n)
+            if np_vals is None:
+                np_vals, np_scales = self._np_vals, self._np_scales
+            assert np_scales is not None
             bad = lib.engram_gather(
                 wfd, sfd, self.weight_base, self.scale_base,
                 rows64.ctypes.data, n,
-                self._np_vals.ctypes.data, self._np_scales.ctypes.data,
+                np_vals.ctypes.data, np_scales.ctypes.data,
                 self.dim, self.scale_dim, threads,
             )
             if bad:
                 raise RuntimeError(f"engram disk gather: {bad} short reads")
             return
-        vals, scales = self._np_vals, self._np_scales
+        if np_vals is None:
+            np_vals, np_scales = self._np_vals, self._np_scales
+        assert np_scales is not None
+        vals, scales = np_vals, np_scales
         dim, sdim = self.dim, self.scale_dim
         wbase, sbase = self.weight_base, self.scale_base
 
@@ -921,7 +1135,12 @@ class _DiskEngramTable:
         # batch (a few hundred rows) on 2 threads, i.e. 64 serial NVMe preads,
         # ~70 ms per step per layer; preads are latency-bound, so parallelism is
         # the whole cost.
-        step = max(1, -(-n // self.num_threads))
+        nthreads = self.num_threads if _ENGRAM_THREADS is None else max(
+            1, _ENGRAM_THREADS
+        )
+        if _ENGRAM_THREAD_FLOOR and n < 256:
+            nthreads = min(nthreads, 2)
+        step = max(1, -(-n // nthreads))
         futures = [
             self._pool.submit(work, lo, min(lo + step, n)) for lo in range(0, n, step)
         ]
@@ -933,6 +1152,10 @@ class _DiskEngramTable:
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """indices: [T, local_heads] global hash ids -> (dev_vals, dev_scales,
         inverse ids [T, local_heads] int32 (-1 = not owned), num_unique)."""
+        # Frente 3 paths (timing / overlap / async D2H). Off by default, in
+        # which case the body below is the pre-existing, untouched code.
+        if _ENGRAM_TIME or _ENGRAM_OVERLAP or _ENGRAM_ASYNC_D2H:
+            return self._gather_instrumented(indices, None)
         ids = indices.to("cpu", torch.int64).numpy()  # one sync per lookup
         local = ids - self.vocab_start
         valid = (local >= 0) & (local < self.vocab_end - self.vocab_start)
@@ -950,6 +1173,110 @@ class _DiskEngramTable:
             self.dev_scales[:n].copy_(self.host_scales[:n], non_blocking=True)
         inv_dev = torch.from_numpy(inv_ids).to(self.device, non_blocking=True)
         return self.dev_vals, self.dev_scales, inv_dev, n
+
+    # --- Frente 3 (experimental; see the env flags at the top) --------------
+    def _next_buffers(self) -> tuple | None:
+        """Pick the staging set for the next gather (double buffered under
+        ``VLLM_DS41_ENGRAM_OVERLAP=1``). None = the primary set."""
+        if self._alt is None:
+            return None
+        slot = self._slot
+        self._slot ^= 1
+        return self._alt if slot else None
+
+    def _copy_indices_to_host(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None"
+    ) -> np.ndarray:
+        """D2H of the hash ids (3.3): pinned buffer + side stream when enabled."""
+        if not _ENGRAM_ASYNC_D2H:
+            return indices.to("cpu", torch.int64).numpy()
+        assert self._d2h_stream is not None and self._d2h_event is not None
+        numel = indices.numel()
+        if self._host_ids is None or self._host_ids.numel() < numel:
+            self._host_ids = torch.empty(
+                numel, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+        host = self._host_ids[:numel].view(indices.shape)
+        stream = sync_stream
+        if stream is None:
+            stream = torch.cuda.current_stream(indices.device)
+        # The copy only waits for the work enqueued on ``stream`` up to here
+        # (the hash kernels), not for whatever is enqueued on it later.
+        self._d2h_stream.wait_stream(stream)
+        with torch.cuda.stream(self._d2h_stream):
+            host.copy_(indices, non_blocking=True)
+            self._d2h_event.record()
+        self._d2h_event.synchronize()
+        return host.numpy()
+
+    def _gather_instrumented(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None"
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Same gather with the A2 timing hooks and the 3.2/3.3 variants."""
+        timer = _ENGRAM_TIMER if _ENGRAM_TIME else None
+        buffers = self._next_buffers()
+        if buffers is None:
+            host_vals, host_scales = self.host_vals, self.host_scales
+            dev_vals, dev_scales = self.dev_vals, self.dev_scales
+            np_vals, np_scales = self._np_vals, self._np_scales
+        else:
+            host_vals, host_scales, dev_vals, dev_scales, np_vals, np_scales = (
+                buffers
+            )
+        t0 = time.perf_counter() if timer is not None else 0.0
+        ids = self._copy_indices_to_host(indices, sync_stream)
+        t1 = time.perf_counter() if timer is not None else 0.0
+        local = ids - self.vocab_start
+        valid = (local >= 0) & (local < self.vocab_end - self.vocab_start)
+        uniq, inv = np.unique(local[valid], return_inverse=True)
+        t2 = time.perf_counter() if timer is not None else 0.0
+        n = len(uniq)
+        if n > self.capacity:
+            raise RuntimeError(
+                f"engram disk staging too small: {n} unique rows > {self.capacity}"
+            )
+        self._read_rows(uniq, np_vals, np_scales)
+        t3 = time.perf_counter() if timer is not None else 0.0
+        inv_ids = np.full(ids.shape, -1, dtype=np.int32)
+        inv_ids[valid] = inv.astype(np.int32)
+        if n > 0:
+            dev_vals[:n].copy_(host_vals[:n], non_blocking=True)
+            dev_scales[:n].copy_(host_scales[:n], non_blocking=True)
+        inv_dev = torch.from_numpy(inv_ids).to(self.device, non_blocking=True)
+        if timer is not None:
+            t4 = time.perf_counter()
+            timer.record(self.layer_tag, "d2h", t1 - t0)
+            timer.record(self.layer_tag, "uniq", t2 - t1)
+            timer.record(self.layer_tag, "preads", t3 - t2)
+            timer.record(self.layer_tag, "h2d", t4 - t3)
+            timer.add_rows(self.layer_tag, n, indices.shape[0])
+        return dev_vals, dev_scales, inv_dev, n
+
+    def submit_gather(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None" = None
+    ) -> concurrent.futures.Future:
+        """Start the host half of a lookup on a worker thread (3.2).
+
+        The caller must join with ``future.result()`` before launching the
+        lookup kernel. The worker sets the caller's CUDA stream so the D2H /
+        H2D copies keep the same stream order as the default path.
+        """
+        if self._prefetch_pool is None:
+            raise RuntimeError(
+                "engram disk prefetch needs VLLM_DS41_ENGRAM_OVERLAP=1"
+            )
+        return self._prefetch_pool.submit(
+            self._gather_in_worker, indices, sync_stream
+        )
+
+    def _gather_in_worker(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None"
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        with torch.cuda.device(indices.device):
+            if sync_stream is not None:
+                with torch.cuda.stream(sync_stream):
+                    return self._gather_instrumented(indices, sync_stream)
+            return self._gather_instrumented(indices, None)
 
 
 def _pinned_exact(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
@@ -989,6 +1316,7 @@ class ParallelEngramEmbedding(nn.Module):
         hf_prefix: str | None = None,
         disk_threads: int = 32,
         staging_rows: int | None = None,
+        layer_tag: int | None = None,
     ):
         super().__init__()
         if storage is None:
@@ -1050,6 +1378,7 @@ class ParallelEngramEmbedding(nn.Module):
                 if staging_rows is not None
                 else vllm_config.scheduler_config.max_num_batched_tokens
                 * self.part_n_hash_cols,
+                layer_tag,
             )
             return
         self.disk = None
@@ -1223,6 +1552,10 @@ class ParallelEngramEmbedding(nn.Module):
             GRID=grid,
         )
 
+    def _local_head_ids(self, indices: torch.Tensor) -> torch.Tensor:
+        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        return indices[:, self.head_start : head_end]
+
     def _lookup_from_disk(
         self, indices: torch.Tensor, out: torch.Tensor, background: bool
     ) -> None:
@@ -1230,9 +1563,49 @@ class ParallelEngramEmbedding(nn.Module):
         then run the ordinary lookup kernel over that staged mini-table with
         the inverse-unique ids (padded/unowned heads map to -1 -> zeros)."""
         assert self.disk is not None
-        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
-        local = indices[:, self.head_start : head_end]
-        vals, scales, inv_ids, num_unique = self.disk.gather(local)
+        vals, scales, inv_ids, num_unique = self.disk.gather(
+            self._local_head_ids(indices)
+        )
+        self._launch_disk_lookup(
+            indices, out, background, vals, scales, inv_ids, num_unique
+        )
+
+    def submit_disk_lookup(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> tuple[concurrent.futures.Future, torch.Tensor, torch.Tensor, bool]:
+        """3.2: run the host half of a disk lookup on a worker thread.
+
+        Returns an opaque handle for :meth:`finish_disk_lookup`. The gather
+        only reads ``indices`` and writes this table's staging buffers, so it
+        can run while the caller does other work; the lookup kernel is
+        launched by ``finish_disk_lookup`` after the join.
+        """
+        assert self.disk is not None
+        stream = torch.cuda.current_stream(indices.device)
+        future = self.disk.submit_gather(self._local_head_ids(indices), stream)
+        return (future, indices, out, background)
+
+    def finish_disk_lookup(
+        self,
+        pending: tuple[concurrent.futures.Future, torch.Tensor, torch.Tensor, bool],
+    ) -> None:
+        """Join a :meth:`submit_disk_lookup` gather and launch its kernel."""
+        future, indices, out, background = pending
+        vals, scales, inv_ids, num_unique = future.result()
+        self._launch_disk_lookup(
+            indices, out, background, vals, scales, inv_ids, num_unique
+        )
+
+    def _launch_disk_lookup(
+        self,
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        background: bool,
+        vals: torch.Tensor,
+        scales: torch.Tensor,
+        inv_ids: torch.Tensor,
+        num_unique: int,
+    ) -> None:
         if inv_ids.shape[1] != self.part_n_hash_cols:
             padded = inv_ids.new_full((inv_ids.shape[0], self.part_n_hash_cols), -1)
             padded[:, : inv_ids.shape[1]] = inv_ids
@@ -1409,6 +1782,15 @@ class Engram(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_hash_index = layer_hash_index
+        # Backbone layer id (1, 14, ...): the A2 timer and 3.1 key tag them.
+        self.layer_id = int(layout.layer_ids[layer_hash_index])
+        # 3.1: ``stage_engram_rows`` deposits the already-computed hash slice
+        # (plus the full [tokens, layers, cols] tensor) here, with a key
+        # proving it belongs to the forward that follows; the forward takes it
+        # instead of hashing the batch a second time.
+        self._staged_hash_ids: torch.Tensor | None = None
+        self._staged_full_hashes: torch.Tensor | None = None
+        self._staged_hash_key: tuple | None = None
         self.dim = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
@@ -1426,6 +1808,7 @@ class Engram(nn.Module):
             storage=engram_config.resolved_storage() if engram_config else "cpu",
             hf_prefix=_hf_engram_prefix(prefix),
             disk_threads=engram_config.disk_threads if engram_config else 32,
+            layer_tag=self.layer_id,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -1464,6 +1847,77 @@ class Engram(nn.Module):
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather this layer's rows on the main stream before decoder layers."""
         self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+
+    def submit_embeddings(self, hash_ids: torch.Tensor):
+        """3.2: start this layer's disk gather on a worker thread.
+
+        Returns a handle for :meth:`join_embeddings`; ``None`` for a layer
+        whose rows the runner does not stage (only disk tables do) and for an
+        empty batch (``lookup`` would return without launching a kernel).
+        """
+        if self.embed_tokens.disk is None or hash_ids.shape[0] == 0:
+            return None
+        return self.embed_tokens.submit_disk_lookup(
+            hash_ids, self.staged_rows[: hash_ids.shape[0]]
+        )
+
+    def join_embeddings(self, pending) -> None:
+        """3.2: join a :meth:`submit_embeddings` gather and launch its kernel."""
+        if pending is None:
+            return
+        if _ENGRAM_TIME:
+            _join_t0 = time.perf_counter()
+        self.embed_tokens.finish_disk_lookup(pending)
+        if _ENGRAM_TIME:
+            _ENGRAM_TIMER.record(
+                str(self.layer_id), "wait", time.perf_counter() - _join_t0
+            )
+
+    def stage_hash_ids(
+        self,
+        hash_ids: torch.Tensor,
+        key: tuple,
+        full_hashes: torch.Tensor,
+    ) -> None:
+        """3.1: deposit the hashes computed by the runner-side staging hook."""
+        self._staged_hash_ids = hash_ids
+        self._staged_full_hashes = full_hashes
+        self._staged_hash_key = key
+
+    def take_staged_hashes(self, key: tuple) -> torch.Tensor | None:
+        """3.1: consume the full staged hashes if ``key`` still applies.
+
+        One-shot (the full tensor is dropped on the first take); the per-layer
+        slice stays for :meth:`verify_staged_hash_ids`. Returns None when
+        there is nothing to reuse, so the caller hashes as before.
+        """
+        full = self._staged_full_hashes
+        staged_key = self._staged_hash_key
+        self._staged_full_hashes = None
+        if full is None or staged_key != key:
+            return None
+        return full
+
+    def verify_staged_hash_ids(self, full_hashes: torch.Tensor) -> bool:
+        """3.1 verification mode: is the staged layer slice the right one?
+
+        Called with the freshly recomputed ``[tokens, layers, cols]`` tensor
+        when ``VLLM_DS41_ENGRAM_REUSE_HASH=2``; consumes (and drops) the
+        staged slice either way.
+        """
+        staged = self._staged_hash_ids
+        self.clear_staged_hash_ids()
+        if staged is None:
+            return True
+        return bool(
+            torch.equal(staged, full_hashes[:, self.layer_hash_index])
+        )
+
+    def clear_staged_hash_ids(self) -> None:
+        """3.1: drop a staged key (dummy runs and graph capture do not stage)."""
+        self._staged_hash_ids = None
+        self._staged_full_hashes = None
+        self._staged_hash_key = None
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""

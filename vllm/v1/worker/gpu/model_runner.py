@@ -272,6 +272,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # VLLM_DSPARK_REST: pular o drafter no passo seguinte a uma rodada
+        # inteira sem aceite (regra do Maya). Alterna draft/descanso: o
+        # descanso nunca se repete duas vezes seguidas.
+        self.dspark_rest_enabled = bool(
+            __import__("os").environ.get("VLLM_DSPARK_REST", "").strip()
+        )
+        self._dspark_rested_last = True
+        self._dspark_skip_drafts = False
+        self._dspark_had_spec = True
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -1900,6 +1909,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
 
         finished_req_ids = scheduler_output.finished_req_ids
+        if self.dspark_rest_enabled:
+            # `sample_tokens` nao recebe o SchedulerOutput; guardamos aqui o
+            # unico dado que a regra de descanso precisa dele.
+            self._dspark_had_spec = bool(
+                scheduler_output.scheduled_spec_decode_tokens
+            )
+
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2043,7 +2059,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        self._dspark_skip_drafts = False
+        if self.speculator is not None and self.dspark_rest_enabled:
+            # Descansa so' quando o passo anterior draftou e este nao tem
+            # draft agendado (o scheduler cortou por nada aceito).
+            if not self._dspark_had_spec:
+                if not self._dspark_rested_last:
+                    self._dspark_skip_drafts = True
+                    self._dspark_rested_last = True
+            else:
+                self._dspark_rested_last = False
+        if self.speculator is not None and not self._dspark_skip_drafts:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -2078,10 +2104,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
-            )
+            if self._dspark_skip_drafts:
+                self.draft_tokens_handler.set_skip_batch(input_batch)
+            else:
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                    # So' usado com VLLM_DSPARK_CONF_CUT (o handler ignora
+                    # se a env estiver vazia); as linhas estao na ordem do
+                    # input_batch, como os drafts acima.
+                    confidence=(
+                        self.speculator.draft_token_confidence_probs
+                        if self.speculator is not None
+                        else None
+                    ),
+                )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch

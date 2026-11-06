@@ -96,6 +96,17 @@ class DSparkSpeculator(DFlashSpeculator):
         self.enable_adaptive_verification = (
             self.speculative_config.enable_adaptive_verification
         )
+        # Corte por confianca (regra do motor Maya): VLLM_DSPARK_CONF_CUT=
+        # "conf_min,cum_min". Precisa das confiancas mesmo com a verificacao
+        # adaptativa desligada; o corte em si acontece no scheduler (via
+        # DraftTokensHandler), nao aqui.
+        self.conf_cut_enabled = bool(
+            os.environ.get("VLLM_DSPARK_CONF_CUT", "").strip()
+        )
+        # As confiancas passam a ser calculadas sempre que o corte pedir.
+        self._need_confidence = (
+            self.enable_adaptive_verification or self.conf_cut_enabled
+        )
 
         # Fused Markov chain (greedy vocab-sharded path only); built in
         # load_draft_model once the head's weights and shard geometry exist.
@@ -398,7 +409,7 @@ class DSparkSpeculator(DFlashSpeculator):
         # read via the precomputed persistent index (fixed buffer for capture).
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
-        if self._fused_markov is not None:
+        if self._fused_markov is not None and not self.conf_cut_enabled:
             # Same chain as the loop below, with each step's seven kernels and
             # three [num_reqs, shard_width] round trips collapsed into one
             # pass over markov_w2. Writes draft_tokens directly.
@@ -410,7 +421,7 @@ class DSparkSpeculator(DFlashSpeculator):
         for i in range(n_spec):
             # Sequential stage: Markov bias from the previously sampled token.
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_adaptive_verification:
+            if self._need_confidence:
                 confidence_markov_embeds.append(markov_embed)
             if self.use_local_argmax_reduction:
                 # Greedy-only (enforced in _validate_local_argmax_reduction):
@@ -430,7 +441,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_adaptive_verification:
+        if self._need_confidence:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),
@@ -484,7 +495,7 @@ class DSparkSpeculator(DFlashSpeculator):
 
         for i in range(n_spec):
             markov_embed = self.model.markov_embed(prev)
-            if self.enable_adaptive_verification:
+            if self._need_confidence:
                 confidence_markov_embeds.append(markov_embed)
             logits_i = self.model.apply_markov_bias_gathered(
                 markov_embed,
@@ -498,7 +509,7 @@ class DSparkSpeculator(DFlashSpeculator):
             self.draft_tokens[:num_reqs, i] = draft_sampled_i
             prev = draft_sampled_i
 
-        if self.enable_adaptive_verification:
+        if self._need_confidence:
             confidence = self.model.compute_confidence(
                 sample_hidden,
                 torch.stack(confidence_markov_embeds, dim=1).flatten(0, 1),

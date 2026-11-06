@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -271,6 +272,13 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        # VLLM_DSPARK_REST: o drafter "descansa" um passo depois de uma
+        # rodada em que nada foi aceito (regra do motor Maya,
+        # ds4_main.cpp:1905). Sem a env nada muda.
+        self.dspark_rest_enabled = bool(
+            os.environ.get("VLLM_DSPARK_REST", "").strip()
+        )
+        self._dspark_rest_req_ids: set[str] = set()
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1980,6 +1988,10 @@ class Scheduler(SchedulerInterface):
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                if self.dspark_rest_enabled and num_accepted == 0:
+                    # Nada aceito: o proximo passo nao drafta para esta
+                    # requisicao (poupa o drafter inteiro).
+                    self._dspark_rest_req_ids.add(req_id)
                 num_rejected = num_draft_tokens - num_accepted
                 # Rejections roll back num_computed_tokens (and, under async
                 # scheduling, num_output_placeholders, which covers the spec
@@ -2427,6 +2439,15 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                continue
+
+            if (
+                self.dspark_rest_enabled
+                and req_id in self._dspark_rest_req_ids
+            ):
+                # Um passo de descanso: sem drafts verificaveis.
+                self._dspark_rest_req_ids.discard(req_id)
+                request.spec_token_ids = []
                 continue
 
             # Add newly generated spec token ids to the request.

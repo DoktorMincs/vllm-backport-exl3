@@ -102,6 +102,36 @@ reduzem o KV mas não o pico de ativação — não são o que limita o contexto
    era dimensionado por `max_model_len` (755 MB por rank a 128 k) mesmo com
    chunk 512. Este branch usa `min(max_model_len, max_num_batched_tokens)`.
 
+## Envs experimentais (todas default = comportamento de antes)
+
+Nenhuma destas muda o caminho default; o `if` desligado não aloca buffer, não
+cria stream e não importa nada pesado.
+
+| env | default | o que faz | veredito |
+|---|---|---|---|
+| `VLLM_DSPARK_REST` | 0 | depois de uma rodada sem nenhum aceite, o passo seguinte daquela requisição não drafta (regra do Maya) | correto e neutro nesta máquina; o `conc=8` varia 109–184 tok/s entre corridas seguidas, o que engole o efeito |
+| `VLLM_DSPARK_CONF_CUT` | vazio | `conf_min,cum_min`; corta os drafts de baixa confiança no scheduler | implementado; não medido (o corte por requisição quebra o decode uniforme dos CUDA graphs) |
+| `VLLM_PP_TRANSPORT` | `nccl` | `host` troca o handoff de PP por staging em host (`pp_host.py`, relay por `/dev/shm`) | **mais lento** (46,8 contra 60,6 tok/s): os 7–8 ms/estágio são bolha, não NCCL |
+| `VLLM_PP_HOST_*` | — | slots/teto/dir/timeout/eager do transporte acima | — |
+| `VLLM_DS41_ENGRAM_TIME` | 0 | decompõe o custo do Engram (d2h/uniq/preads/h2d/wait/hash) a cada 20 passos | em decode: ~5,7 ms por camada por passo, preads dominam |
+| `VLLM_DS41_ENGRAM_REUSE_HASH` | 0 | 1 reusa o hash do staging; 2 reusa e confere | correto (bit-idêntico) |
+| `VLLM_DS41_ENGRAM_OVERLAP` | 0 | gathers das camadas em threads de trabalho + double buffer (+26 MiB/GPU) | sem ganho medível |
+| `VLLM_DS41_ENGRAM_ASYNC_D2H` | 0 | D2H dos ids em buffer pinado + side stream | sem ganho medível |
+| `VLLM_DS41_ENGRAM_THREADS` / `_THREAD_FLOOR` | — / 0 | força o nº de threads do helper / capa em 2 abaixo de 256 rows | ferramenta |
+
+## Metodologia de medida (custou a noite de 05→06/11)
+
+- **`conc=8` numa corrida só não vale nada**: no mesmo boot e mesma config,
+  seis corridas deram 109,6 / 129,6 / 135,5 / 145,7 / 147,4 / 183,6 tok/s. Use
+  `spec_bench.py --reps` e reporte a mediana; ou compare distribuições.
+- A primeira medida depois do boot sai baixa (page cache do pack e das tabelas
+  do Engram). Aqueça antes de comparar braços.
+- O **stream guloso é determinístico** entre boots e entre eager/grafo: um probe
+  de 256 tokens com `temperature=0` serve de oráculo de correção para qualquer
+  mudança de transporte, grafo ou Engram (`scripts/dspark_probe.py`).
+- `scripts/ab_bench.sh <tag>` roda conc1 + conc8 + prefill/TTFT/potência e grava
+  `logs/ab-<tag>-*` com cabeçalho de envs e commit.
+
 ## Estado
 
 Funcional e validado contra o motor Maya (paridade de prefill; decode 4x pior

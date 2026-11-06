@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -87,6 +88,10 @@ from ..common.engram import (
     EngramLayout,
     NgramHashState,
     ParallelEngramEmbedding,
+    _ENGRAM_OVERLAP,
+    _ENGRAM_REUSE_HASH,
+    _ENGRAM_TIME,
+    _ENGRAM_TIMER,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
@@ -94,6 +99,36 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+
+def _engram_hash_key(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    lookback_token_ids: torch.Tensor,
+) -> tuple:
+    """3.1: cheap identity of everything the n-gram hash reads.
+
+    The buffers of a step are preallocated, so their pointers are stable; the
+    one-shot consumption plus the explicit clears on dummy/capture runs are
+    what stop a stale key from matching. ``VLLM_DS41_ENGRAM_REUSE_HASH=2``
+    additionally recomputes and compares the ids before reusing them.
+    """
+    def part(t: torch.Tensor, *, shape: bool = True) -> tuple:
+        # ``_version`` catches an in-place rewrite of the buffer between the
+        # staging call and the forward (views share the counter).
+        tail = tuple(t.shape) if shape else ()
+        return (t.data_ptr(), t.element_size(), t._version, *tail)
+
+    # ``query_start_loc`` is the full input buffer at staging time and a
+    # ``[:num_reqs + 1]`` view of the same buffer in the forward, so only its
+    # identity is comparable (same storage base in both calls).
+    return (
+        part(input_ids),
+        part(positions),
+        part(query_start_loc, shape=False),
+        part(lookback_token_ids),
+    )
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -568,6 +603,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 self.engram_swa_prefix = swa_cache_module.prefix
 
+        # Frente 3.1: counters for the staged-hash reuse (the staged tensors
+        # themselves live on each Engram; see _take_staged_hashes).
+        self._engram_hash_reuse_hits = 0
+        self._engram_hash_reuse_misses = 0
+        self._engram_hash_reuse_mismatches = 0
+        self._engram_hash_reuse_verified = 0
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
@@ -626,6 +668,63 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             for layer in islice(self.layers, self.start_layer, self.end_layer)
         )
 
+    def _staged_engram(self) -> Engram | None:
+        """First local layer carrying an Engram module, or None."""
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None:
+                return engram
+        return None
+
+    def _take_staged_hashes(self, key: tuple) -> torch.Tensor | None:
+        """3.1: consume the hashes staged for the forward that follows.
+
+        The staged tensor lives on the Engram modules (all of them hold the
+        same ``[tokens, layers, cols]`` tensor); taking it from the first
+        local layer is enough. One-shot: ``stage_engram_rows`` runs in
+        ``prepare_inputs`` and the forward in the same ``execute_model`` call,
+        so it can only be consumed by that forward. Dummy/capture runs clear
+        it beforehand.
+        """
+        engram = self._staged_engram()
+        if engram is None:
+            self._engram_hash_reuse_misses += 1
+            return None
+        staged = engram.take_staged_hashes(key)
+        if staged is None:
+            self._engram_hash_reuse_misses += 1
+            return None
+        self._engram_hash_reuse_hits += 1
+        return staged
+
+    def _verify_staged_hashes(self, full_hashes: torch.Tensor) -> None:
+        """3.1 verification mode: prove no layer reuses a wrong id."""
+        ok = True
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            engram = getattr(layer, "engram", None)
+            if engram is not None and not engram.verify_staged_hash_ids(
+                full_hashes
+            ):
+                ok = False
+        self._engram_hash_reuse_verified += 1
+        if not ok:
+            self._engram_hash_reuse_mismatches += 1
+            logger.warning(
+                "ENGRAM-HASH reuse mismatch: staged ids differ from the "
+                "recomputed ones (%d mismatches in %d verified steps)",
+                self._engram_hash_reuse_mismatches,
+                self._engram_hash_reuse_verified,
+            )
+        elif self._engram_hash_reuse_verified % 100 == 0:
+            logger.info(
+                "ENGRAM-HASH verify: %d steps, %d hits, %d misses, "
+                "%d mismatches",
+                self._engram_hash_reuse_verified,
+                self._engram_hash_reuse_hits,
+                self._engram_hash_reuse_misses,
+                self._engram_hash_reuse_mismatches,
+            )
+
     def stage_engram_rows(
         self,
         input_ids: torch.Tensor,
@@ -640,8 +739,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         CUDA graph capture."""
         assert self.engram_hash is not None
         if not self.engram_hash.ensure_cache():
-            return  # KV cache unbound (profile run): the forward skips engram too
+            # KV cache unbound (profile run): the forward skips engram too.
+            # Drop any staged hash so it cannot leak into that forward.
+            if _ENGRAM_REUSE_HASH:
+                for layer in islice(self.layers, self.start_layer, self.end_layer):
+                    engram = getattr(layer, "engram", None)
+                    if engram is not None:
+                        engram.clear_staged_hash_ids()
+            return
         image_mask = image_sentinel_mask(input_ids)
+        if _ENGRAM_TIME:
+            _hash_t0 = time.perf_counter()
         engram_hashes = self.engram_hash(
             input_ids,
             positions,
@@ -652,10 +760,44 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             None,
             None,
         )
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
-            engram = getattr(layer, "engram", None)
-            if engram is not None and engram.rows_staged_by_runner:
-                engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
+        if _ENGRAM_TIME:
+            _ENGRAM_TIMER.record(
+                "hash", "stage", time.perf_counter() - _hash_t0
+            )
+            _ENGRAM_TIMER.add_rows("hash", 0, input_ids.shape[0])
+        if _ENGRAM_REUSE_HASH:
+            key = _engram_hash_key(
+                input_ids, positions, query_start_loc, lookback_token_ids
+            )
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.stage_hash_ids(
+                        engram_hashes[:, engram.layer_hash_index],
+                        key,
+                        engram_hashes,
+                    )
+        staged = [
+            (engram, engram_hashes[:, engram.layer_hash_index])
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if (engram := getattr(layer, "engram", None)) is not None
+            and engram.rows_staged_by_runner
+        ]
+        if _ENGRAM_OVERLAP and staged:
+            # 3.2: all ids for the chunk are known here (eager, pre-forward),
+            # so every layer's host gather runs on a worker thread while the
+            # previous ones are still in flight; the join happens only right
+            # before that layer's lookup kernel is launched.
+            pending = [
+                (engram, engram.submit_embeddings(ids)) for engram, ids in staged
+            ]
+            for engram, handle in pending:
+                engram.join_embeddings(handle)
+        else:
+            for engram, ids in staged:
+                engram.prepare_embeddings(ids)
+        if _ENGRAM_TIME:
+            _ENGRAM_TIMER.tick()
 
     def forward(
         self,
@@ -720,16 +862,50 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     lookback_token_ids = input_ids.new_full(
                         (num_reqs, self.engram_hash.lookback_depth), -1
                     )
-                engram_hashes = self.engram_hash(
-                    input_ids,
-                    positions,
-                    swa_metadata.query_start_loc,
-                    image_mask,
-                    lookback_token_ids,
-                    image_sentinel_mask(lookback_token_ids),
-                    swa_metadata.slot_mapping,
-                    swa_metadata.block_table,
-                )
+                # 3.1: reuse the hashes stage_engram_rows already computed for
+                # this step when the key proves the inputs are the same.
+                staged_hashes: torch.Tensor | None = None
+                if (
+                    _ENGRAM_REUSE_HASH
+                    # The staging hook passes no slot cache, so its hashes
+                    # only match a forward that does not use one either.
+                    and not self.engram_hash.use_slot_cache
+                ):
+                    staged_hashes = self._take_staged_hashes(
+                        _engram_hash_key(
+                            input_ids,
+                            positions,
+                            swa_metadata.query_start_loc,
+                            lookback_token_ids,
+                        )
+                    )
+                if staged_hashes is not None and _ENGRAM_REUSE_HASH != 2:
+                    engram_hashes = staged_hashes
+                else:
+                    if _ENGRAM_TIME:
+                        _hash_t0 = time.perf_counter()
+                    engram_hashes = self.engram_hash(
+                        input_ids,
+                        positions,
+                        swa_metadata.query_start_loc,
+                        image_mask,
+                        lookback_token_ids,
+                        image_sentinel_mask(lookback_token_ids),
+                        swa_metadata.slot_mapping,
+                        swa_metadata.block_table,
+                    )
+                    if _ENGRAM_TIME:
+                        _ENGRAM_TIMER.record(
+                            "hash", "fwd", time.perf_counter() - _hash_t0
+                        )
+                        _ENGRAM_TIMER.add_rows(
+                            "hash", 0, input_ids.shape[0]
+                        )
+                        if not self.has_disk_engram:
+                            # No runner-side staging hook to tick the step.
+                            _ENGRAM_TIMER.tick()
+                    if staged_hashes is not None:
+                        self._verify_staged_hashes(engram_hashes)
                 # Gather all Engram rows before entering the decoder layers.
                 # Disk-backed tables were staged by the model-state hook
                 # (stage_engram_rows) before this forward began.

@@ -258,6 +258,17 @@ class CudaGraphManager:
         else:
             decode_query_lens = [self.decode_query_len]
 
+        # VLLM_DSPARK_REST: um passo "de descanso" (o drafter nao roda e so' o
+        # token novo e' verificado) tem query len 1. Sem um grafo capturado
+        # para isso o dispatch cai em eager (7x mais lento), entao capturamos
+        # os dois tamanhos.
+        import os as _os
+
+        if _os.environ.get("VLLM_DSPARK_REST", "").strip():
+            decode_query_lens = sorted(
+                {*decode_query_lens, 1, self.decode_query_len}
+            )
+
         capture_varlen_decode = (
             separate_decode_routine and bool(decode_mode) and self.varlen_decode
         )

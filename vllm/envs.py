@@ -48,6 +48,12 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_TRANSPORT: Literal["nccl", "host"] = "nccl"
+    VLLM_PP_HOST_SLOTS: int = 1
+    VLLM_PP_HOST_MAX_BYTES: int = 67108864
+    VLLM_PP_HOST_DIR: str = "/dev/shm"
+    VLLM_PP_HOST_TIMEOUT_S: float = 300.0
+    VLLM_PP_HOST_FORCE_EAGER: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -916,6 +922,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Transport for the pipeline-parallel intermediate-tensor handoff.
+    # - "nccl" (default): the existing NCCL + gloo-metadata path, untouched.
+    # - "host": host-relayed handoff (see vllm/v1/worker/gpu/pp_host.py).
+    "VLLM_PP_TRANSPORT": env_with_choices(
+        "VLLM_PP_TRANSPORT",
+        "nccl",
+        ["nccl", "host"],
+    ),
+    # Number of slots in the shared segment of one host-transport PP edge.
+    "VLLM_PP_HOST_SLOTS": lambda: int(os.getenv("VLLM_PP_HOST_SLOTS", "1")),
+    # Hard cap, in bytes, of one host-transport PP edge buffer (the real size
+    # is min(cap, bytes/token x max_num_batched_tokens x 1.5)).
+    "VLLM_PP_HOST_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_PP_HOST_MAX_BYTES", str(64 << 20))
+    ),
+    # Directory for the per-edge shared segment of the host transport.
+    "VLLM_PP_HOST_DIR": lambda: os.getenv("VLLM_PP_HOST_DIR", "/dev/shm"),
+    # Timeout, in seconds, for one host-transport send/recv.
+    "VLLM_PP_HOST_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_PP_HOST_TIMEOUT_S", "300")
+    ),
+    # Disable torch.compile/CUDA graphs when VLLM_PP_TRANSPORT=host (bring-up).
+    "VLLM_PP_HOST_FORCE_EAGER": lambda: (
+        os.getenv("VLLM_PP_HOST_FORCE_EAGER", "0") == "1"
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -2712,6 +2743,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ASSETS_CACHE",
         "VLLM_ASSETS_CACHE_MODEL_CLEAN",
         "VLLM_WORKER_MULTIPROC_METHOD",
+        # PP transport selection changes no compiled artifact.
+        "VLLM_PP_TRANSPORT",
+        "VLLM_PP_HOST_SLOTS",
+        "VLLM_PP_HOST_MAX_BYTES",
+        "VLLM_PP_HOST_DIR",
+        "VLLM_PP_HOST_TIMEOUT_S",
+        "VLLM_PP_HOST_FORCE_EAGER",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
