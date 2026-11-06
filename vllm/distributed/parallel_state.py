@@ -25,7 +25,9 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
+import time
 import weakref
 from collections import deque, namedtuple
 from collections.abc import Callable
@@ -416,6 +418,55 @@ direct_register_custom_op(
     op_func=patched_fused_scaled_matmul_reduce_scatter,
     fake_impl=patched_fused_scaled_matmul_reduce_scatter_fake,
 )
+
+
+# --- Timing do protocolo de PP (VLLM_PP_PROTO_TIME=1) ---------------------
+# Medido em 06/11 com isto: o handshake de metadados no gloo custa 0,1–0,2 ms e
+# o isend do tensor 0,1-1,6 ms, mas o `recv` bloqueante aparece com 37-60 ms por
+# passo porque e' ali que a bolha do pipeline se materializa (o rank fica
+# parado esperando o upstream inteiro). Ou seja: o TRANSPORTE do PP nao e' o
+# custo; trocar NCCL por staging em host nao ajuda (VLLM_PP_TRANSPORT=host).
+# Serve como instrumentacao: separa espera de handshake de espera de tensor.
+# Desligado por default: o `if` nao aloca, nao loga e nao muda o caminho.
+_PP_PROTO_ON = bool(os.environ.get("VLLM_PP_PROTO_TIME", "").strip())
+_PP_PROTO_STATS: dict[str, list[float]] = {}
+_PP_PROTO_STEPS = [0]
+
+
+@contextlib.contextmanager
+def proto_timer(name: str):
+    if not _PP_PROTO_ON:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        _PP_PROTO_STATS.setdefault(name, []).append(
+            (time.perf_counter() - t0) * 1000.0
+        )
+
+
+def proto_step_done(rank: int, every: int = 20) -> None:
+    """Chamado uma vez por passo no worker: loga e zera a cada `every` passos."""
+    if not _PP_PROTO_ON:
+        return
+    _PP_PROTO_STEPS[0] += 1
+    if _PP_PROTO_STEPS[0] % every:
+        return
+    parts = []
+    for name, vals in sorted(_PP_PROTO_STATS.items()):
+        n = len(vals)
+        if n:
+            vals.sort()
+            parts.append(
+                "%s med=%.2f p90=%.2f n=%d"
+                % (name, vals[n // 2], vals[int(0.9 * (n - 1))], n)
+            )
+    if parts:
+        logger.info("PP-PROTO rank=%d step=%d | %s", rank, _PP_PROTO_STEPS[0],
+                    " | ".join(parts))
+    _PP_PROTO_STATS.clear()
 
 
 class GroupCoordinator:
@@ -918,21 +969,22 @@ class GroupCoordinator:
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
-        # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        with proto_timer("meta_recv"):
+            # Receive object size
+            rank_size = torch.distributed.recv(
+                size_tensor, src=self.ranks[src], group=self.cpu_group
+            )
 
-        # Tensor to receive serialized objects into.
-        object_tensor = torch.empty(  # type: ignore[call-overload]
-            size_tensor.item(),  # type: ignore[arg-type]
-            dtype=torch.uint8,
-            device="cpu",
-        )
+            # Tensor to receive serialized objects into.
+            object_tensor = torch.empty(  # type: ignore[call-overload]
+                size_tensor.item(),  # type: ignore[arg-type]
+                dtype=torch.uint8,
+                device="cpu",
+            )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+            rank_object = torch.distributed.recv(
+                object_tensor, src=self.ranks[src], group=self.cpu_group
+            )
 
         assert rank_object == rank_size, (
             "Received object sender rank does not match the size sender rank."
@@ -960,12 +1012,13 @@ class GroupCoordinator:
 
         retained = (size_tensor, object_tensor)
         works: list[Any] = []
-        for tensor in retained:
-            work = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=self.cpu_group
-            )
-            if work is not None:
-                works.append(work)
+        with proto_timer("meta_send"):
+            for tensor in retained:
+                work = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=self.cpu_group
+                )
+                if work is not None:
+                    works.append(work)
 
         return _RetainedHandle(works, retained)
 

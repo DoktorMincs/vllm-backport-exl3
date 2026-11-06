@@ -56,6 +56,26 @@ prefill e 68/63/74 tok/s de decode em chat: **o port ganha no prefill e perde no
 decode em chat** (o handoff de PP em NCCL custa ~44 J/token contra ~21 J/token
 do Maya, que usa comunicação IPC própria).
 
+### Medido em 06/11 — a diferença de chat é o CUSTO DO PASSO, não a aceitação
+
+Mesmo prompt de chat, 128 tokens, `scripts/maya_step.py` (lê `drafts A of B
+kept` do log dele) contra `scripts/step_by_prompt.py` (lê `/metrics`):
+
+| | port (N=5) | Maya |
+|---|---:|---:|
+| tok/s chat | 30,7–33,9 | **86,0–86,3** |
+| ms/passo | 78–83 | **32–35** |
+| tok/rodada | 2,5–2,6 | 2,8–3,1 |
+| drafts verificados/rodada | 5 | 2,3–2,5 (corta) |
+
+Os dois entregam ~2,5–3 tokens por rodada: a diferença de 2,5× está no preço do
+passo. O Maya roda um processo só (sem all-reduce de TP e sem rendezvous de PP)
+e corta os drafts antes de verificar; nós pagamos ~12 coletivos por passo e
+verificamos 5. Sobrepor estágios (DBO/microbatch) é a única alavanca de 2× que
+sobra e a V2 a recusa com PP>1 + spec (`config/vllm.py:2806-2845`) — e a mesma
+lista também recusa DBO com CUDA graphs, que aqui valem 7×; é trabalho de
+código, não de configuração.
+
 ## Contexto e KV
 
 O KV já é **fp8** (`fp8_ds_mla`, ~3 KB/token). O pool escala com
@@ -131,6 +151,41 @@ cria stream e não importa nada pesado.
   mudança de transporte, grafo ou Engram (`scripts/dspark_probe.py`).
 - `scripts/ab_bench.sh <tag>` roda conc1 + conc8 + prefill/TTFT/potência e grava
   `logs/ab-<tag>-*` com cabeçalho de envs e commit.
+- **A aceitação varia mais que o passo.** Os mesmos 256 tokens saem a 26 tok/s
+  num prompt analítico (2,17 tok/passo) e a 64 tok/s num prompt curto
+  (5,43 tok/passo) no MESMO boot. Comparar braços com prompts diferentes mede o
+  prompt: use `scripts/step_by_prompt.py`, que fixa 5 prompts e reporta
+  tok/s, passo, aceitação e aceitação por posição.
+
+## Decomposição do passo (medida em 06/11)
+
+`scripts/step_by_prompt.py` lê `vllm:spec_decode_num_drafts_total` e
+`..._num_accepted_tokens_total`; `ms/passo` sai de `dt / rodadas` — sem profiler
+e sem sync, então não perturba o que mede.
+
+| braço | tok/s | ms/passo | tok/passo |
+|---|---:|---:|---:|
+| sem spec (1 token) | 16,6 | **60** | 1,0 |
+| N=1 (k=2) | 25,1 | **76** | 1,9 |
+| N=5 (k=6) | 48,9 | **83** | 4,1 |
+
+`passo ≈ 60 (alvo) + 14 (drafter fixo) + 1,7 × (k−1)`: 1,7 ms por token
+verificado (cortar drafts por confiança vale ≤6% em chat) e 17% do passo é o
+drafter — 80% é o alvo.
+
+**O alvo de 60 ms é sincronização, não GEMM.** Kernel time por GPU em 3,1 s de
+decode (nsys, `--cuda-graph-trace=node`): **58–78% do tempo ocupado está dentro
+de kernels NCCL** (AllReduce de TP; Broadcast/SendRecv do PP) contra 10–20% de
+EXL3 MoE + `reconstruct` + cutlass. O kernel do NCCL gira esperando o par, então
+esses milissegundos são rendezvous: ~2 all-reduces por camada × 40 camadas por
+passo, num par TP sem P2P.
+
+O protocolo do PP, medido à parte (`VLLM_PP_PROTO_TIME=1`): metadados no gloo
+**0,1–0,2 ms**, `isend` do tensor **0,1–1,6 ms**, espera do tensor do passo
+anterior **0,01–0,06 ms**. Os 37–60 ms aparecem no `recv` bloqueante porque é
+ali que a bolha do pipeline se materializa — **o transporte de PP não custa
+nada**; o que custa é o rendezvous. É por isso que trocar NCCL por staging em
+host (`VLLM_PP_TRANSPORT=host`) ficou mais lento: atacava o que não era o custo.
 
 ## Estado
 

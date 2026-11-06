@@ -47,6 +47,8 @@ from vllm.distributed.parallel_state import (
     checkpoint_restore_distributed_state,
     get_pp_group,
     get_tp_group,
+    proto_step_done,
+    proto_timer,
     resume_device_comms,
     suspend_device_comms,
 )
@@ -1218,8 +1220,9 @@ class Worker(WorkerBase):
         if self._pp_host is not None:
             self._pp_host.wait_send()
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with proto_timer("wait_prev_send"):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1266,12 +1269,13 @@ class Worker(WorkerBase):
                     all_gather_tensors=all_gather_tensors
                 )
             else:
-                tensor_dict, comm_handles, comm_postprocess = (
-                    get_pp_group().irecv_tensor_dict(
-                        all_gather_group=get_tp_group(),
-                        all_gather_tensors=all_gather_tensors,
+                with proto_timer("recv_total"):
+                    tensor_dict, comm_handles, comm_postprocess = (
+                        get_pp_group().irecv_tensor_dict(
+                            all_gather_group=get_tp_group(),
+                            all_gather_tensors=all_gather_tensors,
+                        )
                     )
-                )
                 assert tensor_dict is not None
                 intermediate_tensors = AsyncIntermediateTensors(
                     tensor_dict,
@@ -1292,6 +1296,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                proto_step_done(self.rank)
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1312,12 +1317,15 @@ class Worker(WorkerBase):
             )
             self._pp_send_work = []
         else:
-            handles = get_pp_group().isend_tensor_dict(
-                output.tensors,
-                all_gather_group=get_tp_group(),
-                all_gather_tensors=all_gather_tensors,
-            )
+            with proto_timer("isend_total"):
+                handles = get_pp_group().isend_tensor_dict(
+                    output.tensors,
+                    all_gather_group=get_tp_group(),
+                    all_gather_tensors=all_gather_tensors,
+                )
             self._pp_send_work = handles[1:]
+
+        proto_step_done(self.rank)
 
         return None
 
