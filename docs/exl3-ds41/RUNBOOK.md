@@ -187,6 +187,14 @@ ali que a bolha do pipeline se materializa — **o transporte de PP não custa
 nada**; o que custa é o rendezvous. É por isso que trocar NCCL por staging em
 host (`VLLM_PP_TRANSPORT=host`) ficou mais lento: atacava o que não era o custo.
 
+**Configuração de NCCL não conserta o rendezvous** (06/11, com a máquina
+aquecida): `NCCL_PROTO=LL` 51,70 tok/s / 78,4 ms contra 51,75 / 78,3 do base
+(Simple) — neutro no decode e 5–10% **pior** no prefill; `NCCL_MAX_NCHANNELS=1`
+52,11 / 77,7; `NCCL_ALGO=Tree` **não sobe** (`NCCL error: invalid usage` no
+`determine_available_memory`, não aceita os grupos strided de 2 ranks);
+`CUDA_DEVICE_MAX_CONNECTIONS` 8 = 1. A alavanca que sobra é sobrepor
+microbatches (DBO), não ajustar coletivo.
+
 ## Estado
 
 Funcional e validado contra o motor Maya (paridade de prefill; decode 4x pior
