@@ -248,13 +248,25 @@ class FlashMLASparseMetadata(AttentionMetadata):
     fp8_use_mixed_batch: bool = False
 
 
-def get_prefill_workspace_size(max_model_len: int):
+def get_prefill_workspace_size(max_model_len: int,
+                              max_num_batched_tokens: int | None = None):
     # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
     # May be tuned later.
     # Memory usage: 5 * max_model_len * 576 * 2 bytes
     #   Example: DeepSeek-V3.2 with max_model_len=163840 ->
     #            5 * 163840 * 576 * 2 = ~900 MB
     # This fits nicely below the typical MoE workspace size of >2GB so this is "free"
+    #
+    # LOCAL (exl3-port, 05/11/2026): o buffer e' bf16 e' reservado por rank no
+    # workspace manager, e dimensiona-lo por `max_model_len` custa 5*maxlen*576*2
+    # bytes FIXOS -- 377 MB por rank a 64k e 755 MB a 128k. Ele so' precisa
+    # caber o PREFILL de um passo, que nunca passa de `max_num_batched_tokens`
+    # (o mesmo numero limita `split_prefill_chunks` logo abaixo, entao encolher
+    # aqui so' deixa o fatiamento mais fino). Com chunk 512 o buffer cai para
+    # 2,9 MB. Medido: foi isso que impedia `--max-model-len 131072` de subir
+    # ("0.17 GiB KV cache is needed ... available 0.01 GiB").
+    if max_num_batched_tokens is not None and max_num_batched_tokens > 0:
+        max_model_len = min(max_model_len, max_num_batched_tokens)
     return max_model_len * 5
 
 
@@ -493,7 +505,8 @@ class FlashMLASparseMetadataBuilder(
 
             # Chunk prefill requests to fit within workspace size
             max_prefill_buffer_size = get_prefill_workspace_size(
-                self.vllm_config.model_config.max_model_len
+                self.vllm_config.model_config.max_model_len,
+                self.vllm_config.scheduler_config.max_num_batched_tokens,
             )
             chunk_bounds = split_prefill_chunks(
                 prefill_seq_lens_cpu, max_prefill_buffer_size
@@ -658,7 +671,8 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             # Reserve workspace during initialization
             assert vllm_config is not None and vllm_config.model_config is not None
             prefill_workspace_size = get_prefill_workspace_size(
-                vllm_config.model_config.max_model_len
+                vllm_config.model_config.max_model_len,
+                vllm_config.scheduler_config.max_num_batched_tokens,
             )
             self.prefill_workspace_shape = (prefill_workspace_size, head_size)
             self.q_concat_buffer, self.prefill_bf16_workspace = (
