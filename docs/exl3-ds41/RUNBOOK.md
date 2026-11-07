@@ -227,6 +227,47 @@ passo não tem como sobrepor). Vem do encadeamento entre estágios e do custo po
 salto. Artefatos e método em `$EXL3_ROOT/NSYS-MAYA-VS-PORT-20261106.md` +
 `scripts/nsys_{maya,vllm}_capture.sh` e `scripts/nsys_stage_report.py`.
 
+### Latência por salto de estágio — medida na linha do tempo (06/11)
+
+`scripts/stage_timeline.py <sqlite>`: âncora = o segundo `Broadcast` do NCCL
+(curto, 1 por passo, alinhado a ~1 ms nos 10 ranks), bloco do estágio = maior
+aglomerado de kernels de compute com lacunas ≤ 1 ms (é o replay do CUDA graph —
+dentro do grafo não há **nenhuma** lacuna > 1 ms).
+
+| estágio | 0 | 1 | 2 | 3 | 4 |
+|---|---:|---:|---:|---:|---:|
+| bloco de camadas (ms) | 4,03 | 4,01 | 4,49 | 4,02 | 5,65 |
+| início do bloco após a âncora (ms) | 0,00 | 5,87 | 21,76 | 38,92 | 59,31 |
+| salto até o próximo (ms) | 1,8 | 11,9 | 14,5 | 16,4 | 17,5 (volta) |
+
+Três conclusões que mudam o plano:
+
+1. **O salto entre estágios é ~0–3 ms** (com a ponte de 5 ms para o bookkeeping,
+   os saltos dão −2,3 / −2,6 / −1,4 / −1,1 / **+0,16** ms). Não existe latência
+   de handoff para atacar — quando o estágio k termina o k+1 já está pronto. A
+   troca de `SendRecv` NCCL por ring em memória (como o `xfer_*` do Maya) **não
+   tem o que ganhar**.
+2. **O trabalho de camadas é paridade com o Maya** (4,0–5,7 contra 3,2–4,5 ms
+   por estágio). O que separa os blocos densos (12–16 ms por estágio) é o
+   **bookkeeping eager do próprio estágio na mesma GPU**: ~90 kernels por passo
+   (slot mappings, block tables, `_prepare_pos_seq_lens`, `_post_update_*`,
+   `_pack_dense_prefix_to_ragged`, …) com lacunas de 0,05–0,8 ms entre eles —
+   GPU ociosa esperando o host.
+3. **Por passo por GPU** (trace, 512 tokens): kernel total 76,5 / 62,7 / 50,0 /
+   30,8 / 10,8 ms, dos quais `Broadcast` (espera a vez) 71,5 / 54,3 / 39,3 /
+   19,9 / 0,03; replay de grafo 4,6 / 4,2 / 5,0 / 4,4 / 3,5; `SendRecv`+
+   `AllGather` 0,1 / 3,8 / 5,3 / 6,4 / 6,2 (mediana ~0, **média** inflada por uma
+   cauda de spins de até 10 ms em ~10% dos passos); `AllReduce` 2,9 ms no total.
+
+⚠️ **O profiler infla o nosso lado** (82,5 ms no trace contra 60,4 ms sem
+profiler = 1,37×; o Maya dá 25,6 contra 25,7 = 1,0×), então compare proporções,
+nunca milissegundos absolutos.
+
+**Prioridade revisada** (substitui a tabela de alavancas do relatório de 06/11):
+1. bookkeeping eager por passo (12–16 ms de espaçamento por estágio) — capturar
+   no grafo ou baratear; 2. cauda de 8–10 ms dos coletivos de handoff; 3.
+   all-gather de logits/dict (≤2 ms). O "handoff de PP" saiu da lista.
+
 ### Grafo FULL para passos microbatched (port do PR #51700)
 
 O `[2/2]` do DBO está no tree (`Ported-from: 73d2a8cf86`): `UBatchRunner` ganhou
