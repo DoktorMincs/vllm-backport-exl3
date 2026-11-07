@@ -219,10 +219,65 @@ Duas notas para quando o DBO for ligado (degraus 2–4):
   microbatch, então os kernels EXL3 dessas threads não se veem "capturando".
   Revisar antes de confiar em `_CAPTURE_SPLIT` sob DBO.
 
+### DBO sob TP puro (degrau 3 — portado, medido, **REPROVADO**)
+
+`Ported-from: 3a7ba0e13cae995a59f92b87c5ad3474d53e5d30` (#63483, "DBO under
+pure tensor parallelism") adaptado a este tree, mais a nossa extensão **3b**.
+
+O que entra: `dbo_tp_only` (`use_ubatching and dp_size==1 and not EP and tp>1`),
+um communicator NCCL **por stream** (`pynccl._stream_comms`/`bind_stream`/`_comm_for`,
+nas 9 coletivas) para os dois microbatches não dividirem o mesmo `ncclComm_t`,
+o hand-off compute→comm em `GroupCoordinator._all_reduce_out_place` (dentro do
+custom op `vllm.all_reduce`, portanto alcançável de dentro do grafo),
+`enable_dbo_tp_overlap`, `prepare_ubatch_streams` (base no-op) e o split local
+em `dispatch_cg_and_sync_dp`. `merge_ubatch_outputs` passa a aceitar
+`tuple`/`list`/`None` recursivamente — é o que o DSpark precisa no degrau 2.
+
+**3b (nossa):** o upstream devolve `cg_mode=NONE` para o passo dividido ("a
+split step runs eager"), e eager aqui vale 7× menos. Com `VLLM_DBO_TP_GRAPH=1`
+o split despacha o **gêmeo microbatch** já capturado (`dispatch(...,
+num_ubatches=N)`, #51700) e só cai em eager quando não existe gêmeo ou um
+microbatch sairia vazio.
+
+Knobs (todos default = comportamento de antes):
+
+| env / flag | default | o que faz |
+|---|---|---|
+| `--enable-dbo`, `--dbo-decode-token-threshold`, `--dbo-prefill-token-threshold` | off / 32 / 32 | liga o DBO; o threshold de decode tem que caber no bucket do passo (8 reqs × 1 token → 4 ou menos) e o de prefill tem que ser altíssimo (com chunk 512 todo passo de prefill seria dividido) |
+| `VLLM_DBO_TP_GRAPH` | 0 | 3b: grafo FULL no passo dividido (0 = comportamento upstream, eager) |
+| `VLLM_DBO_ALLOW_PP` | 0 | único ponto que recusa PP>1 sob DBO; ligado, mede-se na topologia real |
+| `CUDA_DEVICE_MAX_CONNECTIONS` | 1 nos scripts | **tem que ser ≥2** para as duas streams não serializarem; medido neutro sem DBO |
+
+Medições (06/11, `scripts/serve_dbo_ds41.sh`, `scripts/serve_qwen_dbo.sh`):
+
+| braço | Qwen2-1.5B TP2×PP1, C=8 | DS4.1 TP2×PP5, C=8 (agregado) | passo |
+|---|---:|---:|---:|
+| A sem DBO | **1052,6 tok/s** | 57,2–72,0 (mediana ~62,8) | 60,4 ms |
+| B DBO **eager** (upstream) | 36,7 | 8,6 | 927 ms |
+| C DBO **+ grafo** (3b) | 860,8 | 50,0–62,0 (mediana ~62,0) | ~60–111 ms |
+
+- **Correção do split: OK.** No Qwen os braços B e C dão o **mesmo** stream
+  guloso (mesmo fingerprint de token ids, 8×64 tokens) e o A difere em 1
+  sinônimo em 512 — o grafo microbatched não muda o resultado. No DS4.1 o
+  guloso não serve de oráculo: dois boots da MESMA config concordam em
+  ~40–49% dos tokens (a paridade com o Maya já divergia em ~5–16 tokens), e os
+  três braços saem coerentes.
+- **C é 7× o B no DS4.1** (62 contra 8,6 tok/s): prova que o gêmeo do #51700 é
+  de fato reexecutado; sem ele o split seria eager e teria esse custo.
+- **Mas o split não paga**: em PP=1 (Qwen, onde não há bolha de PP) o C é 18%
+  **pior** que o A; com PP=5 o C empata ou perde ~1–14%. O `--enable-dbo` troca
+  um all-reduce de TP por um round trip a mais do pipeline e por uma troca de
+  stream; num par TP sem P2P o rendezvous de 2 ranks cabe justamente sob o
+  GEMM do outro microbatch só em teoria, não nos 60 ms medidos.
+- **Gate decidido (ms/passo(C) ≤ 0,90 × ms/passo(A)) não passou → o degrau 2
+  (spec decode sob DBO, #61464) NÃO foi feito.** `--enable-dbo` continua
+  recusando spec decode; nada disso está no caminho default.
+
 ## Estado
 
 Funcional e validado contra o motor Maya (paridade de prefill; decode 4x pior
 sem o drafter e equivalente com ele, em prompt simples). O que continua em
 aberto: o decode não escala com concorrência como no Maya e o custo por token em
 chat/thinking é maior (a aceitação do drafter cai de ~0,95 para ~0,72 na
-primeira posição quando o modelo está "pensando").
+primeira posição quando o modelo está "pensando"). DBO sob TP puro foi medido e
+reprovado (acima); a bolha/sincronização do passo segue sendo o limite.
