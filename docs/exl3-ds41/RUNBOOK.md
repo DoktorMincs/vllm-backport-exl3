@@ -195,6 +195,25 @@ aquecida): `NCCL_PROTO=LL` 51,70 tok/s / 78,4 ms contra 51,75 / 78,3 do base
 `CUDA_DEVICE_MAX_CONNECTIONS` 8 = 1. A alavanca que sobra é sobrepor
 microbatches (DBO), não ajustar coletivo.
 
+### Comparativo de kernel com o Maya (06/11) — o gargalo é o protocolo
+
+Perfil por sessão (`nsys launch` sem coletar + `start`/`stop`, 512 tokens, 1
+requisição, sem spec nos dois) contra o motor Maya na mesma topologia. Por
+**token por GPU**: compute 3,88 ms nosso contra 3,26 do Maya (**1,19×**, quase
+paridade; 0,45 contra 0,36–0,42 ms por camada) e **comunicação 3,34 contra
+0,77 ms (4,3×)**. A composição do nosso: `AllGather` 4,2 ops/passo a 0,56 ms (o
+Maya não tem nenhum), `SendRecv` 7,2 ops/passo a 0,32 ms (Maya: 1,4 op a
+**0,03 ms** — ring em memória pinada, não NCCL), `AllReduce` 16,2 a 0,06 (Maya
+15,6 a 0,04). E 536 kernels por passo por GPU contra 266.
+
+Ou seja: 2,4× de diferença no passo (60 contra ~25 ms) **não** vem de compute nem
+de pipelining — o pipeline do Maya é o mesmo (5 estágios em série; um token por
+passo não tem como sobrepor). Vem de handoff barato. Alavancas medidas, em ordem:
+menos saltos de PP e/ou ring próprio (8–11 ms), atribuir/cortar o `AllGather`
+(2–8 ms), overhead fixo por estágio (0,5–1,5 ms). Artefatos e método em
+`$EXL3_ROOT/NSYS-MAYA-VS-PORT-20261106.md` + `scripts/nsys_{maya,vllm}_capture.sh`
+e `scripts/nsys_stage_report.py`.
+
 ### Grafo FULL para passos microbatched (port do PR #51700)
 
 O `[2/2]` do DBO está no tree (`Ported-from: 73d2a8cf86`): `UBatchRunner` ganhou
