@@ -677,6 +677,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Fork-local experiment gates for dual batch overlap (DBO).
+    # VLLM_DBO_ALLOW_PP lifts the pipeline-parallel refusal so the overlap can be
+    # measured on TP x PP topologies, which upstream does not support (default 0:
+    # upstream behaviour untouched).
+    "VLLM_DBO_ALLOW_PP": lambda: bool(int(os.getenv("VLLM_DBO_ALLOW_PP", "0"))),
+    # VLLM_DBO_TP_GRAPH makes a pure-TP split dispatch to a captured FULL graph
+    # instead of running the step eager (port of the DP microbatch path). The
+    # upstream pure-TP split is eager-only, which loses 7x against our graphs.
+    "VLLM_DBO_TP_GRAPH": lambda: bool(int(os.getenv("VLLM_DBO_TP_GRAPH", "0"))),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),

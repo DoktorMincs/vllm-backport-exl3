@@ -20,6 +20,7 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -33,7 +34,11 @@ from vllm.v1.worker.ubatch_utils import (
     create_sm_control_context,
     maybe_create_ubatch_slices,
 )
-from vllm.v1.worker.ubatching import make_ubatch_contexts
+from vllm.v1.worker.ubatching import (
+    dbo_comm_stream_priority,
+    enable_dbo_tp_overlap,
+    make_ubatch_contexts,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -256,8 +261,9 @@ def slice_model_inputs(
 def merge_ubatch_outputs(outputs: list[Any]) -> Any:
     """Reassemble the full-batch model output from the per-microbatch ones.
 
-    Models return hidden states, a tuple of those plus auxiliary hidden states
-    (EAGLE3), or IntermediateTensors on non-final pipeline ranks.
+    Models return hidden states, a tuple of those plus a list of auxiliary
+    hidden states (EAGLE3, DFlash, DSpark), or IntermediateTensors on non-final
+    pipeline ranks.
     """
     first = outputs[0]
     if isinstance(first, IntermediateTensors):
@@ -268,7 +274,11 @@ def merge_ubatch_outputs(outputs: list[Any]) -> Any:
             }
         )
     if isinstance(first, tuple):
-        return tuple(torch.cat(parts, dim=0) for parts in zip(*outputs))
+        return tuple(merge_ubatch_outputs(list(parts)) for parts in zip(*outputs))
+    if isinstance(first, list):
+        return [merge_ubatch_outputs(list(parts)) for parts in zip(*outputs)]
+    if first is None:
+        return None
     return torch.cat(outputs, dim=0)
 
 
@@ -317,13 +327,21 @@ class UBatchRunner:
             else None
             for _ in range(self.num_ubatches)
         ]
-        self.comm_stream = torch.cuda.Stream(device=device)
+        self.comm_stream = torch.cuda.Stream(
+            device=device, priority=dbo_comm_stream_priority()
+        )
         # Threads and graph capture must use the same compute stream.
         self.capture_stream = torch.cuda.Stream(device=device)
         # The microbatch threads plus the thread that starts them.
         self.ready_barrier = threading.Barrier(self.num_ubatches + 1)
+        enable_dbo_tp_overlap(self.parallel_config, self.comm_stream)
         self._pending_finish: Callable[[], Any] | None = None
         self.sm_control = create_sm_control_context(self.parallel_config)
+        current_platform.prepare_ubatch_streams(
+            self.device,
+            (current_stream(), self.capture_stream, self.comm_stream),
+            self.num_ubatches,
+        )
 
     def prepare(
         self,
@@ -411,8 +429,12 @@ class UBatchRunner:
                     self.vllm_config,
                     dp_metadata=DPMetadata.make(
                         self.parallel_config, num_tokens, num_tokens_across_dp
-                    ),
+                    )
+                    if dp_size > 1
+                    else None,
                     cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    # A model picking a path per step sees the whole split.
+                    ubatch_slices=ubatch_slices,
                     slot_mapping=slot_mappings_by_layer[i],
                     is_padding=is_padding[i],
                 )
@@ -481,6 +503,8 @@ class UBatchRunner:
                 # changing the shared handoff protocol in ubatching.py, which
                 # is deliberately out of scope here.
                 errors[ubatch_context.id] = e
+                # The sibling may wait on a hand-off forever: log before the join.
+                logger.exception("Microbatch %d failed", ubatch_context.id)
 
         # Threads own the forward context; keep it cleared and SMs reserved
         # until finish joins them.
@@ -544,11 +568,13 @@ def maybe_build_ubatch_runner(
 ) -> UBatchRunner | None:
     """Build the microbatch runner, or None when DBO is not in use.
 
-    Microbatching needs the DP handshake to agree on it, so it is only
-    available with more than one DP rank (as in the V1 runner).
+    With more than one DP rank, the DP handshake agrees on each split. With one
+    DP rank, only pure-TP DBO splits, as a local decision.
     """
     parallel_config = vllm_config.parallel_config
-    if not parallel_config.use_ubatching or parallel_config.data_parallel_size <= 1:
+    if not parallel_config.use_ubatching:
+        return None
+    if parallel_config.data_parallel_size <= 1 and not parallel_config.dbo_tp_only:
         return None
 
     logger.info_once("Dual batch overlap is enabled.")

@@ -140,6 +140,21 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
+    def _get_workspace_id(self) -> int:
+        """Index of the workspace slot for the current (ubatch, lane)."""
+        ubatch_id = dbo_current_ubatch_id()
+        lane = _workspace_lane.get()
+        if lane >= self._num_lanes:
+            raise RuntimeError(
+                f"Workspace lane {lane} is not configured; manager has "
+                f"{self._num_lanes} lane(s)."
+            )
+        # One set of workspaces shared by every microbatch (TP-only DBO, where
+        # both microbatches compute on the same stream) or one per microbatch.
+        if self._num_ubatches <= 1:
+            ubatch_id = 0
+        return ubatch_id * self._num_lanes + lane
+
     def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
@@ -149,14 +164,7 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
-        ubatch_id = dbo_current_ubatch_id()
-        lane = _workspace_lane.get()
-        if lane >= self._num_lanes:
-            raise RuntimeError(
-                f"Workspace lane {lane} is not configured; manager has "
-                f"{self._num_lanes} lane(s)."
-            )
-        workspace_id = ubatch_id * self._num_lanes + lane
+        workspace_id = self._get_workspace_id()
         current_workspace = self._current_workspaces[workspace_id]
         current_size = self._workspace_size_bytes(current_workspace)
 

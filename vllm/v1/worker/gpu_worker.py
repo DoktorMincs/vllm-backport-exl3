@@ -494,6 +494,10 @@ class Worker(WorkerBase):
 
         # DSpark target and draft CUDA graphs retain workspace views concurrently.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        parallel_config = self.vllm_config.parallel_config
+        if self.use_v2_model_runner and parallel_config.dbo_tp_only:
+            # Both microbatches compute on one stream: one workspace set.
+            num_ubatches = 1
         init_workspace_manager(
             self.device,
             num_ubatches,
