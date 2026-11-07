@@ -799,6 +799,7 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
+        _log_collective_caller("all_reduce", self.unique_name, input_)
         if not self.dbo_overlap:
             return self.device_communicator.all_reduce(input_)
         # DBO hand-off, on the comm stream. Under the vllm.all_reduce custom op,
@@ -818,6 +819,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
+        _log_collective_caller("all_gather", self.unique_name, input_)
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
@@ -840,6 +842,7 @@ class GroupCoordinator:
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        _log_collective_caller("all_gatherv", self.unique_name, input_)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
@@ -897,6 +900,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        _log_collective_caller("broadcast", self.unique_name, input_)
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
@@ -1433,6 +1437,7 @@ class GroupCoordinator:
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
+        _log_collective_caller("send", self.unique_name, tensor)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         self.device_communicator.send(tensor, dst)
@@ -1442,6 +1447,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
+        _log_collective_caller("recv", self.unique_name, size)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.recv(size, dtype, src)
@@ -1712,6 +1718,39 @@ def graph_capture(
 
 
 logger = init_logger(__name__)
+
+# VLLM_LOG_COLLECTIVE_CALLERS: one line per unique (collective, group, call
+# site). Decode is replayed from CUDA graphs, so an nsys kernel cannot be traced
+# back to Python; the capture pass can, and these sites are what the graph was
+# built from.
+_LOGGED_CALLERS: set[tuple] = set()
+
+
+def _log_collective_caller(kind: str, group: str, tensor: Any) -> None:
+    if not envs.VLLM_LOG_COLLECTIVE_CALLERS:
+        return
+    import traceback
+
+    frames = traceback.extract_stack()[-8:-1]
+    key = (
+        kind,
+        group,
+        tuple((f.filename.rsplit("/", 2)[-1], f.lineno) for f in frames),
+    )
+    if key in _LOGGED_CALLERS:
+        return
+    _LOGGED_CALLERS.add(key)
+    shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else "?"
+    dtype = tensor.dtype if isinstance(tensor, torch.Tensor) else "?"
+    logger.info(
+        "collective caller: %s[%s] shape=%s dtype=%s\n%s",
+        kind,
+        group,
+        shape,
+        dtype,
+        "".join(traceback.format_list(frames)),
+    )
+
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 

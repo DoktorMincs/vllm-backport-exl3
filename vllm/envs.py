@@ -686,6 +686,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of running the step eager (port of the DP microbatch path). The
     # upstream pure-TP split is eager-only, which loses 7x against our graphs.
     "VLLM_DBO_TP_GRAPH": lambda: bool(int(os.getenv("VLLM_DBO_TP_GRAPH", "0"))),
+    # Diagnostic: log (once per unique call site) which Python code issues each
+    # collective of a GroupCoordinator. Decode runs from CUDA graphs, so the
+    # sites are recorded during capture/warmup -- that is exactly what is
+    # needed to attribute a NCCL kernel seen in an nsys trace (kernel -> graph
+    # node loses the caller). Default 0: no logging, no stack walks.
+    "VLLM_LOG_COLLECTIVE_CALLERS": lambda: bool(
+        int(os.getenv("VLLM_LOG_COLLECTIVE_CALLERS", "0"))
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),

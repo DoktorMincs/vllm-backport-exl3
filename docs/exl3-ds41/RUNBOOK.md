@@ -200,19 +200,32 @@ microbatches (DBO), não ajustar coletivo.
 Perfil por sessão (`nsys launch` sem coletar + `start`/`stop`, 512 tokens, 1
 requisição, sem spec nos dois) contra o motor Maya na mesma topologia. Por
 **token por GPU**: compute 3,88 ms nosso contra 3,26 do Maya (**1,19×**, quase
-paridade; 0,45 contra 0,36–0,42 ms por camada) e **comunicação 3,34 contra
-0,77 ms (4,3×)**. A composição do nosso: `AllGather` 4,2 ops/passo a 0,56 ms (o
-Maya não tem nenhum), `SendRecv` 7,2 ops/passo a 0,32 ms (Maya: 1,4 op a
-**0,03 ms** — ring em memória pinada, não NCCL), `AllReduce` 16,2 a 0,06 (Maya
-15,6 a 0,04). E 536 kernels por passo por GPU contra 266.
+paridade; 0,45 contra 0,36–0,42 ms por camada) e **46,4 contra 15,7 ms de kernel
+no total** — o resto é espera (a coluna de comunicacão soma kernels longos que só
+aguardam o par; o custo útil é ~1,4 contra ~0,8 ms/token/GPU).
+
+Três coisas que a atribuição (gate `VLLM_LOG_COLLECTIVE_CALLERS=1`, log
+one-shot por call site) mostrou:
+
+- **Não existe taxa de coletiva por camada.** São 1–2 all-gathers lógicos por
+  passo por estágio: o **handoff de PP** (`irecv_tensor_dict(...,
+  all_gather_group=get_tp_group())`, 163840 elementos — a máquina não tem P2P,
+  então cada rank TP recebe metade e completa com o vizinho), o **Engram**
+  (`engram.py:1944`, camadas 1 e 14) e os **logits** fatiados no TP
+  (`logits_processor._gather_logits`, 8 × 64640, só no último estágio). O
+  all-gather soma 2,36 ms/token/GPU (~4 ms de um passo de 60, ~7%), não os 8 ms
+  que a média de kernel sugeria.
+- O `SendRecv` observado é o *primer* de 1 elemento do handshake do PP
+  (`gpu_worker.py:885`); os 6–12 kernels por passo são instanciações do NCCL,
+  não chamadas.
+- 536 kernels por passo por GPU contra 266 do Maya, com gaps de 0,15 ms entre
+  eles: o overhead fixo por estágio existe e é o item mais barato de atacar.
 
 Ou seja: 2,4× de diferença no passo (60 contra ~25 ms) **não** vem de compute nem
 de pipelining — o pipeline do Maya é o mesmo (5 estágios em série; um token por
-passo não tem como sobrepor). Vem de handoff barato. Alavancas medidas, em ordem:
-menos saltos de PP e/ou ring próprio (8–11 ms), atribuir/cortar o `AllGather`
-(2–8 ms), overhead fixo por estágio (0,5–1,5 ms). Artefatos e método em
-`$EXL3_ROOT/NSYS-MAYA-VS-PORT-20261106.md` + `scripts/nsys_{maya,vllm}_capture.sh`
-e `scripts/nsys_stage_report.py`.
+passo não tem como sobrepor). Vem do encadeamento entre estágios e do custo por
+salto. Artefatos e método em `$EXL3_ROOT/NSYS-MAYA-VS-PORT-20261106.md` +
+`scripts/nsys_{maya,vllm}_capture.sh` e `scripts/nsys_stage_report.py`.
 
 ### Grafo FULL para passos microbatched (port do PR #51700)
 
