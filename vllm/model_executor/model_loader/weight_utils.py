@@ -920,7 +920,9 @@ def _read_tensors_without_mmap(
             # Read straight into the tensor's storage. A bytes/bytearray
             # round-trip would double the peak host RAM of the big tensors
             # (lm_head / embed are ~1.2 GiB each) in every worker.
-            flat = tensor.view(torch.uint8).reshape(-1)
+            # reshape(-1) first: os marcadores de codebook (.mul1/.mcg) sao
+            # escalares 0-dim, e `view(uint8)` recusa um tensor de dim 0.
+            flat = tensor.reshape(-1).view(torch.uint8).reshape(-1)
             if flat.numel():
                 got = f.readinto(memoryview(flat.numpy()))
                 if got != end - start:
@@ -1092,21 +1094,28 @@ def safetensors_weights_iterator(
                     try:
                         param = f.get_tensor(name)
                     except Exception:
-                        # Diagnostico do 'UntypedStorage' intermitente (boots
-                        # 8c3/9b/9c): precisamos saber QUAL tensor e QUAL
-                        # arquivo, que o traceback do safetensors nao diz.
+                        # O 'UntypedStorage' do safetensors e' INTERMITENTE e nao
+                        # depende do tensor: o mesmo nome le' bem em outro
+                        # boot/processo (boots 8c3/9b/9c; 07/11 02:30 derrubou
+                        # os 10 workers em `layers.22.ffn.experts.49.w2.mul1`,
+                        # um escalar I32 de 4 bytes). Reler o MESMO tensor por
+                        # pread, fora do `safe_open`, resolve -- e' o caminho
+                        # que o load dos shards de Engram ja' usa.
                         import traceback as _tb
 
-                        logger.error(
-                            "get_tensor falhou: name=%r file=%s size=%s "
-                            "header_shape=%r",
+                        logger.warning(
+                            "get_tensor falhou (flake do safetensors): name=%r "
+                            "file=%s -> releitura por pread",
                             name,
                             st_file,
-                            os.path.getsize(st_file),
-                            _safetensors_header(st_file)[0].get(name),
                         )
-                        logger.error("%s", _tb.format_exc())
-                        raise
+                        logger.debug("%s", _tb.format_exc())
+                        _header, _data_start = _safetensors_header(st_file)
+                        param = next(
+                            _read_tensors_without_mmap(
+                                st_file, _header, _data_start, [name]
+                            )
+                        )[1]
                     yield name, param
 
 def multi_thread_safetensors_weights_iterator(

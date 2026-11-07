@@ -2587,6 +2587,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    # How long the shm-broadcast reader keeps busy-spinning (sched_yield) after a
+    # read before parking on the zmq notify socket, in microseconds. The upstream
+    # constant is one *second*, which turns every pipeline wait of a PP stage
+    # (5-30 ms) into a full busy-spin and shows up as ~28% of EngineCore's CPU
+    # time. 0 parks immediately (no spin at all); 1000000 reproduces the
+    # upstream one-second spin for an A/B.
+    "VLLM_SHM_BUSY_LOOP_US": lambda: int(
+        os.getenv("VLLM_SHM_BUSY_LOOP_US", "200")
+    ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
