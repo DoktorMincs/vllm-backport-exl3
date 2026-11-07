@@ -268,6 +268,40 @@ nunca milissegundos absolutos.
    no grafo ou baratear; 2. cauda de 8–10 ms dos coletivos de handoff; 3.
    all-gather de logits/dict (≤2 ms). O "handoff de PP" saiu da lista.
 
+### O passo é limitado pelo HOST, não pela GPU (medido 07/11)
+
+Fechando a pergunta dos 12–16 ms por estágio com só 4–5 ms de GPU: medição
+**sem profiler nenhum** (`/proc/<pid>/stat` utime+stime antes/depois), 1024
+tokens, no-spec, `max_model_len=32768`:
+
+| grandeza | valor |
+|---|---|
+| decode | **18,29 tok/s → 54,6 ms/passo** |
+| EngineCore (1 thread) | **~31 ms de CPU/passo** (57 % de um core) |
+| cada um dos 10 workers | **~36 ms de CPU/passo** (65 % de um core) |
+| CPU total por passo | ~0,39 s para 55 ms de parede (24 cores, sem quota) |
+| GPU | ~22–25 ms de kernel por passo |
+
+`py-spy` (frames Python, que o `--sample=cpu` do nsys não vê) no EngineCore:
+**36 %** dentro de `_process_engine_step` (`core.py:1491`), **~28 %** esperando a
+resposta dos workers — e essa espera é *spin* (`MessageQueue.dequeue`,
+`acquire_read`, `SpinCondition.wait` → `sched_yield`), mais ~10 % de
+`zmq`/`memory_fence`/`timeout_ms`. **`Scheduler.update_from_output` é 1,8 %**: o
+scheduler do vLLM não é o custo; o custo é o **caminho de mensagens entre
+processos** (1 `SchedulerOutput` e 1 resposta por rank por passo).
+
+`max_concurrent_batches` já é `pp_size + 1 = 6` com async scheduling, mas isso
+só adianta o lado do scheduler: **vLLM PP executa stage 0→4 do mesmo token
+dentro do passo**, então o passo é a soma das latências de estágio.
+
+Consequência para alavancas: NCCL/DBO/protocolo de PP e o scheduler estão
+descartados por medição. Sobra **o trabalho de host por passo dos workers** —
+~91 kernels eager por passo com lacunas de 0,05–0,8 ms, ~27 `cudaMemcpyAsync`
+(1/4/8/512 B, DtoD) e ~95 launches. Se o host por estágio cair de ~11 para ~5 ms,
+o passo vai de 55 para ~35 ms (**1,6×**) e o chat de ~38–41 para ~60 tok/s.
+Relatório e método em `$EXL3_ROOT/HOST-BOUND-20261107.md`; ferramentas
+`scripts/pyspy_engine.sh`, `scripts/spy_summary.py`, `scripts/spy_tree.py`.
+
 ### Grafo FULL para passos microbatched (port do PR #51700)
 
 O `[2/2]` do DBO está no tree (`Ported-from: 73d2a8cf86`): `UBatchRunner` ganhou
