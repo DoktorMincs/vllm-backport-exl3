@@ -85,11 +85,65 @@ O KV já é **fp8** (`fp8_ds_mla`, ~3 KB/token). O pool escala com
 |---|---:|---|
 | 32.768 | 203.300 tok | |
 | 65.536 | 189.032 tok | |
-| **98.304** | **126.714 tok** | default; um prompt de 87 k roda inteiro |
-| 131.072 | 184.087 tok | só com `util 0.98` **e** o patch abaixo; um prompt de ~118 k derruba o engine (`k_bf16` do indexer sobre o contexto todo) |
+| **98.304** | **126.714 tok** | pack 2,9 bpw; o de 2,68 bpw dá **1.448.915** |
+| 131.072 | 184.087 tok | pack 2,9 bpw, só com `util 0.98` e o patch abaixo; um prompt de ~118 k derruba o engine (`k_bf16` do indexer sobre o contexto todo) |
+
+A partição faz toda a diferença e precisa ser recalculada por pack:
+`pack_budget.py --pack <dir> --levels` dá o ótimo contíguo. No pack de 2,68 bpw
+com o drafter no último estágio, **`8,9,9,8,6`** dá 1,34 M tokens a 64 k e
+1,45 M a 96 k; a partição antiga (`8,8,10,8,6`) deixa o estágio de 10 camadas
+no teto de `util` e o pool cai para 111 k.
 
 O fork também aceita `nvfp4_ds_mla` e `turboquant_*` (KV de 4 bits), que
 reduzem o KV mas não o pico de ativação — não são o que limita o contexto.
+
+## Pack do turboderp (2,68 bpw) — suporte a K fracionário
+
+`turboderp/DeepSeek-V4.1-Flash-1017-exl3` @ `2.68bpw` (179,27 GiB; as tabelas de
+Engram são as nossas, por symlink — `ngram_embedding.safetensors` não é
+baixado). Convertido por `scripts/turbo_pack_build.sh`
+(`make_vllm_pack.py` → `export_dspark.py` → `turbo_prepare.py` →
+`turbo_config_patch.py`) em `/root/models/DS41-turbo-2.68bpw-vllm`.
+
+O bloqueio era **K = 2,5** nos experts roteados das camadas 6–34: a tile tem
+40 palavras = `16 × 2,5`. Do lado do plugin: o loader aceita `words % 16 == 8`,
+`Exl3Config.layer_bits` guarda 2,5 como float, e a convenção do kernel mudou na
+linha 1.6 do exllamav3 — as arrays por expert do `exl3_moe_mixedk` são **meias
+unidades** (`k2 = 2*bits + half`) e `k_max` continua em bits
+(`(max_k2+1)//2`). Gate em `scripts/frac_mixedk_check.py`: cos 1,000000
+(K=2,5 × K=2,5), 0,999703 (K=2,5 × K=3) e **0,0039 com K em bits** — o negativo
+prova a convenção. Camadas de K fracionário nunca entram no coop nem no dispatch
+`grouped`, deixam `_exl3_k_tuple = None` e não passam pelo caminho nativo; as de
+K inteiro continuam no kernel nativo (`EXL3_FORCE_MIXEDK=0` é o certo: forçar
+mixedk em tudo piora o passo 16%).
+
+Duas armadilhas de conversão, ambas custaram boot:
+- **skip dos `mtp.*.attn.wo_a.slice.*`**: o `make_vllm_pack` só registrava esses
+  96 tensores quando o ledger do pack de origem tinha prefixos `mtp.*` — o do
+  turboderp tem 47.008 chaves e **zero** `mtp.`, então o drafter morria em
+  `KeyError: 'model.layers.0.attn.wo_a.slice.0.mul1'`. `export_dspark.py` agora
+  adiciona esses nomes por conta própria (gate: achar `trellis` no cabeçalho).
+- **overlay do `head`**: nunca compor `reconstruct_slice` com `had_r_128` sobre
+  a identidade (cos −0,0055 no exllamav3 1.6.5). `build_head` usa `effective()`
+  do exl3_torch e confere cada bloco de 8192 colunas contra uma segunda
+  implementação (decode do ext + Hadamards do Python), cos > 0,9995.
+
+Números (partição `8,9,9,8,6`, DSpark N=5, knobs de host OFF):
+
+| medida | valor |
+|---|---|
+| pool de KV @65.536 | 1.339.664 tok (20,4×) |
+| **pool de KV @98.304** | **1.448.915 tok (14,74×)** |
+| decode repetitivo, 256 tok | 59–63 tok/s |
+| decode comp (5 prompts) | 39,8 tok/s / 80,9 ms / 2,28 aceitos por rodada |
+| decode chat (raciocínio) | 28,8 tok/s / 88,9 ms / 1,56 aceitos |
+
+O MTP do turboderp é **K=2** contra K=4 do nosso pack, e a aceitação cai
+(2,28 contra ~2,2–2,4 do nosso pack no chat). Enxertar o nosso drafter K=4
+(`scripts/graft_mtp_k4.py`) **não ajuda**: 38,75/27,71 tok/s com passo 82,6/96,2
+ms e aceitação 2,235/1,667 — a perda é do modelo principal (experts de 2,5 bits
+mudam a distribuição que o drafter vê), não da largura do MTP. O pack sem
+enxerto é o que fica.
 
 ## Armadilhas (todas custaram medida)
 
@@ -383,8 +437,19 @@ Medições (06/11, `scripts/serve_dbo_ds41.sh`, `scripts/serve_qwen_dbo.sh`):
 ## Estado
 
 Funcional e validado contra o motor Maya (paridade de prefill; decode 4x pior
-sem o drafter e equivalente com ele, em prompt simples). O que continua em
-aberto: o decode não escala com concorrência como no Maya e o custo por token em
-chat/thinking é maior (a aceitação do drafter cai de ~0,95 para ~0,72 na
-primeira posição quando o modelo está "pensando"). DBO sob TP puro foi medido e
-reprovado (acima); a bolha/sincronização do passo segue sendo o limite.
+sem o drafter e equivalente com ele, em prompt simples). **No ar em 07/11**: o
+pack de 2,5 bits do turboderp em `0.0.0.0:3000` (ver a seção acima e
+`/root/exl3-port/SERVING-NOW.md`). O que continua em aberto: o decode não escala com
+concorrência como no Maya e o custo por token em chat/thinking é maior (a
+aceitação do drafter cai de ~0,95 para ~0,72 na primeira posição quando o modelo
+está "pensando"). DBO sob TP puro foi medido e reprovado (acima); a
+bolha/sincronização do passo segue sendo o limite.
+
+**Próxima alavanca de kernel (não medida): `ext.CoopMK`.** O master do
+exllamav3 ≥1.6.5 traz um MoE cooperativo de decode com K por camada
+(`exllamav3/modules/block_sparse_mlp.py`, env `EXL3_MOE_COOP_MIXEDK`, default
+só em sm_121) — nos 3090 ele não é usado por default, e o plugin chama o ext
+direto, então isso é trabalho de código (buffers + ordem dos experts). Vale
+porque cobriria as camadas de K=2,5 no kernel rápido; o teto é o MoE de decode,
+que é ~8–10 ms de um passo de 80 ms com spec — não é a alavanca de 2×.
+
