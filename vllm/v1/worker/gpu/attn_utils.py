@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -256,6 +257,18 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+# VLLM_SHARE_TOKEN_TO_REQ=1: the per-token request index mapping (query_start_loc ->
+# repeat_interleave, a handful of tiny kernels plus Python) is identical for every KV
+# cache group of a step, but each group's CommonAttentionMetadata rebuilt it. Reuse the
+# first group's result. Default off (A/B first).
+_SHARE_TOKEN_TO_REQ = os.environ.get("VLLM_SHARE_TOKEN_TO_REQ", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -286,6 +299,7 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    shared_token_to_req: torch.Tensor | None = None
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
@@ -325,6 +339,9 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
+        if _SHARE_TOKEN_TO_REQ and shared_token_to_req is not None:
+            common_attn_metadata._token_to_req_indices_cache = shared_token_to_req
+
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
             if for_cudagraph_capture:
@@ -347,6 +364,8 @@ def build_attn_metadata(
                 )
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
+        if _SHARE_TOKEN_TO_REQ and shared_token_to_req is None:
+            shared_token_to_req = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
 
 
