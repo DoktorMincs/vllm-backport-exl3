@@ -220,12 +220,11 @@ class WorkspaceManager:
             if envs.VLLM_DEBUG_WORKSPACE:
                 logger.info(
                     "[WORKSPACE DEBUG] Resized workspace from '%s': %.2f MB -> "
-                    "%.2f MB (ubatch %d, lane %d)",
+                    "%.2f MB (workspace slot %d)",
                     get_caller_info(),
                     current_size / _MB,
                     required_bytes / _MB,
-                    ubatch_id,
-                    lane,
+                    workspace_id,
                 )
 
         return current_workspace
