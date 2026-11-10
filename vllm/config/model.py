@@ -2391,6 +2391,32 @@ def _get_head_dtype(
         raise ValueError(f"Unknown dtype: {head_dtype}")
 
 
+def _apply_derived_max_len_cap(max_model_len: int) -> int:
+    """Cap the DEFAULT/auto max_model_len with VLLM_MAX_MODEL_LEN_CAP (0 = off).
+
+    Only the derived value (``--max-model-len`` unset or ``auto``/-1) is capped;
+    an explicit length is never touched. The cap matters because the model's
+    full context (1M for DS4.1) sizes persistent workspaces during memory
+    profiling, before ``auto`` has had a chance to fit the KV pool.
+    """
+    import os
+
+    raw = os.environ.get("VLLM_MAX_MODEL_LEN_CAP", "").strip()
+    try:
+        cap = int(raw) if raw else 0
+    except ValueError:
+        cap = 0
+    if cap > 0 and max_model_len > cap:
+        logger.info_once(
+            "VLLM_MAX_MODEL_LEN_CAP=%d lowers the derived max_model_len %d -> %d",
+            cap,
+            max_model_len,
+            cap,
+        )
+        return cap
+    return max_model_len
+
+
 def _get_and_verify_max_len(
     hf_config: PretrainedConfig,
     model_arch_config: ModelArchitectureConfig,
@@ -2505,6 +2531,7 @@ def _get_and_verify_max_len(
         else:
             max_model_len = int(derived_max_model_len)
         max_model_len = current_platform.check_max_model_len(max_model_len)
+        max_model_len = _apply_derived_max_len_cap(max_model_len)
 
     # If the user specified a max length, make sure it is smaller than the
     # derived length from the HF model config.
