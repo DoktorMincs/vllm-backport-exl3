@@ -515,3 +515,21 @@ Root causes found with `VLLM_DEBUG_WORKSPACE=1` (its logging had a NameError, fi
 
 Defaults in `scripts/serve_best_ds41.sh`: UTIL 0.975, SEQS 8, maxlen `auto`, cap 262144, chunk 1.
 Decode is unchanged by all of this (host-bound).
+
+## Decode host path (2026-11-10): where the CPU goes, and `VLLM_SHARE_TOKEN_TO_REQ`
+
+`scripts/host_profile.sh` (py-spy 50 Hz on the EngineCore and one worker per stage, production config,
+C=1, ~57 ms/step): stage 0 spends 79% of its samples in the Engram D2H sync (`engram.py:1159`), i.e. waiting
+for the new token from the last stage (inherent PP latency; the preads are only 3.4%); the EngineCore spends
+~75% spinning on the shm queue (off the critical path). The host work on the critical path is ~8.5 ms/step on
+stage 0 and ~14 ms/step on the last stage, of which attention-metadata building is the largest item.
+
+* `token_to_req_indices` was rebuilt for every KV cache group (~5x per step). `VLLM_SHARE_TOKEN_TO_REQ=1`
+  (`vllm/v1/worker/gpu/attn_utils.py`) reuses the first group's result. 20 s py-spy windows, baseline -> flag:
+  `build_attn_metadata` 68 -> 46 samples (stage 0) and 111 -> 85 (stage 4); `token_to_req_indices` 34 -> 14 on
+  stage 4; drafter metadata 43 -> 31; decode C=1 56.6 -> 61.0 tok/s (inside the +-8% boot noise).
+* Correctness: `VLLM_SHARE_TOKEN_TO_REQ=check` asserts every step (device sync, skipped during graph capture)
+  that the shared map equals the one each group would build; a full run (87k prefill, mixed stress, decode) had
+  zero divergences. Default in `scripts/serve_best_ds41.sh`: 1.
+* Not ported: the batched sliding-window metadata of vllm-project/vllm#60996 (one kernel for the 4 SWA groups);
+  it depends on `replay_start` and a model-state hook this fork does not have. Estimated extra gain ~1 ms/step.
