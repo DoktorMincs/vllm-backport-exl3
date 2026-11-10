@@ -288,6 +288,29 @@ class DSparkDeepseekV4Model(nn.Module):
         return hidden_states
 
 
+_DUMMY_Q_SHARE = os.environ.get("VLLM_SHARE_DUMMY_Q", "1").lower() not in (
+    "", "0", "false", "no", "off",
+)
+_DUMMY_Q_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _get_dummy_q(n_ctx: int, heads: int, head_dim: int, kv: torch.Tensor):
+    """Zero query scratch for the context-KV insert op.
+
+    The op only needs a query-shaped buffer it may scribble on and whose
+    contents are discarded; an all-zero input stays zero through rms-norm/rope,
+    so one buffer per shape can serve every drafter layer.
+    """
+    if not _DUMMY_Q_SHARE:
+        return torch.zeros((n_ctx, heads, head_dim), dtype=kv.dtype, device=kv.device)
+    key = (n_ctx, heads, head_dim, kv.dtype, kv.device)
+    buf = _DUMMY_Q_CACHE.get(key)
+    if buf is None:
+        buf = torch.zeros((n_ctx, heads, head_dim), dtype=kv.dtype, device=kv.device)
+        _DUMMY_Q_CACHE[key] = buf
+    return buf
+
+
 def _insert_context_kv(
     attn: nn.Module,
     kv: torch.Tensor,
@@ -305,11 +328,7 @@ def _insert_context_kv(
     cos_sin_cache = attn.rotary_emb.cos_sin_cache
     cache_dtype = swa_cache.dtype
     n_ctx = kv.shape[0]
-    dummy_q = torch.zeros(
-        (n_ctx, attn.n_local_heads, attn.head_dim),
-        dtype=kv.dtype,
-        device=kv.device,
-    )
+    dummy_q = _get_dummy_q(n_ctx, attn.n_local_heads, attn.head_dim, kv)
     if cache_dtype == torch.uint8:
         # fp8_ds_mla UE8M0 paged layout
         swa_2d = swa_cache.view(swa_cache.shape[0], -1)

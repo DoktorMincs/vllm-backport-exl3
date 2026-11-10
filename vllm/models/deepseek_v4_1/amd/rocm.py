@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -403,6 +404,13 @@ def _copy_ragged_to_graph_buffers(
     return ragged_out, indptr_out
 
 
+# VLLM_RAGGED_DIRECT=1: pack the SWA ragged indices straight into the persistent
+# graph buffers (no temporary tensors, no two D2D copies per KV group per step).
+_RAGGED_DIRECT = os.environ.get("VLLM_RAGGED_DIRECT", "0").lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+
 @dataclass
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
@@ -451,6 +459,20 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
+            n_rows = base.num_decode_tokens
+            if _RAGGED_DIRECT and not _ON_GFX950:
+                needed = max(n_rows * base.decode_swa_width, 1)
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    base.decode_swa_indices.reshape(n_rows, base.decode_swa_width),
+                    base.decode_swa_lens,
+                    indices_out=self.decode_swa_ragged_indices_buffer[:needed],
+                    indptr_out=self.decode_swa_ragged_indptr_buffer[: n_rows + 1],
+                )
+                return DeepseekV4ROCMAiterSparseSWAMetadata(
+                    **vars(base),
+                    decode_swa_ragged_indices=ragged_indices,
+                    decode_swa_ragged_indptr=ragged_indptr,
+                )
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
                 base.decode_swa_indices.reshape(
                     base.num_decode_tokens, base.decode_swa_width
