@@ -453,3 +453,23 @@ direto, então isso é trabalho de código (buffers + ordem dos experts). Vale
 porque cobriria as camadas de K=2,5 no kernel rápido; o teto é o MoE de decode,
 que é ~8–10 ms de um passo de 80 ms com spec — não é a alavanca de 2×.
 
+
+## KV pool sweep (2026-11-10, pack Mia EAQ v1 2.9 bpw, TP2xPP5, DSpark N=5)
+
+Measured with `sweep_util.sh` (util x PIECEWISE skip), `VLLM_DSPARK_REST` off:
+
+| util | maxlen | KV pool (tokens) | concurrency | prefill 87k | decode C=1 |
+|---|---|---|---|---|---|
+| 0.97 | 98304 | 126,714 | 1.29x | ok | 50.9 tok/s |
+| 0.9775 | 98304 | 249,405 | 2.54x | ok | 51.2 |
+| **0.98** | 98304 | **290,302** | **2.95x** | ok, stress ok | 50.9-51.6 |
+| 0.98 | 131072 | 184,087 | 1.40x | 122k ok | 52.7 |
+| 0.982 | 131072 | 219,951 | 1.68x | OOM in the indexer (26 MiB) | - |
+| 0.985 | any | refused: free memory on startup 23.14/23.56 GiB caps util at ~0.982 | | | |
+
+* The pool depends on util, not on skipping the PIECEWISE graphs. `VLLM_CUDAGRAPH_SKIP_PIECEWISE=1`
+  returns 0.14 GiB of graph memory but costs ~10% decode (C=1) and ~15% (C=8): leave it off.
+* `VLLM_DSPARK_REST=1` at util 0.98 OOMs (40 MiB, dense EXL3 fallback) in the 87k prefill.
+* Packing the hybrid KV groups by pooled bytes (vllm-project/vllm#60996, branch `kv-pack-60996`)
+  yields identical groups (9,140 bytes/token summed) and an identical pool: not needed here.
+* `VLLM_LOG_KV_GROUPS=1` prints the per-group page size and padding at boot.
