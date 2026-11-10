@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -28,6 +30,15 @@ from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.sample.thinking_budget import ThinkingBudgetState
 from vllm.v1.worker.gpu.sample.trace_replay import TraceReplayState
 from vllm.v1.worker.gpu.states import RequestState
+
+
+# VLLM_SKIP_IDLE_STAGED_WRITES=1: every step re-copied ~11 tiny per-request arrays
+# (temperature, top_k, top_p, min_p, seeds, logit bias, bad words, logprob ids) into the
+# UVA ring even though they only change in add_request. Skip the copies on steps that
+# added no request (the last PP stage pays this every decode step). Default off.
+_SKIP_IDLE_STAGED_WRITES = os.environ.get(
+    "VLLM_SKIP_IDLE_STAGED_WRITES", ""
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 class Sampler:
@@ -59,6 +70,8 @@ class Sampler:
             TraceReplayState(req_states) if enable_trace_replay else None
         )
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Set by add_request; the UVA copies in apply_staged_writes are skipped while clean.
+        self._staged_dirty = True
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -68,6 +81,7 @@ class Sampler:
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
     ) -> None:
+        self._staged_dirty = True
         self.sampling_states.add_request(req_idx, sampling_params)
         self.penalties_state.add_request(req_idx, sampling_params)
         self.logit_bias_state.add_request(req_idx, prompt_len, sampling_params)
@@ -94,11 +108,13 @@ class Sampler:
         )
 
     def apply_staged_writes(self) -> None:
-        self.sampling_states.apply_staged_writes()
-        self.penalties_state.apply_staged_writes()
-        self.logit_bias_state.apply_staged_writes()
-        self.bad_words_state.apply_staged_writes()
-        self.logprob_token_ids_state.apply_staged_writes()
+        if not _SKIP_IDLE_STAGED_WRITES or self._staged_dirty:
+            self.sampling_states.apply_staged_writes()
+            self.penalties_state.apply_staged_writes()
+            self.logit_bias_state.apply_staged_writes()
+            self.bad_words_state.apply_staged_writes()
+            self.logprob_token_ids_state.apply_staged_writes()
+            self._staged_dirty = False
         self.thinking_budget_state.apply_staged_writes()
         if self.trace_replay_state is not None:
             self.trace_replay_state.apply_staged_writes()
