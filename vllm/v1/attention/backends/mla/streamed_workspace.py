@@ -22,11 +22,11 @@ def eligible(config):
     ok=all(checks.values())
     if not ok:
         from vllm.logger import init_logger
+        failed=[k for k,v in checks.items() if not v]
         init_logger(__name__).info_once(
-            'streamed indexer workspace NOT eligible (falls back to max_model_len*40 rows): failed=%s '
-            '(model_type=%r block_size=%r)',
-            [k for k,v in checks.items() if not v],
-            getattr(text,'model_type',None), config.cache_config.block_size)
+            "streamed indexer workspace NOT eligible (falls back to max_model_len*40 rows): "
+            "failed=%s model_type=%r block_size=%r"
+            % (failed, getattr(text,'model_type',None), config.cache_config.block_size))
     return ok
 
 
