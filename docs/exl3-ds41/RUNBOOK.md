@@ -473,3 +473,17 @@ Measured with `sweep_util.sh` (util x PIECEWISE skip), `VLLM_DSPARK_REST` off:
 * Packing the hybrid KV groups by pooled bytes (vllm-project/vllm#60996, branch `kv-pack-60996`)
   yields identical groups (9,140 bytes/token summed) and an identical pool: not needed here.
 * `VLLM_LOG_KV_GROUPS=1` prints the per-group page size and padding at boot.
+
+### max-num-seqs 2 and where the KV pool goes (2026-11-10)
+
+* `SEQS=2` @ util 0.98, maxlen 98304: pool **identical** (290,302), decode C=1 50.3 tok/s (same),
+  C=2 48.9 tok/s/request (~98 aggregate). Only the CUDA-graph memory shrinks (0.56 -> ~0.2 GiB
+  on most ranks, 0.43 on the worst). Not worth the lost concurrency by itself.
+* `VLLM_LOG_KV_GROUPS=1` now also prints tensor sizes, bytes/block and blocks/request. DS4.1 TP2xPP5:
+  6 groups (4x SlidingWindowMLA 2 layers, MLA 2 layers, CircularBuffer 1 layer), 7 pool tensors of
+  46,080 B per block = **322,560 B per block id**; a 98k request claims 1,173 blocks
+  (SWA 4x101, MLA 768, CB 1) = ~378 MB/rank, of which only ~73 MB are pages actually used by the group
+  that owns each block: the shared-slab layout wastes ~5x. The structural fix is a per-group pool
+  (vllm-project/vllm#44276); packing tweaks (#60996) do not change these groups.
+* maxlen 131072 @ util 0.98 SEQS=2: pool 184,087 (1.40x), "weights + non-torch" grows by 0.08-0.17
+  GiB per rank versus maxlen 98304 (something is sized by max_model_len); 122k prefill ok.

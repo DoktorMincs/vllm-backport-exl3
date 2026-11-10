@@ -2341,10 +2341,10 @@ def update_kv_cache_capacity(
         "yes",
         "on",
     ):
-        _log_kv_groups(kv_cache_config)
+        _log_kv_groups(vllm_config, kv_cache_config)
 
 
-def _log_kv_groups(kv_cache_config: KVCacheConfig) -> None:
+def _log_kv_groups(vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
     """Diagnostic (VLLM_LOG_KV_GROUPS=1): bytes per block of every KV group.
 
     Shows where the hybrid manager pays page padding: for each group the spec
@@ -2353,9 +2353,12 @@ def _log_kv_groups(kv_cache_config: KVCacheConfig) -> None:
     holds one block per ``block_size * tokens_per_state`` tokens of a request.
     """
     logger.info(
-        "KV groups: num_blocks=%s tensors=%d",
+        "KV groups: num_blocks=%s tensors=%d tensor_bytes=%s bytes/block=%.0f",
         kv_cache_config.num_blocks,
         len(kv_cache_config.kv_cache_tensors),
+        [t.size for t in kv_cache_config.kv_cache_tensors],
+        sum(t.size for t in kv_cache_config.kv_cache_tensors)
+        / max(kv_cache_config.num_blocks, 1),
     )
     total = 0.0
     for i, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -2366,9 +2369,14 @@ def _log_kv_groups(kv_cache_config: KVCacheConfig) -> None:
         n = len(group.layer_names)
         per_token = n * page / (block * (getattr(spec, "tokens_per_state", 1) or 1))
         total += per_token
+        try:
+            req_blocks = cdiv(spec.max_memory_usage_bytes(vllm_config), page)
+        except Exception:  # diagnostic only
+            req_blocks = -1
         logger.info(
             "KV group %d: %s layers=%d block_size=%d page=%d real_page=%d "
-            "padding=%.1f%% tokens_per_state=%s bytes/token(group)=%.0f",
+            "padding=%.1f%% tokens_per_state=%s bytes/token(group)=%.0f "
+            "blocks/request(max_len)=%d",
             i,
             type(spec).__name__,
             n,
@@ -2378,6 +2386,7 @@ def _log_kv_groups(kv_cache_config: KVCacheConfig) -> None:
             100.0 * (page - real) / page if page else 0.0,
             getattr(spec, "tokens_per_state", None),
             per_token,
+            req_blocks,
         )
     logger.info("KV groups: sum bytes/token over groups = %.0f", total)
 
