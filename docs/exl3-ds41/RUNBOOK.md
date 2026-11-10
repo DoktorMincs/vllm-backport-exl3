@@ -487,3 +487,31 @@ Measured with `sweep_util.sh` (util x PIECEWISE skip), `VLLM_DSPARK_REST` off:
   (vllm-project/vllm#44276); packing tweaks (#60996) do not change these groups.
 * maxlen 131072 @ util 0.98 SEQS=2: pool 184,087 (1.40x), "weights + non-torch" grows by 0.08-0.17
   GiB per rank versus maxlen 98304 (something is sized by max_model_len); 122k prefill ok.
+
+## KV pool: indexer workspace fix + prefill chunk + `auto` (2026-11-10, night)
+
+Root causes found with `VLLM_DEBUG_WORKSPACE=1` (its logging had a NameError, fixed) and
+`VLLM_LOG_KV_GROUPS=1`:
+
+1. `streamed_workspace.eligible()` was always False in the workers: the indexer layers are built while
+   `cache_config.block_size` is still the default 16, so the indexer K-gather workspace fell back to
+   `max_model_len*40` rows (248 MB on PP0/1, 496 MB on PP2-4 at 98k; it scaled ~2.5-5 KB per token of
+   max_model_len). Fixed (accept 16 or 128, re-check in the metadata builder): 7.2 MB.
+2. The sparse-prefill gather workspace (`rocm.py` forward_mqa on this platform) then became the largest
+   reservation (4 chunks x (L/ratio + window + chunk) x 1 KB): `VLLM_DS41_PREFILL_CHUNK_SIZE=1` cuts it 4x.
+3. `VLLM_MAX_MODEL_LEN_CAP` bounds the DERIVED (`auto`) max_model_len; without it the profile sizes the
+   workspaces for the model's 1M context.
+
+| config (util 0.98 unless noted) | max_model_len | pool | prefill | notes |
+|---|---|---|---|---|
+| before (util 0.97) | 98,304 | 126,714 | 87k ok | |
+| util 0.98 | 98,304 | 290,302 | 87k ok | |
+| + eligible() fix | 98,304 | 358,101 | 87k ok | |
+| + chunk 1 | 98,304 | 547,921 (5.57x) | 87k ok | |
+| auto, cap 262144, chunk 1, SEQS=2 | 262,144 | 560,408 (2.14x) | 232k ok (1,131 t/s) | decode 51.8 |
+| auto, cap 393216, chunk 1, SEQS=2 | 393,216 | 464,915 (1.18x) | ~350k OOM | |
+| auto, cap 262144, chunk 1, **SEQS=8 util 0.98** | 262,144 | 560,408 | 232k OOM (2 MiB) | graphs 0.56 GiB |
+| auto, cap 262144, chunk 1, **SEQS=8 util 0.975** | 262,144 | 456,107 (1.74x) | 232k ok (1,150 t/s) | stress ok; decode 51.2 C=1, 19.0/req C=8 |
+
+Defaults in `scripts/serve_best_ds41.sh`: UTIL 0.975, SEQS 8, maxlen `auto`, cap 262144, chunk 1.
+Decode is unchanged by all of this (host-bound).
