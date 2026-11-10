@@ -942,6 +942,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 f"{self.cp_kv_cache_interleave_size})."
             )
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
+        from vllm.v1.attention.backends.mla.streamed_workspace import (
+            assert_resolved_block_size,
+        )
+
+        assert_resolved_block_size(self.vllm_config)
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens

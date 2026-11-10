@@ -15,7 +15,11 @@ def eligible(config):
         'layers==40':getattr(text,'num_hidden_layers',None)==40,
         'experts==384':getattr(text,'n_routed_experts',None)==384,
         'compress_ratios':bool(getattr(text,'compress_ratios',None)) and all(r in (0,1,2) for r in text.compress_ratios),
-        'block_size==128':config.cache_config.block_size==128,
+        # The DS4.1 backend forces block size 128, but the indexer layers are built BEFORE the
+        # platform resolves it (cache_config.block_size is still the default 16 then), which made
+        # this check fail and the indexer reserve max_model_len*40 rows. 16 = not resolved yet;
+        # the attention metadata builder re-checks the resolved value (assert_resolved_block_size).
+        'block_size in (16,128)':config.cache_config.block_size in (16,128),
         'dcp==1':parallel.decode_context_parallel_size==1,
         'pcp==1':parallel.prefill_context_parallel_size==1,
     }
@@ -43,3 +47,12 @@ def chunk_capacity(config,uncompressed_capacity,ratio):
     if not eligible(config):return uncompressed_capacity
     if ratio not in (1,2):raise ValueError('Unqualified indexer compression ratio')
     return uncompressed_capacity//ratio
+
+
+def assert_resolved_block_size(config):
+    """Called once the cache block size is final (metadata builder init)."""
+    if eligible(config) and config.cache_config.block_size != 128:
+        raise ValueError(
+            "streamed indexer workspace sizing assumes cache block size 128, got "
+            f"{config.cache_config.block_size}"
+        )
