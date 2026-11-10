@@ -8,15 +8,26 @@ budget larger than the actual compressed gather allocation.
 def eligible(config):
     text=getattr(config.model_config,'hf_text_config',None)
     parallel=config.parallel_config
-    return (text is not None and getattr(text,'model_type',None) in ('deepseek_v41','deepseek_v41_text')
-            and getattr(text,'hidden_size',None)==5120
-            and getattr(text,'num_hidden_layers',None)==40
-            and getattr(text,'n_routed_experts',None)==384
-            and getattr(text,'compress_ratios',None)
-            and all(r in (0,1,2) for r in text.compress_ratios)
-            and config.cache_config.block_size==128
-            and parallel.decode_context_parallel_size==1
-            and parallel.prefill_context_parallel_size==1)
+    checks={
+        'text_config':text is not None,
+        'model_type':getattr(text,'model_type',None) in ('deepseek_v41','deepseek_v41_text'),
+        'hidden_size==5120':getattr(text,'hidden_size',None)==5120,
+        'layers==40':getattr(text,'num_hidden_layers',None)==40,
+        'experts==384':getattr(text,'n_routed_experts',None)==384,
+        'compress_ratios':bool(getattr(text,'compress_ratios',None)) and all(r in (0,1,2) for r in text.compress_ratios),
+        'block_size==128':config.cache_config.block_size==128,
+        'dcp==1':parallel.decode_context_parallel_size==1,
+        'pcp==1':parallel.prefill_context_parallel_size==1,
+    }
+    ok=all(checks.values())
+    if not ok:
+        from vllm.logger import init_logger
+        init_logger(__name__).info_once(
+            'streamed indexer workspace NOT eligible (falls back to max_model_len*40 rows): failed=%s '
+            '(model_type=%r block_size=%r)',
+            [k for k,v in checks.items() if not v],
+            getattr(text,'model_type',None), config.cache_config.block_size)
+    return ok
 
 
 def gather_capacity(config):
