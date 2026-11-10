@@ -533,3 +533,19 @@ stage 0 and ~14 ms/step on the last stage, of which attention-metadata building 
   zero divergences. Default in `scripts/serve_best_ds41.sh`: 1.
 * Not ported: the batched sliding-window metadata of vllm-project/vllm#60996 (one kernel for the 4 SWA groups);
   it depends on `replay_start` and a model-state hook this fork does not have. Estimated extra gain ~1 ms/step.
+
+### Last PP stage (2026-11-10): `VLLM_SKIP_IDLE_STAGED_WRITES`
+
+The last stage's profile (321 busy samples per 20 s) showed `Sampler.apply_staged_writes` + `copy_to_uva`
+at ~9%: each decode step re-copied ~11 per-request arrays (temperature, top_k/top_p/min_p, seeds, logit
+bias, bad words, logprob ids) into the UVA ring although they only change in `add_request`.
+`VLLM_SKIP_IDLE_STAGED_WRITES=1` (`vllm/v1/worker/gpu/sample/sampler.py`) skips them until a request is added
+(the thinking-budget and trace-replay states keep their own guards). Last-stage samples: `apply_staged_writes`
+13 -> 0, `copy_to_uva` 14 -> 1, total busy 328 -> 273.
+Validation: unit tests; full run with both flags (87k prefill, mixed stress, decode, `check` mode: zero
+divergences); `scripts/sampling_semantics.py` (greedy repeatable, top_k=1 == greedy, same seed repeatable,
+temperature applied, different seed differs): all OK. Production config with both flags
+(`VLLM_SHARE_TOKEN_TO_REQ=1`, `VLLM_SKIP_IDLE_STAGED_WRITES=1`): decode C=1 median 55.0 tok/s (5 reps, was
+51.2 before the host-path work, same util/SEQS), C=8 21.2 tok/s/request (was 19.0); both inside boot noise
+individually but consistent with the CPU-sample reductions. Defaults: both on in `serve_best_ds41.sh`.
+Remaining on the last stage: the drafter attention metadata (~2.4 ms/step) and `sample_tokens`.
