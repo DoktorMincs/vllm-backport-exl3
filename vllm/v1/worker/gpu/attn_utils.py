@@ -261,12 +261,11 @@ def build_slot_mappings_by_layer(
 # repeat_interleave, a handful of tiny kernels plus Python) is identical for every KV
 # cache group of a step, but each group's CommonAttentionMetadata rebuilt it. Reuse the
 # first group's result. Default off (A/B first).
-_SHARE_TOKEN_TO_REQ = os.environ.get("VLLM_SHARE_TOKEN_TO_REQ", "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+_SHARE_MODE = os.environ.get("VLLM_SHARE_TOKEN_TO_REQ", "").strip().lower()
+_SHARE_TOKEN_TO_REQ = _SHARE_MODE in ("1", "true", "yes", "on", "check")
+# "check": also verify, with a device sync, that the shared map equals the one each group
+# would have built (skipped while capturing a CUDA graph). Validation runs only.
+_SHARE_CHECK = _SHARE_MODE == "check"
 
 
 def build_attn_metadata(
@@ -341,6 +340,16 @@ def build_attn_metadata(
 
         if _SHARE_TOKEN_TO_REQ and shared_token_to_req is not None:
             common_attn_metadata._token_to_req_indices_cache = shared_token_to_req
+            if _SHARE_CHECK and not torch.cuda.is_current_stream_capturing():
+                qlens = query_start_loc_gpu[1 : num_reqs + 1] - query_start_loc_gpu[:num_reqs]
+                ref = torch.repeat_interleave(
+                    torch.arange(num_reqs, dtype=torch.int32, device=qlens.device), qlens
+                )
+                got = shared_token_to_req[: ref.shape[0]]
+                assert torch.equal(ref, got), (
+                    "VLLM_SHARE_TOKEN_TO_REQ=check: shared token->request map differs "
+                    f"from the group's own at group {i}"
+                )
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
