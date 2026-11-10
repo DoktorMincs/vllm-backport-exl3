@@ -549,3 +549,11 @@ temperature applied, different seed differs): all OK. Production config with bot
 51.2 before the host-path work, same util/SEQS), C=8 21.2 tok/s/request (was 19.0); both inside boot noise
 individually but consistent with the CPU-sample reductions. Defaults: both on in `serve_best_ds41.sh`.
 Remaining on the last stage: the drafter attention metadata (~2.4 ms/step) and `sample_tokens`.
+
+## Fase A do último estágio (11/11): `VLLM_RAGGED_DIRECT` + `dummy_q` compartilhado
+- `VLLM_RAGGED_DIRECT=1` (default 1 em `serve_best_ds41.sh`): `DeepseekV4ROCMAiterSparseSWAMetadataBuilder.build` empacota os
+  índices ragged direto nos buffers persistentes do grafo (sem as 2 cópias D2D de `_copy_ragged_to_graph_buffers`).
+  `VLLM_SHARE_DUMMY_Q` (default 1) reaproveita o `dummy_q` zerado entre as camadas do drafter.
+- Medido: `sample_tokens` do último estágio 118→102 amostras, passos/22 s 280→302, greedy_gate OK contra
+  `dumps/base_tokens_mia_flags0.json`, PPL 28,40±0,17 (ruído), C=1 mediana 56,25 tok/s.
+- Fases B (metadata do drafter só-refresh), C (SWA em lote), D (contexto KV do drafter no grafo) ainda NÃO feitas.
