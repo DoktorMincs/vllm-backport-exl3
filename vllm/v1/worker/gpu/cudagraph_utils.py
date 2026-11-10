@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import itertools
+import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack
@@ -387,6 +388,19 @@ class CudaGraphManager:
                 ubatch_desc = self._maybe_ubatch_twin(desc)
                 if ubatch_desc is not None:
                     descs_by_mode[mixed_mode].append(ubatch_desc)
+
+        # VLLM_CUDAGRAPH_SKIP_PIECEWISE=1: do not capture the PIECEWISE (mixed /
+        # prefill) graphs; those batches dispatch eager. Only the FULL decode
+        # graphs remain. Frees part of the per-rank CUDA-graph pool (0.35-0.58
+        # GiB on the DS4.1 TP2xPP5 port) for KV. Default off: prefill speed
+        # with eager mixed batches has to be A/B-ed before this is enabled.
+        if os.environ.get("VLLM_CUDAGRAPH_SKIP_PIECEWISE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            descs_by_mode.pop(CUDAGraphMode.PIECEWISE, None)
 
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)

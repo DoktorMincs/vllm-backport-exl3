@@ -2335,6 +2335,53 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    if os.environ.get("VLLM_LOG_KV_GROUPS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        _log_kv_groups(kv_cache_config)
+
+
+def _log_kv_groups(kv_cache_config: KVCacheConfig) -> None:
+    """Diagnostic (VLLM_LOG_KV_GROUPS=1): bytes per block of every KV group.
+
+    Shows where the hybrid manager pays page padding: for each group the spec
+    type, block size, page size (padded and unpadded) and layer count, plus the
+    pool tensors. ``bytes/token`` is the pool cost of one token if the group
+    holds one block per ``block_size * tokens_per_state`` tokens of a request.
+    """
+    logger.info(
+        "KV groups: num_blocks=%s tensors=%d",
+        kv_cache_config.num_blocks,
+        len(kv_cache_config.kv_cache_tensors),
+    )
+    total = 0.0
+    for i, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        page = spec.page_size_bytes
+        real = getattr(spec, "real_page_size_bytes", page)
+        block = getattr(spec, "block_size", 0) or 1
+        n = len(group.layer_names)
+        per_token = n * page / (block * (getattr(spec, "tokens_per_state", 1) or 1))
+        total += per_token
+        logger.info(
+            "KV group %d: %s layers=%d block_size=%d page=%d real_page=%d "
+            "padding=%.1f%% tokens_per_state=%s bytes/token(group)=%.0f",
+            i,
+            type(spec).__name__,
+            n,
+            block,
+            page,
+            real,
+            100.0 * (page - real) / page if page else 0.0,
+            getattr(spec, "tokens_per_state", None),
+            per_token,
+        )
+    logger.info("KV groups: sum bytes/token over groups = %.0f", total)
+
+
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
