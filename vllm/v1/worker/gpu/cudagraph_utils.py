@@ -297,7 +297,9 @@ class CudaGraphManager:
         # os dois tamanhos.
         import os as _os
 
-        if _os.environ.get("VLLM_DSPARK_REST", "").strip():
+        if _os.environ.get("VLLM_DSPARK_REST", "").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        ):
             decode_query_lens = sorted(
                 {*decode_query_lens, 1, self.decode_query_len}
             )
@@ -305,7 +307,9 @@ class CudaGraphManager:
         # VLLM_DSPARK_CONF_CUT: o corte por confianca encurta a fila de tokens
         # verificados (k pode ir de 1 a N+1). Sem um grafo por comprimento o
         # dispatch cai em eager (7x mais lento), entao capturamos TODOS.
-        if _os.environ.get("VLLM_DSPARK_CONF_CUT", "").strip():
+        if _os.environ.get("VLLM_DSPARK_CONF_CUT", "").strip().lower() not in (
+            "", "0", "false", "no", "off"
+        ):
             decode_query_lens = list(
                 range(1, max(decode_query_lens) + 1)
             )

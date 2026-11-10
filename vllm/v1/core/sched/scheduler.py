@@ -275,9 +275,9 @@ class Scheduler(SchedulerInterface):
         # VLLM_DSPARK_REST: o drafter "descansa" um passo depois de uma
         # rodada em que nada foi aceito (regra do motor Maya,
         # ds4_main.cpp:1905). Sem a env nada muda.
-        self.dspark_rest_enabled = bool(
-            os.environ.get("VLLM_DSPARK_REST", "").strip()
-        )
+        self.dspark_rest_enabled = os.environ.get(
+            "VLLM_DSPARK_REST", ""
+        ).strip().lower() not in ("", "0", "false", "no", "off")
         self._dspark_rest_req_ids: set[str] = set()
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:

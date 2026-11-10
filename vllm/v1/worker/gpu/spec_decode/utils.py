@@ -19,7 +19,7 @@ def conf_cut_thresholds() -> tuple[float, float] | None:
     Sem a env (default) devolve None e nada muda.
     """
     raw = os.environ.get("VLLM_DSPARK_CONF_CUT", "").strip()
-    if not raw:
+    if raw.lower() in ("", "0", "false", "no", "off"):
         return None
     try:
         parts = [p for p in raw.replace(";", ",").split(",") if p.strip()]

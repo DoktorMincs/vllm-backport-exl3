@@ -275,9 +275,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # VLLM_DSPARK_REST: pular o drafter no passo seguinte a uma rodada
         # inteira sem aceite (regra do Maya). Alterna draft/descanso: o
         # descanso nunca se repete duas vezes seguidas.
-        self.dspark_rest_enabled = bool(
-            __import__("os").environ.get("VLLM_DSPARK_REST", "").strip()
-        )
+        self.dspark_rest_enabled = __import__("os").environ.get(
+            "VLLM_DSPARK_REST", ""
+        ).strip().lower() not in ("", "0", "false", "no", "off")
         self._dspark_rested_last = True
         self._dspark_skip_drafts = False
         self._dspark_had_spec = True

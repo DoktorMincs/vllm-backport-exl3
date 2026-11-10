@@ -100,9 +100,9 @@ class DSparkSpeculator(DFlashSpeculator):
         # "conf_min,cum_min". Precisa das confiancas mesmo com a verificacao
         # adaptativa desligada; o corte em si acontece no scheduler (via
         # DraftTokensHandler), nao aqui.
-        self.conf_cut_enabled = bool(
-            os.environ.get("VLLM_DSPARK_CONF_CUT", "").strip()
-        )
+        self.conf_cut_enabled = os.environ.get(
+            "VLLM_DSPARK_CONF_CUT", ""
+        ).strip().lower() not in ("", "0", "false", "no", "off")
         # As confiancas passam a ser calculadas sempre que o corte pedir.
         self._need_confidence = (
             self.enable_adaptive_verification or self.conf_cut_enabled
