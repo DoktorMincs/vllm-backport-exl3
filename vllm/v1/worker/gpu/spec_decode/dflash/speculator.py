@@ -37,6 +37,13 @@ from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
 
+# VLLM_DRAFT_CTX_IN_GRAPH=1: in pure-decode steps the drafter's context-KV work
+# (combine_hidden_states + copy + precompute_and_store_context_kv) is captured
+# inside the FULL drafter CUDA graph instead of running eagerly every step.
+_CTX_IN_GRAPH = os.environ.get("VLLM_DRAFT_CTX_IN_GRAPH", "0").lower() not in (
+    "", "0", "false", "no", "off",
+)
+
 
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
@@ -157,8 +164,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos.zero_()
         self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
+        self._setup_ctx_in_graph()
         self.query_cudagraph_manager.capture(
-            self._generate_draft,
+            self._graph_body if self._ctx_in_graph else self._generate_draft,
             self.input_buffers,
             self.block_tables,
             self.attn_groups,
@@ -166,6 +174,71 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_model_len,
             causal=self._group_causal,
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+        )
+
+    _ctx_in_graph: bool = False
+    _aux_static: torch.Tensor | None = None
+
+    def _setup_ctx_in_graph(self) -> None:
+        self._ctx_in_graph = False
+        if not _CTX_IN_GRAPH:
+            return
+        mgr = self.query_cudagraph_manager
+        inner = getattr(self.model, "model", None)
+        main_proj = getattr(inner, "main_proj", None)
+        if (
+            mgr is None
+            or mgr.cudagraph_mode == CUDAGraphMode.NONE
+            or main_proj is None
+            or os.environ.get("VLLM_DSPARK_TAPS_DUMP")
+            or envs.VLLM_M3_DEBUG_DRAFT
+        ):
+            logger.warning("VLLM_DRAFT_CTX_IN_GRAPH requested but not supported here")
+            return
+        self._ctx_per_req = self.num_speculative_steps + 1
+        rows = self._ctx_per_req * self.max_num_reqs
+        self._aux_static = torch.zeros(
+            rows, main_proj.input_size, dtype=self.hidden_states.dtype, device=self.device
+        )
+        # Capture/warmup runs execute the context insert for real: make every
+        # context row inert until prepare_dflash_inputs fills it.
+        self._context_slot_mappings.fill_(PAD_SLOT_ID)
+        self.context_positions.zero_()
+        self._ctx_in_graph = True
+        logger.info(
+            "VLLM_DRAFT_CTX_IN_GRAPH=1: drafter context KV captured in the FULL graph "
+            "(aux buffer %s)", tuple(self._aux_static.shape),
+        )
+
+    def _graph_body(
+        self,
+        num_reqs: int,
+        num_tokens_padded: int,
+        attn_metadata,
+        slot_mappings,
+        num_tokens_across_dp,
+        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+    ) -> None:
+        # Pure-decode context: the target verified (num_speculative_steps + 1)
+        # tokens per request, so the context has that many rows per request.
+        n = self._ctx_per_req * num_reqs
+        assert self._aux_static is not None
+        hs = self.model.combine_hidden_states(self._aux_static[:n])
+        self.hidden_states[:n].copy_(hs)
+        if self._layer_group_idx is not None:
+            slots = [self._context_slot_mappings[g][:n] for g in self._layer_group_idx]
+        else:
+            slots = self._context_slot_mappings[0][:n]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[:n], self.context_positions[:n], slots
+        )
+        self._generate_draft(
+            num_reqs,
+            num_tokens_padded,
+            attn_metadata,
+            slot_mappings,
+            num_tokens_across_dp,
+            cudagraph_runtime_mode,
         )
 
     def load_draft_model(
@@ -392,11 +465,60 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_seq_len + self.num_query_per_req, self.max_model_len
         )
 
+        batch_sync, num_batch_tokens = (
+            self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+            if dp_sync is not None
+            else (None, num_query_tokens)
+        )
+        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
+        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
+            self.query_cudagraph_manager,
+            num_reqs,
+            num_batch_tokens,
+            uniform_token_count=self.num_query_per_req,
+            dp_size=self.dp_size,
+            dp_rank=self.dp_rank,
+            need_eager=is_profile,
+            dp_sync=batch_sync,
+        )
+        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        num_tokens_padded = batch_desc.num_tokens
+        num_tokens_across_dp = (
+            batch_sync.num_tokens_across_dp if batch_sync is not None else None
+        )
+
+        use_ctx_graph = (
+            self._ctx_in_graph
+            and bool(aux_hidden_states)
+            and not dummy_run
+            and not is_profile
+            and batch_desc.cg_mode == CUDAGraphMode.FULL
+            and num_target_tokens == num_reqs * self._ctx_per_req
+            and self._ctx_per_req * num_reqs_padded <= self._aux_static.shape[0]
+            and sum(a.shape[-1] for a in aux_hidden_states)
+            == self._aux_static.shape[1]
+        )
+
         # NOTE: To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of input_ids and
         # hidden_states the same as the target model's. This means, we pad each
         # request's query length to include any rejected positions.
-        if aux_hidden_states:
+        if use_ctx_graph and not getattr(self, "_ctx_logged", False):
+            self._ctx_logged = True
+            logger.info(
+                "VLLM_DRAFT_CTX_IN_GRAPH: first pure-decode step uses graph ctx "
+                "(reqs=%d padded=%d ctx_rows=%d query_per_req=%d)",
+                num_reqs, num_reqs_padded, num_target_tokens, self.num_query_per_req,
+            )
+        if use_ctx_graph:
+            # combine + copy + context-KV insert run inside the replayed graph.
+            torch.cat(
+                [a[:num_target_tokens] for a in aux_hidden_states],
+                dim=-1,
+                out=self._aux_static[:num_target_tokens],
+            )
+            hidden_states = last_hidden_states
+        elif aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
                 torch.cat(aux_hidden_states, dim=-1)
             )
@@ -409,7 +531,10 @@ class DFlashSpeculator(DraftModelSpeculator):
             # oraculo do drafter (scripts/dspark_oracle.py) avaliar offline as
             # janelas de tap e conferir a matematica do bloco.
             self._dump_taps(aux_hidden_states, hidden_states, num_target_tokens)
-        self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+        if not use_ctx_graph:
+            self.hidden_states[:num_target_tokens].copy_(
+                hidden_states[:num_target_tokens]
+            )
 
         if dummy_run and skip_attn_for_dummy_run:
             # Memory profiling path: block_tables / kv_cache_config are not initialized.
@@ -468,6 +593,12 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
+        if use_ctx_graph and self._ctx_per_req * num_reqs_padded > num_target_tokens:
+            # Padded context rows replay stale aux data: make them write nothing.
+            n_pad = self._ctx_per_req * num_reqs_padded
+            self._context_slot_mappings[:, num_target_tokens:n_pad].fill_(PAD_SLOT_ID)
+            self.context_positions[num_target_tokens:n_pad].zero_()
+
         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
         # because the context shape varies per step. During dummy runs the block tables
         # are placeholders, so we skip the cache write to avoid clobbering real entries.
@@ -485,37 +616,17 @@ class DFlashSpeculator(DraftModelSpeculator):
         if envs.VLLM_M3_TIME_DRAFT:
             torch.cuda.synchronize()
             self._dbg_t0 = time.perf_counter()
-        self.model.precompute_and_store_context_kv(
-            self.hidden_states[:num_target_tokens],
-            self.context_positions[:num_target_tokens],
-            context_slots,
-        )
+        if not use_ctx_graph:
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
         if self._dbg_t0 is not None:
             torch.cuda.synchronize()
             self._dbg_t_ctx = time.perf_counter() - self._dbg_t0
             self._dbg_t0 = time.perf_counter()
 
-        batch_sync, num_batch_tokens = (
-            self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
-            if dp_sync is not None
-            else (None, num_query_tokens)
-        )
-        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
-            self.query_cudagraph_manager,
-            num_reqs,
-            num_batch_tokens,
-            uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
-            need_eager=is_profile,
-            dp_sync=batch_sync,
-        )
-        num_reqs_padded = batch_desc.num_reqs or num_reqs
-        num_tokens_padded = batch_desc.num_tokens
-        num_tokens_across_dp = (
-            batch_sync.num_tokens_across_dp if batch_sync is not None else None
-        )
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -542,6 +653,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         # so the real token count is num_query_tokens.
         self._prepare_eplb_forward(num_query_tokens)
 
+        if self._ctx_in_graph and not use_ctx_graph and (
+            batch_desc.cg_mode == CUDAGraphMode.FULL
+        ):
+            # The captured graph also contains the context insert. This step did
+            # its own (eager) insert above, so make the graph's insert inert.
+            self._context_slot_mappings[
+                :, : self._ctx_per_req * num_reqs_padded
+            ].fill_(PAD_SLOT_ID)
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             assert self.query_cudagraph_manager is not None
             self.query_cudagraph_manager.run_fullgraph(batch_desc)

@@ -568,3 +568,15 @@ Remaining on the last stage: the drafter attention metadata (~2.4 ms/step) and `
 - Medido: `greedy_gate` OK, PPL 28,42±0,06, C=1 mediana 60,8 tok/s; perfil py-spy 78,0→62,8 ms/passo,
   `build_attn_metadata` do último estágio 26,7%→16,7% das amostras. Default 1 em `serve_best_ds41.sh`.
 - Teste: `tests/v1/attention/test_batched_swa_decode.py`.
+
+## Fase D (11/11): `VLLM_DRAFT_CTX_IN_GRAPH`
+- Em passos pure-decode (`num_target_tokens == num_reqs * (N+1)`, descritor FULL) o contexto KV do drafter
+  (`combine_hidden_states` + cópia + `precompute_and_store_context_kv`) roda DENTRO do grafo FULL do drafter
+  (`DFlashSpeculator._graph_body`). `aux_hidden_states` vão por `torch.cat(out=)` para um buffer estático
+  (`_aux_static`, `(N+1)*max_num_reqs` linhas); linhas de padding do contexto ficam com PAD_SLOT_ID/posição 0.
+- Armadilha: o grafo agora SEMPRE contém o insert; em passos FULL que não são pure-decode o insert eager roda
+  antes e depois os slots de contexto são preenchidos com PAD para o replay não regravar KV com dados velhos
+  (sem isso a decodificação caiu a 16 tok/s e a aceitação desabou).
+- O `greedy_gate` NÃO detecta drafter quebrado (o alvo decide a saída): comparar aceitação
+  (`scripts/accept_rate.sh`, "Mean acceptance length" nos logs): 4,6996 vs 4,6997 no baseline.
+- Medido: gate OK, PPL 28,37±0,19, C=1 mediana 62,9 tok/s; grafo +0,0 GiB visível (0,28–0,39 GiB/rank como antes).
