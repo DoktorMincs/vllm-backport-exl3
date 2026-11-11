@@ -37,6 +37,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    rocm_sparse_attn_prefill_paged,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -410,6 +411,13 @@ _RAGGED_DIRECT = os.environ.get("VLLM_RAGGED_DIRECT", "0").lower() not in (
     "", "0", "false", "no", "off",
 )
 
+# VLLM_DS41_PAGED_PREFILL=1: stream prefill KV directly from paged fp8_ds_mla
+# caches instead of reserving and gathering a [chunk, M, 512] BF16 workspace
+# (~513 MiB/rank on PP2 at 512k context). Set to 0 for legacy gather path.
+_PAGED_PREFILL = os.environ.get("VLLM_DS41_PAGED_PREFILL", "1").lower() not in (
+    "", "0", "false", "no", "off",
+)
+
 
 @dataclass
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
@@ -688,6 +696,15 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             result = self.wo_b(zf)
         return result
 
+    def _use_paged_prefill(self) -> bool:
+        return (
+            _PAGED_PREFILL
+            and self.kv_cache_dtype == "fp8_ds_mla"
+            and self.head_dim == 512
+            and self.nope_head_dim == 448
+            and self.rope_head_dim == 64
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor,
@@ -706,20 +723,20 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # Warmup dummy run: no real metadata. Reserve the same bf16
-            # gather workspace _forward_prefill would; the dequantize / topk
-            # / sparse_fwd kernels are skipped this step.
-            swa_only = self.compress_ratio == 0
-            N = (
-                0
-                if swa_only
-                else (self.max_model_len + self.compress_ratio - 1)
-                // self.compress_ratio
-            )
-            M = N + self.window_size + self.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
+            # Warmup dummy run: no real metadata. Reserve the bf16 gather
+            # workspace only when the legacy gather prefill path is active.
+            if not self._use_paged_prefill():
+                swa_only = self.compress_ratio == 0
+                N = (
+                    0
+                    if swa_only
+                    else (self.max_model_len + self.compress_ratio - 1)
+                    // self.compress_ratio
+                )
+                M = N + self.window_size + self.max_num_batched_tokens
+                current_workspace_manager().get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                )
             output.zero_()
             return
 
@@ -884,6 +901,55 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         else:
             top_k = 0
             N = 0
+
+        if (
+            self._use_paged_prefill()
+            and swa_k_cache.dtype == torch.uint8
+            and (swa_only or (compressed_k_cache is not None and compressed_k_cache.dtype == torch.uint8))
+        ):
+            total_q = int(
+                query_start_loc_cpu[num_decodes + num_prefills] - prefill_token_base
+            )
+            if total_q <= 0:
+                return
+            rocm_sparse_attn_prefill_paged(
+                q=q[:total_q],
+                compressed_k_cache=None if swa_only else compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                topk_indices=None if swa_only else topk_indices[:total_q],
+                query_start_loc=query_start_loc[
+                    num_decodes : num_decodes + num_prefills + 1
+                ],
+                seq_lens=seq_lens[:num_prefills],
+                gather_lens=gather_lens[:num_prefills],
+                mla_block_table=(
+                    None
+                    if swa_only
+                    else attn_metadata.block_table[
+                        num_decodes : num_decodes + num_prefills
+                    ]
+                ),
+                mla_block_size=(
+                    1
+                    if swa_only
+                    else attn_metadata.block_size // self.compress_ratio
+                ),
+                swa_block_table=swa_metadata.block_table[
+                    num_decodes : num_decodes + num_prefills
+                ],
+                swa_block_size=swa_metadata.block_size,
+                scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+                attn_sink=self.attn_sink,
+                top_k=top_k,
+                compress_ratio=0 if swa_only else self.compress_ratio,
+                window_size=self.window_size,
+                output=output[:total_q],
+                swa_use_fnuz=current_platform.is_fp8_fnuz(),
+            )
+            return
 
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + self.PREFILL_CHUNK_SIZE - 1) // (

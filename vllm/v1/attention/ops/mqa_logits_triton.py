@@ -522,6 +522,7 @@ def fp8_mqa_logits_triton(
     cu_seqlen_ke: torch.Tensor,
     clean_logits: bool = True,
     k_bf16: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Triton implementation of DeepGEMM's fp8_mqa_logits.
 
@@ -535,6 +536,7 @@ def fp8_mqa_logits_triton(
             (indexer top-k reads only `[ks, ke)` per row). Matches DeepGEMM.
         k_bf16:       optional pre-decoded k_fp8.to(torch.bfloat16) hoisted
             across row chunks.
+        out:          optional pre-allocated [M, N] float32 output buffer.
     Returns:
         logits:       [M, N] float32
     """
@@ -546,6 +548,7 @@ def fp8_mqa_logits_triton(
         cu_seqlen_ke,
         _select_prefill_kv_group(q.shape[0], kv[0].shape[0]),
         k_bf16=k_bf16,
+        out=out,
     )
 
 
@@ -557,6 +560,7 @@ def _fp8_mqa_logits_triton_impl(
     cu_seqlen_ke: torch.Tensor,
     kv_group: int,
     k_bf16: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     k_fp8, k_scales = kv
     k_scales = k_scales.reshape(-1)
@@ -567,7 +571,11 @@ def _fp8_mqa_logits_triton_impl(
     # The grid covers every (m, n_block) and each tile stores its full row
     # span, so a -inf pre-fill would be entirely overwritten; `clean_logits`
     # is accepted for DeepGEMM signature parity only.
-    logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
+    if out is not None:
+        assert out.shape == (M, N) and out.dtype == torch.float32
+        logits = out
+    else:
+        logits = torch.empty((M, N), dtype=torch.float32, device=q.device)
 
     BLOCK_H = max(16, triton.next_power_of_2(num_heads))
     BLOCK_D = triton.next_power_of_2(head_dim)

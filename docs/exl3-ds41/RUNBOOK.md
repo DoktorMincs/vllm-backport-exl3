@@ -607,3 +607,20 @@ All changes are individually gated by env vars (`1` = enabled, `0` = legacy fall
 - **Decode:** `step_by_prompt` `66.30 -> 62.39` (Wave 1) `-> 58.85 ms/step` (`-11.2%`); `C=1` `70.7–76.6 tok/s` (peak `92.5`); `spec_bench C=8` `170.7` (`155.5` Wave 1) `-> 248.0 tok/s` median (`168.4` cold / `253.2` warm, `+45.3%` vs baseline, `+59.4%` vs Wave 1); 24 unseen `C=8` prompts `117.4 -> 162.3 tok/s` median (`+38.2%`).
 - **Long prefill (`201k` actual tokens, Vision ON):** `202.0 s (1,131 tok/s) -> 119.6–128.6 s (1,565–1,683 tok/s, +38%..+49%)`, zero OOM.
 
+## 512k Context + `deepseek_v41` Tool/Reasoning Parsers (11/11)
+
+1. **Zero-workspace paged FP8 sparse prefill (`VLLM_DS41_PAGED_PREFILL=1`, default `1`):**
+   - `rocm_sparse_attn_prefill_paged` / `_sparse_attn_prefill_paged_kernel` (`rocm_aiter_mla_sparse.py` + `models/deepseek_v4_1/amd/rocm.py`): streams `fp8_ds_mla` (`584 B/slot`: `448 B` FP8 NoPE + `8×e8m0` scales + `64 B` BF16 RoPE) directly from paged MLA + SWA KV caches via `topk_indices` and `block_table`, eliminating the `[chunk, M, 512]` BF16 gather workspace (`513.2 MiB/rank` on `PP2` at `512k` -> `0 B`, `1.68x` faster prefill attention at `256k`, `max_abs_diff = 0.0156`).
+2. **Zero-fragmentation `WorkspaceManager` indexer buffers (`VLLM_DS41_REUSE_INDEXER_BUFS=1`, `VLLM_DSV4_LOGITS_MAX_MB=32`):**
+   - `_triton_prefill_workspace_specs` (`sparse_attn_indexer.py`) + `out: torch.Tensor | None = None` (`mqa_logits_triton.py`): pre-locks both `_hoisted_k_bf16` (`64 MiB` on `PP2` / `128 MiB` on `PP1` / `1 MiB` on candidate-consumer stages `PP3/PP4`) and `logits` (`32 MiB` `float32`) inside `WorkspaceManager.get_simultaneous`, eliminating `100%` of step-growing allocations across ~490 chunked-prefill steps (`delta_alloc = 0 B`, avoiding `120.6 MiB` of PyTorch caching-allocator fragmentation) while preserving full hoisted-`k_bf16` Tensor Core throughput.
+   - Keeps the `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` (`512 MiB`) transient active during `profile_run` so KV cache sizing reserves headroom for subsequent piecewise CUDA graph capture (`0.31–0.46 GiB/GPU`).
+3. **Tool calling, reasoning parser & OpenAI `reasoning_effort` compatibility:**
+   - Launch with `--tool-call-parser deepseek_v41 --enable-auto-tool-choice --reasoning-parser deepseek_v41`.
+   - `VLLM_DS41_ALLOW_OPENAI_EFFORT=1` (`tokenizers/deepseek_v41.py`): maps `"minimal" -> "low"` (`25`) and `"medium" -> "high"` (`50`, DS4.1 native default) so standard OpenAI/Anthropic clients sending `reasoning_effort="medium"` do not trigger HTTP 400, while keeping native `"none"`, `"low"`, `"high"`, `"xhigh"`, `"max"`, and integer `1..100` unchanged.
+
+**Validated (`10× RTX 3090`, `TP=2 × PP=5`, `8,8,10,8,6`, `UTIL=0.968`, `VLLM_MAX_MODEL_LEN_CAP=524288`, Vision `image:4` + DSpark `N=5`):**
+- **KV pool:** `574,853` tokens (`1.10x` concurrency at `524,288`), `481–487 MiB` free VRAM on `PP2` after CUDA graph capture (`0.45–0.46 GiB`).
+- **512k cold prefill + needle recall:** `514,936` prompt tokens (`98.2%` of `524,288`) in `359.1 s` (`1,434 tok/s`), `100%` exact needle retrieval, `49–53 MiB` free VRAM floor on `PP2`, zero OOM.
+- **Decode & parsers:** `C=1` `74.1 tok/s`; streaming + multi-turn tool calls, `reasoning_content` extraction, and Vision `image_url` all pass.
+
+

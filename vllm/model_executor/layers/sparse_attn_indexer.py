@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -342,6 +344,55 @@ def _gather_workspace_shapes(
     )
 
 
+def _triton_prefill_workspace_specs(
+    total_seq_lens: int,
+    head_dim: int,
+    use_fp4_cache: bool,
+    dcp_world_size: int,
+    candidate_blocks: torch.Tensor | None,
+    candidate_block_size: int,
+    candidate_write: bool,
+) -> tuple[tuple[tuple[int, int], torch.dtype], tuple[tuple[int], torch.dtype]] | None:
+    """Return ((k_bf16_shape, bf16), (logits_shape, fp32)) workspace specs for
+    the row-chunked SM80/SM86 Triton prefill indexer path, or None when inactive.
+
+    Pre-locking both `_hoisted_k_bf16` and `logits` inside `WorkspaceManager`
+    eliminates step-growing allocations across chunked 512k prefills (avoiding
+    ~120+ MiB of PyTorch caching-allocator fragmentation) and ensures memory
+    profiling reserves their exact peak upfront.
+    """
+    if (
+        os.environ.get("VLLM_DS41_REUSE_INDEXER_BUFS", "1") == "0"
+        or use_fp4_cache
+        or dcp_world_size > 1
+        or envs.VLLM_DSV4_LOGITS_ROW_CHUNK <= 0
+        or not current_platform.is_cuda()
+        or is_deep_gemm_supported()
+    ):
+        return None
+    max_full_n = total_seq_lens
+    if (
+        candidate_blocks is not None
+        and not candidate_write
+        and candidate_block_size > 0
+        and os.environ.get("VLLM_DSV41_CAND_LOGITS", "1") != "0"
+    ):
+        max_full_n = min(max_full_n, candidate_blocks.shape[1] * candidate_block_size)
+    max_logits_mb = int(os.environ.get("VLLM_DSV4_LOGITS_MAX_MB", "64"))
+    min_row_step = min(16, envs.VLLM_DSV4_LOGITS_ROW_CHUNK)
+    if max_logits_mb > 0:
+        logits_elems = max(
+            (max_logits_mb * 1024 * 1024) // 4,
+            min_row_step * max_full_n,
+        )
+    else:
+        logits_elems = envs.VLLM_DSV4_LOGITS_ROW_CHUNK * max_full_n
+    return (
+        ((max_full_n, head_dim), torch.bfloat16),
+        ((logits_elems,), torch.float32),
+    )
+
+
 def kv_cache_as_quant_view(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -448,14 +499,34 @@ def sparse_attn_indexer(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        current_workspace_manager().get_simultaneous(
-            values_spec,
-            scales_spec,
-            ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+        extra_specs = _triton_prefill_workspace_specs(
+            total_seq_lens,
+            head_dim,
+            use_fp4_cache,
+            dcp_world_size,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
         )
+        if extra_specs is not None:
+            current_workspace_manager().get_simultaneous(
+                values_spec,
+                scales_spec,
+                extra_specs[0],
+                extra_specs[1],
+                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            )
+        else:
+            current_workspace_manager().get_simultaneous(
+                values_spec,
+                scales_spec,
+                ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),
+            )
 
-        # Dummy allocation to simulate for peak logits tensor memory during inference.
-        # FP8 elements so elements == bytes
+        # Keep the profiling cushion active even when extra_specs are locked in
+        # WorkspaceManager: KV cache is sized BEFORE piecewise CUDA graph capture
+        # (~0.45 GiB on PP2), so this transient reserves headroom for graph pools
+        # and eager activations.
         max_logits_elems = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
         _ = torch.empty(
             max_logits_elems, dtype=torch.uint8, device=hidden_states.device
@@ -570,10 +641,31 @@ def sparse_attn_indexer(
         values_spec, scales_spec = _gather_workspace_shapes(
             total_seq_lens, head_dim, fp8_dtype, use_fp4_cache
         )
-        k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
-            values_spec,
-            scales_spec,
+        extra_specs = _triton_prefill_workspace_specs(
+            total_seq_lens,
+            head_dim,
+            use_fp4_cache,
+            dcp_world_size,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
         )
+        if extra_specs is not None:
+            k_quant_full, k_scale_full, k_bf16_ws, logits_ws = (
+                workspace_manager.get_simultaneous(
+                    values_spec,
+                    scales_spec,
+                    extra_specs[0],
+                    extra_specs[1],
+                )
+            )
+        else:
+            k_quant_full, k_scale_full = workspace_manager.get_simultaneous(
+                values_spec,
+                scales_spec,
+            )
+            k_bf16_ws = None
+            logits_ws = None
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
@@ -665,14 +757,33 @@ def sparse_attn_indexer(
                     # so process them in fixed-size row blocks and drop each
                     # block's logits immediately.
                     row_step = envs.VLLM_DSV4_LOGITS_ROW_CHUNK
-                    num_rows = q_slice_cast.shape[0]
-                    _hoisted_k_bf16 = (
-                        k_quant_cast.to(torch.bfloat16)
-                        if num_rows > row_step
-                        else None
+                    max_logits_mb = int(
+                        os.environ.get("VLLM_DSV4_LOGITS_MAX_MB", "64")
                     )
+                    n_cols = k_quant_cast.shape[0]
+                    if max_logits_mb > 0 and n_cols > 0:
+                        max_rows_for_mb = max(
+                            16,
+                            (max_logits_mb * 1024 * 1024) // (n_cols * 4),
+                        )
+                        row_step = min(row_step, max_rows_for_mb)
+                    num_rows = q_slice_cast.shape[0]
+                    if k_bf16_ws is not None and n_cols <= k_bf16_ws.shape[0]:
+                        _hoisted_k_bf16 = k_bf16_ws[:n_cols]
+                        _hoisted_k_bf16.copy_(k_quant_cast)
+                    elif num_rows > row_step:
+                        _hoisted_k_bf16 = k_quant_cast.to(torch.bfloat16)
+                    else:
+                        _hoisted_k_bf16 = None
                     for r0 in range(0, num_rows, row_step):
                         r1 = min(r0 + row_step, num_rows)
+                        m_cur = r1 - r0
+                        logits_out = (
+                            logits_ws[: m_cur * n_cols].view(m_cur, n_cols)
+                            if logits_ws is not None
+                            and m_cur * n_cols <= logits_ws.numel()
+                            else None
+                        )
                         logits = fp8_mqa_logits_triton(
                             q_slice_cast[r0:r1],
                             (k_quant_cast, k_scale_cast),
@@ -681,6 +792,7 @@ def sparse_attn_indexer(
                             cu_seqlen_ke[r0:r1],
                             clean_logits=False,
                             k_bf16=_hoisted_k_bf16,
+                            out=logits_out,
                         )
                         _apply_prefill_candidates(
                             logits,
@@ -697,7 +809,7 @@ def sparse_attn_indexer(
                             cu_seqlen_ks[r0:r1],
                             cu_seqlen_ke[r0:r1],
                             topk_indices[r0:r1],
-                            r1 - r0,
+                            m_cur,
                             logits.stride(0),
                             logits.stride(1),
                             topk_tokens,

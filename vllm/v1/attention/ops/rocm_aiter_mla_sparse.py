@@ -4300,3 +4300,441 @@ def rocm_sparse_attn_decode(
     )
     if direct_out is None:
         output.copy_(attn_out.to(output.dtype))
+
+
+@triton.jit
+def _decode_e8m0_scales_bf16_paged(encoded_scales):
+    bits = (encoded_scales.to(tl.uint16) & 0xFF) << 7
+    return tl.where(encoded_scales == 0, 0, bits).to(tl.bfloat16, bitcast=True)
+
+
+@triton.jit
+def _load_dequant_ds_mla_kv_2x256(
+    token_data_ptr,
+    token_scale_ptr,
+    valid,
+    d0,
+    d1,
+    nope1_mask,
+    rope1_offsets,
+    scale_offs4,
+    USE_FNUZ: tl.constexpr,
+    fp8_lut_ptr,
+    BLOCK_K: tl.constexpr,
+):
+    enc0 = tl.load(
+        token_scale_ptr[:, None] + scale_offs4[None, :],
+        mask=valid[:, None],
+        other=127,
+    )
+    sc0 = _decode_e8m0_scales_bf16_paged(enc0)
+    sc0_256 = tl.reshape(
+        tl.broadcast_to(sc0[:, :, None], (BLOCK_K, 4, 64)),
+        (BLOCK_K, 256),
+    )
+    x0 = tl.load(
+        token_data_ptr[:, None] + d0[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    k_vals0 = _decode_fp8_lut(x0, USE_FNUZ, fp8_lut_ptr)
+    kv0 = (k_vals0.to(tl.float32) * sc0_256.to(tl.float32)).to(tl.bfloat16)
+    kv0 = tl.where(valid[:, None], kv0, 0.0).to(tl.bfloat16)
+
+    enc1 = tl.load(
+        token_scale_ptr[:, None] + 4 + scale_offs4[None, :],
+        mask=valid[:, None],
+        other=127,
+    )
+    sc1 = _decode_e8m0_scales_bf16_paged(enc1)
+    sc1_256 = tl.reshape(
+        tl.broadcast_to(sc1[:, :, None], (BLOCK_K, 4, 64)),
+        (BLOCK_K, 256),
+    )
+    x1 = tl.load(
+        token_data_ptr[:, None] + d1[None, :],
+        mask=valid[:, None] & nope1_mask[None, :],
+        other=0,
+    )
+    k_vals1 = _decode_fp8_lut(x1, USE_FNUZ, fp8_lut_ptr)
+    k_nope1 = (k_vals1.to(tl.float32) * sc1_256.to(tl.float32)).to(tl.bfloat16)
+    rope_ptr = (token_data_ptr + 448).to(tl.pointer_type(tl.bfloat16))
+    k_rope1 = tl.load(
+        rope_ptr[:, None] + rope1_offsets[None, :],
+        mask=valid[:, None] & (~nope1_mask)[None, :],
+        other=0.0,
+    )
+    kv1 = tl.where(nope1_mask[None, :], k_nope1, k_rope1)
+    kv1 = tl.where(valid[:, None], kv1, 0.0).to(tl.bfloat16)
+    return kv0, kv1
+
+
+@triton.jit
+def _sparse_attn_prefill_paged_kernel(
+    q_ptr,
+    mla_cache_ptr,
+    swa_cache_ptr,
+    topk_indices_ptr,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    mla_block_table_ptr,
+    swa_block_table_ptr,
+    attn_sink_ptr,
+    fp8_lut_ptr,
+    out_ptr,
+    q_stride_t,
+    q_stride_h,
+    q_stride_d,
+    mla_cache_stride0,
+    swa_cache_stride0,
+    topk_stride0,
+    mla_bt_stride0,
+    swa_bt_stride0,
+    out_stride_t,
+    out_stride_h,
+    out_stride_d,
+    num_heads,
+    num_reqs,
+    top_k,
+    scale,
+    HAS_MLA: tl.constexpr,
+    HAS_ATTN_SINK: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    MLA_BLOCK_SIZE: tl.constexpr,
+    SWA_BLOCK_SIZE: tl.constexpr,
+    SWA_IS_FNUZ: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    EXACT_TILE: tl.constexpr = False,
+):
+    query_idx = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    head_mask = head_offsets < num_heads
+    d0 = tl.arange(0, 256)
+    d1 = 256 + tl.arange(0, 256)
+    nope1_mask = d1 < 448
+    rope1_offsets = tl.maximum(d1 - 448, 0)
+    scale_offs4 = tl.arange(0, 4)
+
+    q_row_ptr = q_ptr + query_idx * q_stride_t + head_offsets[:, None] * q_stride_h
+    if EXACT_TILE:
+        q0 = tl.load(q_row_ptr + d0[None, :] * q_stride_d)
+        q1 = tl.load(q_row_ptr + d1[None, :] * q_stride_d)
+    else:
+        q0 = tl.load(
+            q_row_ptr + d0[None, :] * q_stride_d,
+            mask=head_mask[:, None],
+            other=0.0,
+        )
+        q1 = tl.load(
+            q_row_ptr + d1[None, :] * q_stride_d,
+            mask=head_mask[:, None],
+            other=0.0,
+        )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc0 = tl.zeros((BLOCK_H, 256), dtype=tl.float32)
+    acc1 = tl.zeros((BLOCK_H, 256), dtype=tl.float32)
+
+    base_q = tl.load(query_start_loc_ptr)
+    lo = 0
+    hi = num_reqs - 1
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        mid_q = tl.load(query_start_loc_ptr + mid) - base_q
+        if mid_q <= query_idx:
+            lo = mid
+        else:
+            hi = mid - 1
+    req_idx = lo
+
+    q_start = tl.load(query_start_loc_ptr + req_idx) - base_q
+    q_end = tl.load(query_start_loc_ptr + req_idx + 1) - base_q
+    query_len = q_end - q_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    gather_len = tl.load(gather_lens_ptr + req_idx)
+    pos = (seq_len - query_len) + (query_idx - q_start)
+    gather_start = seq_len - gather_len
+
+    k_offsets = tl.arange(0, BLOCK_K)
+
+    if HAS_MLA:
+        mla_seq_len = seq_len // COMPRESS_RATIO
+        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, top_k)
+        topk_len = tl.maximum(topk_len, 0)
+        mla_bt_row_ptr = mla_block_table_ptr + req_idx.to(tl.int64) * mla_bt_stride0
+        topk_row_ptr = topk_indices_ptr + query_idx.to(tl.int64) * topk_stride0
+
+        for k_start in tl.range(0, topk_len, BLOCK_K):
+            k_pos = k_start + k_offsets
+            in_range = k_pos < topk_len
+            local_idx = tl.load(topk_row_ptr + k_pos, mask=in_range, other=-1)
+            valid = in_range & (local_idx >= 0) & (local_idx < mla_seq_len)
+            safe_idx = tl.where(valid, local_idx, 0)
+
+            block_in_seq = safe_idx // MLA_BLOCK_SIZE
+            pos_in_block = safe_idx % MLA_BLOCK_SIZE
+            phys_block = tl.load(mla_bt_row_ptr + block_in_seq, mask=valid, other=0)
+            cache_block_ptr = (
+                mla_cache_ptr + phys_block.to(tl.int64) * mla_cache_stride0
+            )
+            token_data_ptr = cache_block_ptr + pos_in_block * 576
+            token_scale_ptr = cache_block_ptr + (MLA_BLOCK_SIZE * 576) + pos_in_block * 8
+
+            kv0, kv1 = _load_dequant_ds_mla_kv_2x256(
+                token_data_ptr,
+                token_scale_ptr,
+                valid,
+                d0,
+                d1,
+                nope1_mask,
+                rope1_offsets,
+                scale_offs4,
+                False,
+                fp8_lut_ptr,
+                BLOCK_K,
+            )
+
+            scores = (tl.dot(q0, tl.trans(kv0)) + tl.dot(q1, tl.trans(kv1))) * scale
+            if EXACT_TILE:  # noqa: SIM108
+                keep = valid[None, :]
+            else:
+                keep = head_mask[:, None] & valid[None, :]
+            scores = tl.where(keep, scores, neg_large)
+
+            m_block = tl.max(scores, axis=1)
+            m_new = tl.maximum(m_i, m_block)
+            alpha = tl.exp(m_i - m_new)
+            p = tl.exp(scores - m_new[:, None])
+            p = tl.where(keep, p, 0.0)
+            l_new = l_i * alpha + tl.sum(p, axis=1)
+
+            p_bf16 = p.to(tl.bfloat16)
+            acc0 = acc0 * alpha[:, None] + tl.dot(p_bf16, kv0)
+            acc1 = acc1 * alpha[:, None] + tl.dot(p_bf16, kv1)
+            m_i = m_new
+            l_i = l_new
+
+    swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+    swa_len = tl.maximum(swa_len, 0)
+    swa_start_pos = pos - swa_len + 1
+    swa_bt_row_ptr = swa_block_table_ptr + req_idx.to(tl.int64) * swa_bt_stride0
+
+    for k_start in tl.range(0, swa_len, BLOCK_K):
+        k_pos = k_start + k_offsets
+        in_range = k_pos < swa_len
+        swa_pos = swa_start_pos + k_pos
+        valid = in_range & (swa_pos >= gather_start) & (swa_pos < seq_len)
+        safe_pos = tl.where(valid, swa_pos, 0)
+
+        block_in_seq = safe_pos // SWA_BLOCK_SIZE
+        pos_in_block = safe_pos % SWA_BLOCK_SIZE
+        phys_block = tl.load(swa_bt_row_ptr + block_in_seq, mask=valid, other=0)
+        cache_block_ptr = swa_cache_ptr + phys_block.to(tl.int64) * swa_cache_stride0
+        token_data_ptr = cache_block_ptr + pos_in_block * 576
+        token_scale_ptr = cache_block_ptr + (SWA_BLOCK_SIZE * 576) + pos_in_block * 8
+
+        kv0, kv1 = _load_dequant_ds_mla_kv_2x256(
+            token_data_ptr,
+            token_scale_ptr,
+            valid,
+            d0,
+            d1,
+            nope1_mask,
+            rope1_offsets,
+            scale_offs4,
+            SWA_IS_FNUZ,
+            fp8_lut_ptr,
+            BLOCK_K,
+        )
+
+        scores = (tl.dot(q0, tl.trans(kv0)) + tl.dot(q1, tl.trans(kv1))) * scale
+        if EXACT_TILE:  # noqa: SIM108
+            keep = valid[None, :]
+        else:
+            keep = head_mask[:, None] & valid[None, :]
+        scores = tl.where(keep, scores, neg_large)
+
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(keep, p, 0.0)
+        l_new = l_i * alpha + tl.sum(p, axis=1)
+
+        p_bf16 = p.to(tl.bfloat16)
+        acc0 = acc0 * alpha[:, None] + tl.dot(p_bf16, kv0)
+        acc1 = acc1 * alpha[:, None] + tl.dot(p_bf16, kv1)
+        m_i = m_new
+        l_i = l_new
+
+    if HAS_ATTN_SINK:
+        if EXACT_TILE:
+            sink = tl.load(attn_sink_ptr + head_offsets).to(tl.float32)
+        else:
+            sink = tl.load(
+                attn_sink_ptr + head_offsets, mask=head_mask, other=neg_large
+            ).to(tl.float32)
+        m_final = tl.maximum(m_i, sink)
+        alpha = tl.exp(m_i - m_final)
+        l_final = l_i * alpha + tl.exp(sink - m_final)
+        denom = tl.maximum(l_final, 1.0e-30)
+        out0 = tl.where(
+            l_final[:, None] > 0.0,
+            (acc0 * alpha[:, None]) / denom[:, None],
+            0.0,
+        )
+        out1 = tl.where(
+            l_final[:, None] > 0.0,
+            (acc1 * alpha[:, None]) / denom[:, None],
+            0.0,
+        )
+    else:
+        denom = tl.maximum(l_i, 1.0e-30)
+        out0 = tl.where(l_i[:, None] > 0.0, acc0 / denom[:, None], 0.0)
+        out1 = tl.where(l_i[:, None] > 0.0, acc1 / denom[:, None], 0.0)
+
+    out_row_ptr = (
+        out_ptr + query_idx * out_stride_t + head_offsets[:, None] * out_stride_h
+    )
+    if EXACT_TILE:
+        tl.store(out_row_ptr + d0[None, :] * out_stride_d, out0)
+        tl.store(out_row_ptr + d1[None, :] * out_stride_d, out1)
+    else:
+        tl.store(
+            out_row_ptr + d0[None, :] * out_stride_d,
+            out0,
+            mask=head_mask[:, None],
+        )
+        tl.store(
+            out_row_ptr + d1[None, :] * out_stride_d,
+            out1,
+            mask=head_mask[:, None],
+        )
+
+
+def rocm_sparse_attn_prefill_paged(
+    q: torch.Tensor,
+    compressed_k_cache: torch.Tensor | None,
+    swa_k_cache: torch.Tensor,
+    topk_indices: torch.Tensor | None,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    mla_block_table: torch.Tensor | None,
+    mla_block_size: int,
+    swa_block_table: torch.Tensor,
+    swa_block_size: int,
+    scale: float,
+    head_dim: int,
+    nope_head_dim: int,
+    rope_head_dim: int,
+    attn_sink: torch.Tensor | None,
+    top_k: int,
+    compress_ratio: int,
+    window_size: int,
+    output: torch.Tensor,
+    swa_use_fnuz: bool = False,
+) -> None:
+    """Zero-workspace paged FP8 sparse prefill for DeepSeek-V4.1 (`fp8_ds_mla`)."""
+    assert swa_k_cache.dtype == torch.uint8, (
+        "rocm_sparse_attn_prefill_paged expects uint8 fp8_ds_mla SWA cache, "
+        f"got {swa_k_cache.dtype}"
+    )
+    _validate_dsv4_sparse_dims(
+        head_dim,
+        nope_head_dim,
+        rope_head_dim,
+        "rocm_sparse_attn_prefill_paged",
+    )
+    num_queries, num_heads, _ = q.shape
+    num_reqs = int(seq_lens.shape[0])
+    if num_queries == 0 or num_reqs == 0:
+        return
+
+    has_mla = compress_ratio > 0 and top_k > 0
+    if has_mla:
+        assert compressed_k_cache is not None
+        assert compressed_k_cache.dtype == torch.uint8, (
+            "rocm_sparse_attn_prefill_paged expects uint8 fp8_ds_mla MLA cache, "
+            f"got {compressed_k_cache.dtype}"
+        )
+        assert topk_indices is not None
+        assert mla_block_table is not None
+        topk_2d = topk_indices.reshape(topk_indices.shape[0], -1)
+        effective_top_k = min(int(top_k), int(topk_2d.shape[1]))
+    else:
+        compressed_k_cache = swa_k_cache
+        topk_2d = swa_block_table
+        mla_block_table = swa_block_table
+        mla_block_size = 1
+        effective_top_k = 0
+
+    has_attn_sink = attn_sink is not None
+    if attn_sink is None:
+        sink_buf = torch.empty(1, device=q.device, dtype=torch.float32)
+    else:
+        sink_buf = attn_sink[:num_heads].contiguous()
+
+    fp8_lut = get_e4m3fn_bf16_lut(q.device)
+
+    write_in_place = (
+        output.dtype == torch.bfloat16
+        and output.shape == q.shape
+        and output.data_ptr() != q.data_ptr()
+    )
+    out_buf = output if write_in_place else torch.empty_like(q, dtype=torch.bfloat16)
+
+    block_h = _prefill_block_h(num_heads)
+    block_k = _prefill_block_k(head_dim)
+    exact_tile = envs.VLLM_SPARSE_PREFILL_EXACT_TILE and num_heads == block_h
+
+    _sparse_attn_prefill_paged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
+        q,
+        compressed_k_cache,
+        swa_k_cache,
+        topk_2d,
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        mla_block_table,
+        swa_block_table,
+        sink_buf,
+        fp8_lut,
+        out_buf,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        compressed_k_cache.stride(0),
+        swa_k_cache.stride(0),
+        topk_2d.stride(0),
+        mla_block_table.stride(0),
+        swa_block_table.stride(0),
+        out_buf.stride(0),
+        out_buf.stride(1),
+        out_buf.stride(2),
+        num_heads,
+        num_reqs,
+        effective_top_k,
+        float(scale),
+        HAS_MLA=has_mla,
+        HAS_ATTN_SINK=has_attn_sink,
+        COMPRESS_RATIO=int(compress_ratio) if has_mla else 1,
+        WINDOW_SIZE=int(window_size),
+        MLA_BLOCK_SIZE=int(mla_block_size),
+        SWA_BLOCK_SIZE=int(swa_block_size),
+        SWA_IS_FNUZ=bool(swa_use_fnuz),
+        BLOCK_H=block_h,
+        BLOCK_K=block_k,
+        EXACT_TILE=exact_tile,
+        num_warps=4,
+    )
+    if not write_in_place:
+        output.copy_(out_buf.to(output.dtype))
+
