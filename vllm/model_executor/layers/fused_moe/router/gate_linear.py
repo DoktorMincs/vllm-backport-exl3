@@ -208,7 +208,7 @@ class GateLinear(ReplicatedLinear):
         if (
             not self.allow_specialized_router_gemm
             and self._router_gemm_no_bias
-            and self.weight.dtype == torch.bfloat16
+            and self.weight.dtype in (torch.bfloat16, torch.float32)
             and should_use_triton_gemv(x, self.weight)
         ):
             return bf16_gemv(x, self.weight, self.out_dtype), None

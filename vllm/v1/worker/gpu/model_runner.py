@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -492,6 +493,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                 )
+            if self.speculator is not None:
+                self.speculator._sampler = self.sampler
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
@@ -2065,7 +2068,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self._dspark_skip_drafts = False
-        if self.speculator is not None and self.dspark_rest_enabled:
+        if (
+            self.speculator is not None
+            and input_batch.has_prefill
+            and input_batch.num_reqs > 0
+            and os.environ.get("VLLM_SKIP_PREFILL_PROPOSE", "1") != "0"
+        ):
+            _post_prefill = (
+                input_batch.num_computed_prefill_tokens_np
+                + input_batch.num_scheduled_tokens
+            )
+            _rem_prefill = input_batch.prefill_len_np - _post_prefill
+            if bool(np.all(_rem_prefill >= 512)):
+                self._dspark_skip_drafts = True
+        if self.speculator is not None and self.dspark_rest_enabled and not self._dspark_skip_drafts:
             # Descansa so' quando o passo anterior draftou e este nao tem
             # draft agendado (o scheduler cortou por nada aceito).
             if not self._dspark_had_spec:

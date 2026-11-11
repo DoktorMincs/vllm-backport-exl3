@@ -78,7 +78,7 @@ def should_use_triton_gemv(x: torch.Tensor, weight: torch.Tensor) -> bool:
     return (
         current_platform.is_cuda()
         and x.dtype == torch.bfloat16
-        and weight.dtype == torch.bfloat16
+        and weight.dtype in (torch.bfloat16, torch.float32)
         and x.ndim == 2
         and weight.ndim == 2
         and x.shape[0] <= MAX_GEMV_TOKENS

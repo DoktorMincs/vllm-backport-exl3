@@ -120,6 +120,17 @@ except ValueError as _e:  # bad value: fall back to the built-in formula
 _ENGRAM_THREAD_FLOOR = _env_flag("VLLM_DS41_ENGRAM_THREAD_FLOOR")
 """3.4: cap the reader threads at 2 when a lookup stages fewer than 256 rows."""
 
+_ENGRAM_FAST_GATHER = _env_flag("VLLM_DS41_ENGRAM_FAST_GATHER")
+"""Wave 3 (DEC-4): persistent C pthread pool + striped direct-mapped row cache
++ stream-ordered pinned D2H/H2D on current_stream (0 = legacy path)."""
+
+try:
+    _ENGRAM_CACHE_POW2 = max(
+        12, min(20, int(os.environ.get("VLLM_DS41_ENGRAM_CACHE_POW2", "17")))
+    )
+except ValueError:
+    _ENGRAM_CACHE_POW2 = 17
+
 
 class _EngramTimer:
     """Opt-in (``VLLM_DS41_ENGRAM_TIME=1``) decomposition of the engram cost.
@@ -788,6 +799,8 @@ def _hf_engram_prefix(prefix: str) -> str:
 _ENGRAM_PREAD_C = r"""
 #include <pthread.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 typedef struct {
@@ -841,6 +854,376 @@ int64_t engram_gather(int fd_w, int fd_s, int64_t base_w, int64_t base_s,
     }
     return bad;
 }
+
+/* --- Persistent pthread pool + striped direct-mapped row cache (DEC-4) --- */
+#define ENGRAM_CACHE_STRIPES 256
+
+typedef struct engram_pool_s engram_pool_t;
+
+typedef struct {
+    engram_pool_t *pool;
+    int tid;
+    uint64_t target_epoch;
+    pthread_cond_t cv;
+} pool_worker_arg_t;
+
+struct engram_pool_s {
+    pid_t owner_pid;
+    int num_threads;
+    int dim, sdim;
+    int cache_pow2;
+    uint64_t cache_slots;
+    int64_t *cache_tags;
+    uint8_t *cache_vals;
+    uint8_t *cache_scales;
+    pthread_mutex_t stripe_mu[ENGRAM_CACHE_STRIPES];
+
+    /* Deduplication hash table + scratch */
+    uint64_t ht_size;
+    uint64_t ht_mask;
+    uint32_t ht_cur_gen;
+    uint32_t *ht_gen;
+    int64_t *ht_key;
+    int32_t *ht_val;
+    int64_t max_cap;
+    int64_t *uniq_buf;
+    int32_t *miss_idx;
+
+    /* Work dispatch */
+    pthread_mutex_t mu;
+    pthread_cond_t cv_done;
+    uint64_t work_epoch;
+    int stop;
+    int active_threads;
+    int remaining;
+    int fd_w, fd_s;
+    int64_t base_w, base_s;
+    int64_t n_miss;
+    uint8_t *vals;
+    uint8_t *scales;
+    int64_t short_reads;
+
+    pthread_t *tids;
+    pool_worker_arg_t *wargs;
+};
+
+static inline uint64_t engram_hash64(uint64_t x) {
+    return x * 11400714819323198485ULL;
+}
+
+static int cmp_i64(const void *a, const void *b) {
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static inline void read_and_cache_one(
+    engram_pool_t *p, int fd_w, int fd_s, int64_t base_w, int64_t base_s,
+    int64_t r, uint8_t *dst_v, uint8_t *dst_s, int64_t *bad_acc
+) {
+    ssize_t a = pread(fd_w, dst_v, p->dim, base_w + r * p->dim);
+    ssize_t b = pread(fd_s, dst_s, p->sdim, base_s + r * p->sdim);
+    if (a != p->dim || b != p->sdim) {
+        __atomic_fetch_add(bad_acc, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    uint64_t slot = engram_hash64((uint64_t)r) >> (64 - p->cache_pow2);
+    pthread_mutex_t *smu = &p->stripe_mu[slot & (ENGRAM_CACHE_STRIPES - 1)];
+    pthread_mutex_lock(smu);
+    p->cache_tags[slot] = r;
+    memcpy(p->cache_vals + slot * (size_t)p->dim, dst_v, (size_t)p->dim);
+    memcpy(p->cache_scales + slot * (size_t)p->sdim, dst_s, (size_t)p->sdim);
+    pthread_mutex_unlock(smu);
+}
+
+static void *pool_worker_main(void *arg) {
+    pool_worker_arg_t *wa = (pool_worker_arg_t *)arg;
+    engram_pool_t *p = wa->pool;
+    int tid = wa->tid;
+    uint64_t seen_epoch = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        while (!p->stop && wa->target_epoch == seen_epoch) {
+            pthread_cond_wait(&wa->cv, &p->mu);
+        }
+        if (p->stop) {
+            pthread_mutex_unlock(&p->mu);
+            return NULL;
+        }
+        seen_epoch = wa->target_epoch;
+        int active = p->active_threads;
+        int64_t n_miss = p->n_miss;
+        int fd_w = p->fd_w, fd_s = p->fd_s;
+        int64_t base_w = p->base_w, base_s = p->base_s;
+        uint8_t *vals = p->vals, *scales = p->scales;
+        pthread_mutex_unlock(&p->mu);
+
+        int64_t per = (n_miss + active - 1) / active;
+        int64_t lo = (int64_t)tid * per;
+        int64_t hi = lo + per > n_miss ? n_miss : lo + per;
+        for (int64_t m = lo; m < hi; m++) {
+            int32_t u = p->miss_idx[m];
+            int64_t r = p->uniq_buf[u];
+            read_and_cache_one(
+                p, fd_w, fd_s, base_w, base_s, r,
+                vals + (size_t)u * (size_t)p->dim,
+                scales + (size_t)u * (size_t)p->sdim,
+                &p->short_reads
+            );
+        }
+        pthread_mutex_lock(&p->mu);
+        if (--p->remaining == 0) {
+            pthread_cond_signal(&p->cv_done);
+        }
+        pthread_mutex_unlock(&p->mu);
+    }
+}
+
+void *engram_pool_create(int num_threads, int dim, int sdim, int cache_pow2, int64_t max_cap) {
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > 256) num_threads = 256;
+    if (cache_pow2 < 12) cache_pow2 = 12;
+    if (cache_pow2 > 20) cache_pow2 = 20;
+    if (max_cap < 1024) max_cap = 1024;
+
+    engram_pool_t *p = (engram_pool_t *)calloc(1, sizeof(engram_pool_t));
+    if (!p) return NULL;
+    p->owner_pid = getpid();
+    p->num_threads = num_threads;
+    p->dim = dim;
+    p->sdim = sdim;
+    p->cache_pow2 = cache_pow2;
+    p->cache_slots = 1ULL << cache_pow2;
+    p->max_cap = max_cap;
+
+    uint64_t ht_size = 4096;
+    while (ht_size < (uint64_t)max_cap * 4ULL) ht_size <<= 1;
+    p->ht_size = ht_size;
+    p->ht_mask = ht_size - 1;
+    p->ht_cur_gen = 1;
+
+    p->cache_tags = (int64_t *)malloc(p->cache_slots * sizeof(int64_t));
+    p->cache_vals = (uint8_t *)malloc(p->cache_slots * (size_t)dim);
+    p->cache_scales = (uint8_t *)malloc(p->cache_slots * (size_t)sdim);
+    p->ht_gen = (uint32_t *)calloc(ht_size, sizeof(uint32_t));
+    p->ht_key = (int64_t *)malloc(ht_size * sizeof(int64_t));
+    p->ht_val = (int32_t *)malloc(ht_size * sizeof(int32_t));
+    p->uniq_buf = (int64_t *)malloc((size_t)max_cap * sizeof(int64_t));
+    p->miss_idx = (int32_t *)malloc((size_t)max_cap * sizeof(int32_t));
+    p->tids = (pthread_t *)calloc((size_t)num_threads, sizeof(pthread_t));
+    p->wargs = (pool_worker_arg_t *)calloc((size_t)num_threads, sizeof(pool_worker_arg_t));
+
+    if (!p->cache_tags || !p->cache_vals || !p->cache_scales || !p->ht_gen ||
+        !p->ht_key || !p->ht_val || !p->uniq_buf || !p->miss_idx || !p->tids || !p->wargs) {
+        free(p->cache_tags); free(p->cache_vals); free(p->cache_scales);
+        free(p->ht_gen); free(p->ht_key); free(p->ht_val);
+        free(p->uniq_buf); free(p->miss_idx); free(p->tids); free(p->wargs);
+        free(p);
+        return NULL;
+    }
+    memset(p->cache_tags, 0xff, p->cache_slots * sizeof(int64_t));
+
+    for (int i = 0; i < ENGRAM_CACHE_STRIPES; i++) {
+        pthread_mutex_init(&p->stripe_mu[i], NULL);
+    }
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv_done, NULL);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+
+    int started = 0;
+    for (int t = 0; t < num_threads; t++) {
+        p->wargs[t].pool = p;
+        p->wargs[t].tid = t;
+        p->wargs[t].target_epoch = 0;
+        pthread_cond_init(&p->wargs[t].cv, NULL);
+        if (pthread_create(&p->tids[t], &attr, pool_worker_main, &p->wargs[t]) != 0) {
+            pthread_cond_destroy(&p->wargs[t].cv);
+            break;
+        }
+        started++;
+    }
+    pthread_attr_destroy(&attr);
+    p->num_threads = started;
+    if (started == 0) {
+        free(p->cache_tags); free(p->cache_vals); free(p->cache_scales);
+        free(p->ht_gen); free(p->ht_key); free(p->ht_val);
+        free(p->uniq_buf); free(p->miss_idx); free(p->tids); free(p->wargs);
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
+void engram_pool_destroy(void *ptr) {
+    engram_pool_t *p = (engram_pool_t *)ptr;
+    if (!p) return;
+    if (p->owner_pid == getpid()) {
+        pthread_mutex_lock(&p->mu);
+        p->stop = 1;
+        for (int t = 0; t < p->num_threads; t++) {
+            pthread_cond_signal(&p->wargs[t].cv);
+        }
+        pthread_mutex_unlock(&p->mu);
+        for (int t = 0; t < p->num_threads; t++) {
+            pthread_join(p->tids[t], NULL);
+            pthread_cond_destroy(&p->wargs[t].cv);
+        }
+        for (int i = 0; i < ENGRAM_CACHE_STRIPES; i++) {
+            pthread_mutex_destroy(&p->stripe_mu[i]);
+        }
+        pthread_mutex_destroy(&p->mu);
+        pthread_cond_destroy(&p->cv_done);
+    }
+    free(p->cache_tags); free(p->cache_vals); free(p->cache_scales);
+    free(p->ht_gen); free(p->ht_key); free(p->ht_val);
+    free(p->uniq_buf); free(p->miss_idx); free(p->tids); free(p->wargs);
+    free(p);
+}
+
+int64_t engram_pool_gather_ids(
+    void *ptr, int fd_w, int fd_s, int64_t base_w, int64_t base_s,
+    const int64_t *ids, int64_t numel, int64_t vocab_start, int64_t vocab_end,
+    int32_t *inv_out, uint8_t *vals, uint8_t *scales, int64_t cap,
+    int max_threads, int64_t *out_n_unique
+) {
+    engram_pool_t *p = (engram_pool_t *)ptr;
+    if (!p || p->owner_pid != getpid()) return -3;
+    if (cap > p->max_cap) return -2;
+    if (numel <= 0) {
+        *out_n_unique = 0;
+        return 0;
+    }
+
+    uint32_t gen = ++p->ht_cur_gen;
+    if (gen == 0) {
+        memset(p->ht_gen, 0, p->ht_size * sizeof(uint32_t));
+        gen = p->ht_cur_gen = 1;
+    }
+    int64_t vocab_len = vocab_end - vocab_start;
+    uint64_t mask = p->ht_mask;
+    int ht_shift = 64 - __builtin_ctzll(p->ht_size);
+    int64_t n = 0;
+
+    for (int64_t i = 0; i < numel; i++) {
+        int64_t local = ids[i] - vocab_start;
+        if ((uint64_t)local >= (uint64_t)vocab_len) {
+            inv_out[i] = -1;
+            continue;
+        }
+        uint64_t h = (engram_hash64((uint64_t)local) >> ht_shift) & mask;
+        while (p->ht_gen[h] == gen && p->ht_key[h] != local) {
+            h = (h + 1) & mask;
+        }
+        if (p->ht_gen[h] != gen) {
+            if (n >= cap) return -2;
+            p->ht_gen[h] = gen;
+            p->ht_key[h] = local;
+            p->ht_val[h] = (int32_t)n;
+            p->uniq_buf[n++] = local;
+        }
+        inv_out[i] = (int32_t)h;
+    }
+
+    *out_n_unique = n;
+    if (n == 0) return 0;
+
+    /* Sort uniq_buf ascending to match np.unique bit-for-bit and linearize preads */
+    if (n <= 64) {
+        for (int64_t i = 1; i < n; i++) {
+            int64_t v = p->uniq_buf[i];
+            int64_t j = i - 1;
+            while (j >= 0 && p->uniq_buf[j] > v) {
+                p->uniq_buf[j + 1] = p->uniq_buf[j];
+                j--;
+            }
+            p->uniq_buf[j + 1] = v;
+        }
+    } else {
+        qsort(p->uniq_buf, (size_t)n, sizeof(int64_t), cmp_i64);
+    }
+
+    for (int64_t u = 0; u < n; u++) {
+        int64_t local = p->uniq_buf[u];
+        uint64_t h = (engram_hash64((uint64_t)local) >> ht_shift) & mask;
+        while (p->ht_key[h] != local) {
+            h = (h + 1) & mask;
+        }
+        p->ht_val[h] = (int32_t)u;
+    }
+    for (int64_t i = 0; i < numel; i++) {
+        int32_t h = inv_out[i];
+        if (h >= 0) inv_out[i] = p->ht_val[h];
+    }
+
+    /* Check striped direct-mapped row cache and compact misses */
+    int64_t n_miss = 0;
+    int dim = p->dim, sdim = p->sdim;
+    int cshift = 64 - p->cache_pow2;
+    for (int64_t u = 0; u < n; u++) {
+        int64_t r = p->uniq_buf[u];
+        uint64_t slot = engram_hash64((uint64_t)r) >> cshift;
+        pthread_mutex_t *smu = &p->stripe_mu[slot & (ENGRAM_CACHE_STRIPES - 1)];
+        pthread_mutex_lock(smu);
+        if (p->cache_tags[slot] == r) {
+            memcpy(vals + (size_t)u * (size_t)dim, p->cache_vals + slot * (size_t)dim, (size_t)dim);
+            memcpy(scales + (size_t)u * (size_t)sdim, p->cache_scales + slot * (size_t)sdim, (size_t)sdim);
+            pthread_mutex_unlock(smu);
+        } else {
+            pthread_mutex_unlock(smu);
+            p->miss_idx[n_miss++] = (int32_t)u;
+        }
+    }
+
+    if (n_miss == 0) return 0;
+
+    if (n_miss <= 2 || max_threads <= 1 || p->num_threads <= 1) {
+        int64_t bad = 0;
+        for (int64_t m = 0; m < n_miss; m++) {
+            int32_t u = p->miss_idx[m];
+            int64_t r = p->uniq_buf[u];
+            read_and_cache_one(
+                p, fd_w, fd_s, base_w, base_s, r,
+                vals + (size_t)u * (size_t)dim,
+                scales + (size_t)u * (size_t)sdim,
+                &bad
+            );
+        }
+        return bad;
+    }
+
+    int active = max_threads < p->num_threads ? max_threads : p->num_threads;
+    if (n_miss < 256 && active > 8) active = 8;
+    int64_t quarter_miss = (n_miss + 3) / 4;
+    if (active > quarter_miss) active = (int)quarter_miss;
+    if (active < 1) active = 1;
+
+    pthread_mutex_lock(&p->mu);
+    p->fd_w = fd_w;
+    p->fd_s = fd_s;
+    p->base_w = base_w;
+    p->base_s = base_s;
+    p->n_miss = n_miss;
+    p->vals = vals;
+    p->scales = scales;
+    p->short_reads = 0;
+    p->active_threads = active;
+    p->remaining = active;
+    uint64_t ep = ++p->work_epoch;
+    for (int t = 0; t < active; t++) {
+        p->wargs[t].target_epoch = ep;
+        pthread_cond_signal(&p->wargs[t].cv);
+    }
+    while (p->remaining > 0) {
+        pthread_cond_wait(&p->cv_done, &p->mu);
+    }
+    int64_t bad = p->short_reads;
+    pthread_mutex_unlock(&p->mu);
+    return bad;
+}
 """
 
 
@@ -889,6 +1272,19 @@ def _engram_pread_lib():
         ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
         ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
         ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ]
+    lib.engram_pool_create.restype = ctypes.c_void_p
+    lib.engram_pool_create.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+    ]
+    lib.engram_pool_destroy.restype = None
+    lib.engram_pool_destroy.argtypes = [ctypes.c_void_p]
+    lib.engram_pool_gather_ids.restype = ctypes.c_int64
+    lib.engram_pool_gather_ids.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
+        ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
     ]
     return lib
 
@@ -1017,6 +1413,41 @@ class _DiskEngramTable:
                 "Python thread pool", e
             )
             self._lib = None
+        self._c_pool: int | None = None
+        self._fast_d2h_event: torch.cuda.Event | None = None
+        self._fast_host_ids: torch.Tensor | None = None
+        self._fast_host_inv: torch.Tensor | None = None
+        self._fast_dev_inv: torch.Tensor | None = None
+        if _ENGRAM_FAST_GATHER and self._lib is not None:
+            pool_ptr = self._lib.engram_pool_create(
+                self.num_threads,
+                self.dim,
+                self.scale_dim,
+                _ENGRAM_CACHE_POW2,
+                self.capacity,
+            )
+            if pool_ptr:
+                self._c_pool = pool_ptr
+                weakref.finalize(self, self._lib.engram_pool_destroy, pool_ptr)
+                self._fast_d2h_event = torch.cuda.Event()
+                self._fast_host_ids = torch.empty(
+                    self.capacity, dtype=torch.int64, device="cpu", pin_memory=True
+                )
+                self._fast_host_inv = torch.empty(
+                    self.capacity, dtype=torch.int32, device="cpu", pin_memory=True
+                )
+                self._fast_dev_inv = torch.empty(
+                    self.capacity, dtype=torch.int32, device=device
+                )
+                logger.info(
+                    "Engram fast gather enabled for %s: persistent pool (%d threads), "
+                    "%d-row striped cache (%.1f MiB)",
+                    hf_prefix,
+                    self.num_threads,
+                    1 << _ENGRAM_CACHE_POW2,
+                    ((1 << _ENGRAM_CACHE_POW2) * (self.dim + self.scale_dim + 8))
+                    / (1024 * 1024),
+                )
         logger.info(
             "Engram table %s served from disk (%s, %.1f GiB never loaded); "
             "%d reader threads, staging %d rows",
@@ -1147,11 +1578,96 @@ class _DiskEngramTable:
         for fut in futures:
             fut.result()
 
+    def _gather_fast(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Wave 3 (DEC-4): stream-ordered pinned D2H/H2D + persistent C pool & row cache."""
+        import ctypes
+
+        assert (
+            self._lib is not None
+            and self._c_pool is not None
+            and self._fast_d2h_event is not None
+            and self._fast_host_ids is not None
+            and self._fast_host_inv is not None
+            and self._fast_dev_inv is not None
+        )
+        numel = indices.numel()
+        if numel == 0:
+            return (
+                self.dev_vals,
+                self.dev_scales,
+                self._fast_dev_inv[:0].view(indices.shape),
+                0,
+            )
+        if self._fast_host_ids.numel() < numel:
+            self._fast_host_ids = torch.empty(
+                numel, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._fast_host_inv = torch.empty(
+                numel, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self._fast_dev_inv = torch.empty(
+                numel, dtype=torch.int32, device=self.device
+            )
+
+        # Materialize contiguous int64 on current_stream BEFORE async pinned DMA:
+        # indices is typically a non-contiguous head slice (stride=(n_hash_cols, 1)).
+        stream = torch.cuda.current_stream(indices.device)
+        idx64 = indices.to(dtype=torch.int64).contiguous()
+        host_ids = self._fast_host_ids[:numel]
+        host_ids.copy_(idx64.view(-1), non_blocking=True)
+        self._fast_d2h_event.record(stream)
+        self._fast_d2h_event.synchronize()
+
+        wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
+        max_threads = (
+            self.num_threads
+            if _ENGRAM_THREADS is None
+            else max(1, _ENGRAM_THREADS)
+        )
+        n_unique = ctypes.c_int64(0)
+        bad = self._lib.engram_pool_gather_ids(
+            self._c_pool,
+            wfd,
+            sfd,
+            self.weight_base,
+            self.scale_base,
+            host_ids.data_ptr(),
+            numel,
+            self.vocab_start,
+            self.vocab_end,
+            self._fast_host_inv.data_ptr(),
+            self._np_vals.ctypes.data,
+            self._np_scales.ctypes.data,
+            self.capacity,
+            max_threads,
+            ctypes.byref(n_unique),
+        )
+        if bad == -2:
+            raise RuntimeError(
+                f"engram disk staging too small: unique rows > {self.capacity}"
+            )
+        if bad != 0:
+            raise RuntimeError(f"engram fast disk gather failed (code={bad})")
+
+        n = int(n_unique.value)
+        if n > 0:
+            self.dev_vals[:n].copy_(self.host_vals[:n], non_blocking=True)
+            self.dev_scales[:n].copy_(self.host_scales[:n], non_blocking=True)
+        inv_dev_flat = self._fast_dev_inv[:numel]
+        inv_dev_flat.copy_(self._fast_host_inv[:numel], non_blocking=True)
+        return self.dev_vals, self.dev_scales, inv_dev_flat.view(indices.shape), n
+
     def gather(
         self, indices: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """indices: [T, local_heads] global hash ids -> (dev_vals, dev_scales,
         inverse ids [T, local_heads] int32 (-1 = not owned), num_unique)."""
+        if _ENGRAM_FAST_GATHER and self._c_pool is not None and not (
+            _ENGRAM_TIME or _ENGRAM_OVERLAP or _ENGRAM_ASYNC_D2H
+        ):
+            return self._gather_fast(indices)
         # Frente 3 paths (timing / overlap / async D2H). Off by default, in
         # which case the body below is the pre-existing, untouched code.
         if _ENGRAM_TIME or _ENGRAM_OVERLAP or _ENGRAM_ASYNC_D2H:

@@ -1,0 +1,137 @@
+diff --git a/exllamav3/exllamav3_ext/quant/coop_autotune.cu b/exllamav3/exllamav3_ext/quant/coop_autotune.cu
+index cd67ce53..72bc958d 100644
+--- a/exllamav3/exllamav3_ext/quant/coop_autotune.cu
++++ b/exllamav3/exllamav3_ext/quant/coop_autotune.cu
+@@ -677,6 +677,38 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
+         return launch_config;
+     }
+ 
++    // CUDA graph capture cannot measure candidates: cudaStreamSynchronize / cudaEventSynchronize
++    // are illegal on a capturing stream. Use a deterministic full-occupancy launch instead, so the
++    // same kernel is baked into the graph. It is not recorded in the caches, so eager calls with
++    // the same shape still get autotuned normally.
++    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++    if (cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
++        capture_status != cudaStreamCaptureStatusNone)
++    {
++        const CoopAutotuneCandidate& base = candidates.front();
++        int total_sms = base.total_sms > 0 ? base.total_sms : base.max_num_sms;
++        int max_concurrency = MAX(base.max_concurrency, 1);
++        launch_config =
++        {
++            base.kernel,
++            base.block_dim,
++            base.max_num_sms,
++            MAX(MIN(total_sms / base.max_num_sms, max_concurrency), 1),
++            base.tag
++        };
++        set_kernel_attr_once(launch_config.kernel, smem);
++        cuda_check(cudaLaunchCooperativeKernel
++        (
++            launch_config.kernel,
++            dim3(launch_config.num_sms, 1, launch_config.concurrency),
++            launch_config.block_dim,
++            kernel_args,
++            smem,
++            stream
++        ));
++        return launch_config;
++    }
++
+     {
+         launch_config = tune(candidates, kernel_args, smem, stream, numel_B);
+         auto inserted = launch_cache.emplace(salted_hash, launch_config);
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+index 29b8a792..5836c075 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_gemm.cu
+@@ -311,7 +311,14 @@ int exl3_gemm_gr
+     }
+ #endif
+ 
+-    bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
++    // CUDA graph capture cannot time candidates (cudaStreamSynchronize is illegal on a capturing
++    // stream), so while capturing fall back to the static shape heuristic. The kernel picked here
++    // is baked into the graph; eager calls with the same shape still autotune normally.
++    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++    bool capturing = cudaStreamIsCapturing(stream, &capture_status) == cudaSuccess &&
++                     capture_status != cudaStreamCaptureStatusNone;
++
++    bool autotune = force_shape_idx <= 0 && force_num_sms <= 0 && !capturing;
+     if (autotune)
+     {
+         // Row invariance for speculative verify: every m <= 8 shares one tuning bucket, so a k-row verify pass runs
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+index 0331df3a..ab6c3bec 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu
+@@ -249,7 +249,7 @@ MoeCoopParams exl3_moe_coop_prepare
+     check_scratch(act_out, p.I);
+     check_scratch(d_out, p.Ho);
+     TORCH_CHECK(out.dim() >= 2 && out.stride(-1) == 1, "exl3_moe_coop: out shape");
+-    TORCH_CHECK(slots_max >= 1 && slots_max <= 256, "exl3_moe_coop: scratch must hold 1..256 slots");
++    TORCH_CHECK(slots_max >= 1 && slots_max <= 512, "exl3_moe_coop: scratch must hold 1..512 slots");
+ 
+     // Counters: the gate/up stage's block covers every slot the scratch can hold, the down
+     // stage's every token row the output can hold
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+index ce8a2f1e..d9d023d7 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh
+@@ -43,7 +43,7 @@ template <bool WIDE> constexpr int tile_wk() { return WK / tile_wn<WIDE>(); }  /
+ template <bool WIDE> constexpr int tile_cols() { return tile_wn<WIDE>() * COLS; }
+ template <bool WIDE> constexpr int tile_gpc() { return tile_cols<WIDE>() >= 128 ? 1 : 128 / tile_cols<WIDE>(); }  // block groups per 128-chunk
+ template <bool WIDE> constexpr int tile_cpb() { return tile_cols<WIDE>() >= 128 ? tile_cols<WIDE>() / 128 : 1; }  // 128-chunks per block
+-constexpr int MAX_SLOTS = 256;                  // MAX_BSZN * top_k bound (top_k <= 32)
++constexpr int MAX_SLOTS = 512;                  // MAX_BSZN * top_k bound (THREADS = 512)
+ constexpr int STAGE_WORDS = WNT * 8 * 8;        // words per warp per k-slice at 8 bpw
+ constexpr float R_SCALE = 0.088388347648f;      // 1/sqrt(128)
+ 
+@@ -249,16 +249,16 @@ __device__ __forceinline__ void build_runs
+     if (t == 0) sh_res[0] = 0;
+     __syncthreads();
+ 
+-    // Rank of every active slot by (expert, slot)
++    // Rank of every active slot by (expert, slot); slot < MAX_SLOTS <= 1024
+     const int my_e = t < slots ? sh_local[t] : -1;
+     if (my_e >= 0)
+     {
+-        const int key = (my_e << 8) | t;
++        const int key = (my_e << 10) | t;
+         int rank = 0;
+         for (int u = 0; u < slots; ++u)
+         {
+             const int eu = sh_local[u];
+-            rank += (eu >= 0 && ((eu << 8) | u) < key) ? 1 : 0;
++            rank += (eu >= 0 && ((eu << 10) | u) < key) ? 1 : 0;
+         }
+         sh_order[rank] = (int16_t) t;
+         atomicMax(sh_res, rank + 1);     // active slot count
+diff --git a/exllamav3/exllamav3_ext/quant/exl3_moe_coopmk.cu b/exllamav3/exllamav3_ext/quant/exl3_moe_coopmk.cu
+index 541370e2..93923a1d 100644
+--- a/exllamav3/exllamav3_ext/quant/exl3_moe_coopmk.cu
++++ b/exllamav3/exllamav3_ext/quant/exl3_moe_coopmk.cu
+@@ -163,7 +163,7 @@ CoopMK::CoopMK
+     check_scratch(act_out, p.I);
+     check_scratch(d_out, p.Ho);
+     TORCH_CHECK(out.dim() >= 2 && out.stride(-1) == 1, "coopmk: out shape");
+-    TORCH_CHECK(slots_max >= 1 && slots_max <= 256, "coopmk: scratch must hold 1..256 slots");
++    TORCH_CHECK(slots_max >= 1 && slots_max <= 512, "coopmk: scratch must hold 1..512 slots");
+ 
+     const int rows_max = (int) out.size(-2);
+     p.slots_max = slots_max;
+diff --git a/exllamav3/modules/quant/exl3.py b/exllamav3/modules/quant/exl3.py
+index c4d5372d..ac70e20f 100644
+--- a/exllamav3/modules/quant/exl3.py
++++ b/exllamav3/modules/quant/exl3.py
+@@ -14,7 +14,9 @@ import os
+ from ...util import profile_opt
+ 
+ AUTO_RECONSTRUCT_THRESHOLD = 144
+-MAX_RECONSTRUCT_SLICE_N = 32768
++MAX_RECONSTRUCT_SLICE_N = max(
++    128, (int(os.environ.get("EXL3_MAX_RECONSTRUCT_SLICE_N", "32768")) // 128) * 128
++)
+ RECONSTRUCT_SLICE_GRANULARITY_N = 128
+ 
+ no_fused_reconstruct = os.environ.get("EXL3_NO_FUSED_RECONSTRUCT", "0") != "0"

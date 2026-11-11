@@ -3,6 +3,7 @@
 import functools
 import importlib
 import math
+import os
 from collections.abc import Callable
 from importlib.util import find_spec
 
@@ -3516,9 +3517,15 @@ def _prefill_block_k(head_dim: int) -> int:
         smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
     except Exception:
         return 16
-    # Two CTAs of the wide tile plus headroom; below this the wide tile either
-    # will not launch or drops to 1 CTA/SM, which measured slower than 16.
-    return 32 if smem >= 96 * 1024 else 16
+    # Two CTAs of the wide tile plus headroom; on SM86 (99 KiB optin smem)
+    # BLOCK_K=32 uses ~84 KiB and drops to 1 CTA/SM, whereas 160 KiB+ (SM80/SM90)
+    # sustains 2 CTAs/SM.
+    _smem_thresh = (
+        160 * 1024
+        if os.environ.get("VLLM_SPARSE_PREFILL_SM86_BK16", "1") != "0"
+        else 96 * 1024
+    )
+    return 32 if smem >= _smem_thresh else 16
 
 
 def _can_use_aiter_sparse_prefill_opus(
@@ -4266,7 +4273,11 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
-    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
+    _direct_out_ok = _ON_GFX950 or (
+        current_platform.is_cuda()
+        and os.environ.get("VLLM_SPARSE_DECODE_DIRECT_OUT", "1") != "0"
+    )
+    direct_out = output if _direct_out_ok and output.dtype == torch.bfloat16 else None
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,

@@ -2643,16 +2643,31 @@ def get_kv_cache_configs(
 
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
+    # Also, under hybrid KV cache (e.g. MLA block_size=128 + SWA block_size=32) with
+    # EAGLE/DSpark block drop, dropping one aligned full-attention block backs a
+    # prefix-cache hit up by `max_block_size` tokens, so SWA must retain at least
+    # `max_block_size` extra trailing tokens below the active sliding window.
     extra_retained_tokens = (
         vllm_config.speculative_config.num_speculative_tokens - 1
         if vllm_config.speculative_config is not None
         and vllm_config.speculative_config.use_multi_module_mtp()
         else 0
     )
+    _max_spec_block_size = max(
+        (s.block_size for s in merged_kv_cache_specs.values()), default=0
+    )
+    _fix_hybrid_swa = (
+        vllm_config.speculative_config is not None
+        and not vllm_config.speculative_config.disable_eagle_block_drop
+        and os.environ.get("VLLM_FIX_HYBRID_SWA_PREFIX", "1") != "0"
+    )
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
+            _layer_extra = extra_retained_tokens
+            if _fix_hybrid_swa and _max_spec_block_size > layer_spec.block_size:
+                _layer_extra = max(_layer_extra, _max_spec_block_size)
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec, extra_retained_tokens=_layer_extra
             )
 
     # Get global KV cache groups. This also handles spec unification for

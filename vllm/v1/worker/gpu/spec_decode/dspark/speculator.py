@@ -29,13 +29,16 @@ import os
 import struct
 import time
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.profiler import record_function
 
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -108,9 +111,18 @@ class DSparkSpeculator(DFlashSpeculator):
             self.enable_adaptive_verification or self.conf_cut_enabled
         )
 
-        # Fused Markov chain (greedy vocab-sharded path only); built in
-        # load_draft_model once the head's weights and shard geometry exist.
+        # Fused Markov chain (greedy vocab-sharded path + hybrid prob fallback);
+        # built in load_draft_model once the head's weights and shard geometry exist.
         self._fused_markov: FusedMarkovSampler | None = None
+        self._prob_draft_hybrid = (
+            os.environ.get("VLLM_DSPARK_PROB_DRAFT", "1") != "0"
+            and self.use_local_argmax_reduction
+            and self.draft_logits is not None
+        )
+        self._sampler: Any = None
+        self._markov_w2_full: torch.Tensor | None = None
+        self._base_logits_shard_static: torch.Tensor | None = None
+        self._draft_vocab_size: int = self.vocab_size
         # Diagnostico de tempo (VLLM_M3_TIME_DRAFT=1): [logits, markov, passos].
         self._t_dbg: list[float] = [0.0, 0.0, 0.0]
 
@@ -120,6 +132,8 @@ class DSparkSpeculator(DFlashSpeculator):
         target_attn_layer_names: set[str],
     ) -> torch.nn.Module:
         model = load_dspark_model(target_model, self.vllm_config)
+        if model.draft_id_to_target_id is not None:
+            self._draft_vocab_size = int(model.draft_id_to_target_id.shape[0])
         # Reduced draft vocab: probabilistic rejection sampling indexes draft
         # logits by target id, so precompute the draft->target column map and a
         # scratch buffer to scatter logits into target vocab before sampling.
@@ -143,19 +157,28 @@ class DSparkSpeculator(DFlashSpeculator):
                 "enable_adaptive_verification=false in the speculative config to verify"
                 " a fixed number of drafts instead."
             )
-        # `draft_logits is None` is greedy drafting, which is the only mode the
-        # fused step covers -- it reduces the logit row instead of emitting it.
-        # `_validate_local_argmax_reduction` rejects the other combination
-        # outright, but it runs after this method, so the condition is spelled
-        # out here rather than assumed.
         if (
             self.use_local_argmax_reduction
-            and self.draft_logits is None
+            and (self.draft_logits is None or self._prob_draft_hybrid)
             and envs.VLLM_DSPARK_FUSED_MARKOV
         ):
             self._fused_markov = build_fused_markov_sampler(
                 model, self.max_num_reqs, self.num_speculative_steps, self.device
             )
+            if self._prob_draft_hybrid and self._fused_markov is not None:
+                op = self._fused_markov.op
+                shard_width = op.w2.shape[0]
+                self._base_logits_shard_static = torch.empty(
+                    (self.max_num_reqs, self.num_speculative_steps, shard_width),
+                    dtype=op.w2.dtype,
+                    device=self.device,
+                )
+                w2_full = (
+                    tensor_model_parallel_all_gather(op.w2, dim=0)
+                    if op.tp_size > 1
+                    else op.w2
+                )
+                self._markov_w2_full = w2_full[: self._draft_vocab_size].contiguous()
         return model
 
     def _sample_logits(
@@ -197,7 +220,10 @@ class DSparkSpeculator(DFlashSpeculator):
         # different pair of hooks than the base class's single get_top_tokens.
         if not self.use_local_argmax_reduction:
             return
-        if self.speculative_config.draft_sample_method == "probabilistic":
+        if (
+            self.speculative_config.draft_sample_method == "probabilistic"
+            and not self._prob_draft_hybrid
+        ):
             raise ValueError(
                 "use_local_argmax_reduction is not compatible with "
                 "draft_sample_method='probabilistic': verification needs whole "
@@ -410,6 +436,8 @@ class DSparkSpeculator(DFlashSpeculator):
         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
 
         if self._fused_markov is not None and not self.conf_cut_enabled:
+            if self._base_logits_shard_static is not None:
+                self._base_logits_shard_static[:num_reqs].copy_(base_logits)
             # Same chain as the loop below, with each step's seven kernels and
             # three [num_reqs, shard_width] round trips collapsed into one
             # pass over markov_w2. Writes draft_tokens directly.
@@ -451,6 +479,67 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         if _t0 is not None:
             self._dbg_markov_time(_t0)
+
+    def _post_propose_sample(self, input_batch: Any, dummy_run: bool) -> None:
+        if (
+            dummy_run
+            or not self._prob_draft_hybrid
+            or self.draft_logits is None
+            or self._base_logits_shard_static is None
+            or self._markov_w2_full is None
+            or self._sampler is None
+        ):
+            return
+
+        num_reqs = input_batch.num_reqs
+        if num_reqs == 0:
+            return
+        idx_np = input_batch.idx_mapping_np
+        ss = self._sampler.sampling_states
+        temp_np = ss.temperature.np[idx_np]
+        if np.all(temp_np == 0.0):
+            # Greedy batch: FusedMarkovSampler already wrote exact argmax draft
+            # tokens inside the FULL CUDA graph, and RejectionSampler skips
+            # draft_logits whenever temp == 0.0.
+            return
+
+        n_spec = self.num_speculative_steps
+        num_sample = num_reqs * n_spec
+        shard_slice = self._base_logits_shard_static[:num_reqs]
+        full_base = (
+            tensor_model_parallel_all_gather(shard_slice, dim=-1)
+            if self._fused_markov is not None and self._fused_markov.op.tp_size > 1
+            else shard_slice
+        )[..., : self._draft_vocab_size]
+
+        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
+        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
+
+        has_filter = (
+            self._d2t_scatter_index is None
+            and bool(
+                np.any(ss.min_p.np[idx_np] > 0.0)
+                or np.any(ss.top_k.np[idx_np] != ss.vocab_size)
+                or np.any(ss.top_p.np[idx_np] != 1.0)
+            )
+        )
+        for i in range(n_spec):
+            markov_embed = self.model.markov_embed(prev)
+            bias = F.linear(markov_embed, self._markov_w2_full)
+            logits_i = full_base[:, i] + bias
+            if has_filter:
+                req_idx_gpu = idx_map[:, i]
+                scaled = logits_i.float()
+                ss.apply_temperature(scaled, req_idx_gpu, idx_np)
+                ss.apply_min_p(scaled, req_idx_gpu, idx_np)
+                scaled = ss.apply_top_k_top_p(scaled, req_idx_gpu, idx_np)
+                logits_i = logits_i.masked_fill(scaled == float("-inf"), float("-inf"))
+            draft_sampled_i = self._sample_logits(
+                logits_i, idx_map[:, i], sample_pos[:, i], i
+            )
+            self.draft_tokens[:num_reqs, i] = draft_sampled_i
+            prev = draft_sampled_i
 
     def _dbg_markov_time(self, t_markov_start: float) -> None:
         """Acumula o tempo da cadeia Markov e loga a cada 10 passos."""

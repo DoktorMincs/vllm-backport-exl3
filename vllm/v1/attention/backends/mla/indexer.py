@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -185,7 +186,10 @@ class PrepareUniformDecodeKernel(
 #   T=8192 -> 9.2x    T=4096 -> 7.4x    T=2048 -> 5.0x    T=1024 -> 2.8x
 # 2048 is the crossover, and is above the cudagraph capture cap
 # (min(max_num_seqs*2, 512)), so a sharded batch is always an eager one.
-MIN_SHARD_TOKENS = 2048
+# Keep MIN_SHARD_TOKENS strictly above the PIECEWISE cudagraph capture cap (512)
+# so captured graphs stay collective-free while eager prefill chunks (e.g. 1152)
+# shard queries across TP=2.
+MIN_SHARD_TOKENS = int(os.environ.get("VLLM_INDEXER_MIN_SHARD_TOKENS", "513"))
 
 
 class ShardedChunkSpec(NamedTuple):

@@ -16,13 +16,15 @@ Thin multimodal wrapper around the text-only ``DeepseekV41LLMForCausalLM``:
   (``requires_raw_input_tokens``).
 """
 
+import os
 from collections.abc import Iterable
+from contextlib import nullcontext
 from typing import Annotated
 
 import torch
 from torch import nn
 
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
@@ -31,8 +33,10 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    StageMissingLayer,
     WeightsMapper,
     maybe_prefix,
+    no_init_weights,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
 from vllm.models.deepseek_v4.common.vision import (
@@ -147,21 +151,37 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
 
         # The tower is always built; _mark_tower_model stubs it out
         # (StageMissingLayer, weights skipped) when the image limit is 0.
+        # Under pipeline parallelism, embed_multimodal/embed_input_ids only
+        # execute on PP stage 0 (is_first_rank), so stub the 0.90 GiB BF16
+        # ViT + aligner on PP stages 1..PP-1 as well.
+        skip_non_first_pp_tower = (
+            self.multimodal_config.get_limit_per_prompt("image") != 0
+            and not get_pp_group().is_first_rank
+            and os.environ.get("VLLM_VL_SKIP_NON_FIRST_PP_TOWER", "1") != "0"
+        )
         with self._mark_tower_model(vllm_config, {"image"}):
-            self.use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
-            self.vision = DeepseekV4ViT(config)
-            self.aligner = DeepseekV4Aligner(config)
-            self.image_start = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
-            )
-            self.image_end = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
-            )
-            self.image_newline = nn.Parameter(
-                torch.empty(config.hidden_size, dtype=torch.float32)
-            )
-            self.vision.to(dtype=model_config.dtype)
-            self.aligner.to(dtype=model_config.dtype)
+            with (
+                no_init_weights(
+                    self,
+                    lambda mod: StageMissingLayer("image_tower", mod),
+                )
+                if skip_non_first_pp_tower
+                else nullcontext()
+            ):
+                self.use_data_parallel = is_vit_use_data_parallel(config.vision_n_heads)
+                self.vision = DeepseekV4ViT(config)
+                self.aligner = DeepseekV4Aligner(config)
+                self.image_start = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float32)
+                )
+                self.image_end = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float32)
+                )
+                self.image_newline = nn.Parameter(
+                    torch.empty(config.hidden_size, dtype=torch.float32)
+                )
+                self.vision.to(dtype=model_config.dtype)
+                self.aligner.to(dtype=model_config.dtype)
 
         with self._mark_language_model(vllm_config):
             self.language_model = DeepseekV41LLMForCausalLM(

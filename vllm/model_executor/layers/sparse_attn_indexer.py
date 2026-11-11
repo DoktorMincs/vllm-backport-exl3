@@ -666,6 +666,11 @@ def sparse_attn_indexer(
                     # block's logits immediately.
                     row_step = envs.VLLM_DSV4_LOGITS_ROW_CHUNK
                     num_rows = q_slice_cast.shape[0]
+                    _hoisted_k_bf16 = (
+                        k_quant_cast.to(torch.bfloat16)
+                        if num_rows > row_step
+                        else None
+                    )
                     for r0 in range(0, num_rows, row_step):
                         r1 = min(r0 + row_step, num_rows)
                         logits = fp8_mqa_logits_triton(
@@ -675,6 +680,7 @@ def sparse_attn_indexer(
                             cu_seqlen_ks[r0:r1],
                             cu_seqlen_ke[r0:r1],
                             clean_logits=False,
+                            k_bf16=_hoisted_k_bf16,
                         )
                         _apply_prefill_candidates(
                             logits,
@@ -697,6 +703,7 @@ def sparse_attn_indexer(
                             topk_tokens,
                         )
                         del logits
+                    del _hoisted_k_bf16
                     logits = q_slice_cast.new_empty((0, 0), dtype=torch.float32)
                 else:
                     # SM80/SM121 Triton fallback (DeepGEMM unavailable).

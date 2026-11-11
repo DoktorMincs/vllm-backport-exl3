@@ -580,3 +580,30 @@ Remaining on the last stage: the drafter attention metadata (~2.4 ms/step) and `
 - O `greedy_gate` NÃO detecta drafter quebrado (o alvo decide a saída): comparar aceitação
   (`scripts/accept_rate.sh`, "Mean acceptance length" nos logs): 4,6996 vs 4,6997 no baseline.
 - Medido: gate OK, PPL 28,37±0,19, C=1 mediana 62,9 tok/s; grafo +0,0 GiB visível (0,28–0,39 GiB/rank como antes).
+
+## Carbon Waves 1+2+3 + Vision Tower (2026-11-11)
+
+All changes are individually gated by env vars (`1` = enabled, `0` = legacy fallback); companion plugin/ext changes live on `DoktorMincs/vllm-exl3` (`exl3-ds41-local`) and `docs/exl3-ds41/patches/exllamav3-ds41-sm86.patch`.
+
+1. **Vision Tower (`PP0`-only) + VRAM budgeting (`--limit-mm-per-prompt '{"image": 4}'`, `CHUNK=1056`, `UTIL=0.968`):**
+   - `VLLM_VL_SKIP_NON_FIRST_PP_TOWER=1` (`vl_model.py`): instantiates `DeepseekV4ViT` + `DeepseekV4Aligner` (`~0.45 GiB/GPU`) only on `is_first_rank` (`PP0`), saving `0.45 GiB/GPU` across `PP1..PP4`.
+   - `EXL3_MAX_RECONSTRUCT_SLICE_N=1024` (`exllamav3/modules/quant/exl3.py`) + `VLLM_EXL3_MOE_TEMP_ROWS=256`: slices `reconstruct_hgemm` along `N <= 1024` (`engram.wkv` peak `-250 MiB`, `PIECEWISE` cudagraph private pool `0.55 -> 0.31 GiB/GPU`) and shrinks `_FUSED_TEMP_CACHE` (`490 -> 61 MiB/GPU`).
+2. **Quality & DSpark `<think>` acceptance (`SD-1`, `SD-3`, `SD-4`):**
+   - `VLLM_DSPARK_PROB_DRAFT=1` (`dspark/speculator.py`): compact `draft_logits` (`[max_reqs * num_spec, vocab]`, `20.7 MiB`), dynamic `all_greedy` fast path (`use_local_argmax_reduction` in-graph), matched `(top_k, top_p, min_p)` filtering on draft logits for `T > 0`, and lossless joint block verification (`rejection_sample_method="block"`).
+   - `VLLM_FP32_MOE_GATE=1` (`deepseek_v4/nvidia/model.py`, `gate_linear.py`, `gemv_triton.py`): keeps all 43 `F16` MoE router weights and logits in `FP32` across all batch sizes (`PPL` `27.885 -> 27.202`).
+   - `VLLM_DRAFT_CTX_IN_GRAPH_RELAXED=1` (`dflash/speculator.py`): relaxes `num_target_tokens <= _ctx_per_req * num_reqs_padded` with zeroed tail padding so mixed/first-decode steps stay inside the captured context graph.
+3. **Hybrid KV prefix cache & SM86 prefill (`KV-1`, `PRE-1..4`, `DEC-2a/5a/5b`):**
+   - `VLLM_FIX_HYBRID_SWA_PREFIX=1` (`kv_cache_coordinator.py`, `kv_cache_utils.py`): aligns hybrid SWA retention/intersection with `eagle_block_drop`, restoring `99.3%` prefix-cache hit rate on `~32k` multi-turn (`TTFT 25.4 s -> 1.68–1.92 s`).
+   - `VLLM_SM86_INDEXER_KV_GROUP=1` (`mqa_logits_triton.py`), `VLLM_INDEXER_MIN_SHARD_TOKENS=513` (`indexer.py`, `sparse_attn_indexer.py`), `VLLM_DSV4_LOGITS_ROW_CHUNK=64`, `VLLM_SPARSE_PREFILL_SM86_BK16=1` (`rocm_aiter_mla_sparse.py`, `BLOCK_K=16` -> `2 CTAs/SM` on SM86), and `VLLM_SKIP_PREFILL_PROPOSE=1` (`model_runner.py`).
+   - `VLLM_PP_NO_DRAIN_SLEEP=1` (`core.py`), `VLLM_PP_SKIP_EMPTY_AG=1` (`gpu_worker.py`), `VLLM_SPARSE_DECODE_DIRECT_OUT=1` (`rocm_aiter_mla_sparse.py`).
+4. **Wave 2 + Wave 3 (`DEC-3A` + `DEC-4`):**
+   - `VLLM_EXL3_COOP_SLOTS_MAX=512`, `VLLM_EXL3_COOP_ROWS_MAX=88` (`exl3_moe_coop*` `(my_e << 10) | t` + `vllm_exl3/exl3.py`): eliminates the `slots = 288 > 256` fallback cliff at `C=8` (`M=48, topk=6`), `100%` bit-exact (`torch.equal`).
+   - `VLLM_DS41_ENGRAM_FAST_GATHER=1`, `VLLM_DS41_ENGRAM_CACHE_POW2=17` (`engram.py`): persistent C `pread` pthread pool (`256 KiB` stacks, per-worker condvars waking `<=8` threads on decode misses to avoid waking all `128` `disk_threads`), open-addressing deduplication + ascending sort matching `np.unique`, `131,072`-row (`34 MiB`/table) `256`-striped row cache, and current-stream pinned D2H/H2D (`3.74x–4.90x` faster at `T=48`, `100%` bit-exact).
+
+**Measured A/B (`10× RTX 3090`, `TP=2 × PP=5`, `8,8,10,8,6`, Mia v1 pack, isolated `127.0.0.1:3019`):**
+- **KV pool (`cap 262,144`):** `477,271` tokens (`1.82x`, Vision `image:4` ON) vs `456,107` text-only baseline; CUDA graphs `0.31–0.41 GiB/GPU`.
+- **Quality & Vision:** `greedy_gate` `256/256` OK; `ppl_probe` `27.885 -> 27.202 ± 0.087`; Vision `1/2/4`-image grounding + OCR `100%` pass.
+- **Stochastic `<think>` (`T=1.0, top_p=0.95`):** `2.256 -> 2.406–2.514 tok/draft` (`+6.6%..+11.4%`).
+- **Decode:** `step_by_prompt` `66.30 -> 62.39` (Wave 1) `-> 58.85 ms/step` (`-11.2%`); `C=1` `70.7–76.6 tok/s` (peak `92.5`); `spec_bench C=8` `170.7` (`155.5` Wave 1) `-> 248.0 tok/s` median (`168.4` cold / `253.2` warm, `+45.3%` vs baseline, `+59.4%` vs Wave 1); 24 unseen `C=8` prompts `117.4 -> 162.3 tok/s` median (`+38.2%`).
+- **Long prefill (`201k` actual tokens, Vision ON):** `202.0 s (1,131 tok/s) -> 119.6–128.6 s (1,565–1,683 tok/s, +38%..+49%)`, zero OOM.
+

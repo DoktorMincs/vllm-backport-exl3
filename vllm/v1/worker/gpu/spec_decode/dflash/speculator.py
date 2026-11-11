@@ -123,8 +123,16 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     @property
     def attn_vllm_config(self) -> VllmConfig:
-        # The draft's attention differs from the target's in causality.
+        # The draft's attention differs from the target's in causality and never
+        # runs non-causal multimodal prefix-LM masks even when the target has a
+        # vision tower enabled.
         config = copy.copy(super().attn_vllm_config)
+        if config.model_config.model_arch_config.is_mm_prefix_lm:
+            config.model_config = copy.copy(config.model_config)
+            config.model_config.model_arch_config = replace(
+                config.model_config.model_arch_config,
+                is_mm_prefix_lm=False,
+            )
         config.attention_config = replace(
             self.vllm_config.attention_config,
             use_non_causal=self.requires_non_causal,
@@ -177,6 +185,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     _ctx_in_graph: bool = False
+    _ctx_per_req: int = 0
     _aux_static: torch.Tensor | None = None
 
     def _setup_ctx_in_graph(self) -> None:
@@ -489,11 +498,17 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         use_ctx_graph = (
             self._ctx_in_graph
+            and self._aux_static is not None
             and bool(aux_hidden_states)
             and not dummy_run
             and not is_profile
             and batch_desc.cg_mode == CUDAGraphMode.FULL
-            and num_target_tokens == num_reqs * self._ctx_per_req
+            and num_target_tokens > 0
+            and (
+                num_target_tokens <= self._ctx_per_req * num_reqs_padded
+                if os.environ.get("VLLM_DRAFT_CTX_IN_GRAPH_RELAXED", "1") != "0"
+                else num_target_tokens == num_reqs * self._ctx_per_req
+            )
             and self._ctx_per_req * num_reqs_padded <= self._aux_static.shape[0]
             and sum(a.shape[-1] for a in aux_hidden_states)
             == self._aux_static.shape[1]
@@ -596,6 +611,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         if use_ctx_graph and self._ctx_per_req * num_reqs_padded > num_target_tokens:
             # Padded context rows replay stale aux data: make them write nothing.
             n_pad = self._ctx_per_req * num_reqs_padded
+            self._aux_static[num_target_tokens:n_pad].zero_()
             self._context_slot_mappings[:, num_target_tokens:n_pad].fill_(PAD_SLOT_ID)
             self.context_positions[num_target_tokens:n_pad].zero_()
 
@@ -694,7 +710,11 @@ class DFlashSpeculator(DraftModelSpeculator):
                 )
                 self._dbg_acc = [0.0, 0.0, 0.0]
 
+        self._post_propose_sample(input_batch, dummy_run)
         return self.draft_tokens[:num_reqs]
+
+    def _post_propose_sample(self, input_batch: InputBatch, dummy_run: bool) -> None:
+        pass
 
 
 @triton.jit

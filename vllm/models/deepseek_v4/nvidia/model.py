@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from inspect import signature
@@ -832,6 +833,7 @@ class DeepseekV4MoE(nn.Module):
             output_size=self.n_routed_experts,
             bias=False,
             out_dtype=torch.float32,
+            force_fp32_compute=os.environ.get("VLLM_FP32_MOE_GATE", "1") != "0",
             prefix=f"{prefix}.gate",
         )
 

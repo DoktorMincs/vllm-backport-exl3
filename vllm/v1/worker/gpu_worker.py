@@ -1274,9 +1274,17 @@ class Worker(WorkerBase):
                 )
             else:
                 with proto_timer("recv_total"):
+                    _ag_group = (
+                        get_tp_group()
+                        if (
+                            os.environ.get("VLLM_PP_SKIP_EMPTY_AG", "1") == "0"
+                            or any(all_gather_tensors.values())
+                        )
+                        else None
+                    )
                     tensor_dict, comm_handles, comm_postprocess = (
                         get_pp_group().irecv_tensor_dict(
-                            all_gather_group=get_tp_group(),
+                            all_gather_group=_ag_group,
                             all_gather_tensors=all_gather_tensors,
                         )
                     )
@@ -1322,9 +1330,17 @@ class Worker(WorkerBase):
             self._pp_send_work = []
         else:
             with proto_timer("isend_total"):
+                _ag_group_send = (
+                    get_tp_group()
+                    if (
+                        os.environ.get("VLLM_PP_SKIP_EMPTY_AG", "1") == "0"
+                        or any(all_gather_tensors.values())
+                    )
+                    else None
+                )
                 handles = get_pp_group().isend_tensor_dict(
                     output.tensors,
-                    all_gather_group=get_tp_group(),
+                    all_gather_group=_ag_group_send,
                     all_gather_tensors=all_gather_tensors,
                 )
             self._pp_send_work = handles[1:]
