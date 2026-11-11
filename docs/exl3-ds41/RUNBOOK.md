@@ -557,3 +557,14 @@ Remaining on the last stage: the drafter attention metadata (~2.4 ms/step) and `
 - Medido: `sample_tokens` do último estágio 118→102 amostras, passos/22 s 280→302, greedy_gate OK contra
   `dumps/base_tokens_mia_flags0.json`, PPL 28,40±0,17 (ruído), C=1 mediana 56,25 tok/s.
 - Fases B (metadata do drafter só-refresh), C (SWA em lote), D (contexto KV do drafter no grafo) ainda NÃO feitas.
+
+## Fase C (11/11): `VLLM_BATCH_SWA_BUILD`
+- Pré-passe em `build_attn_metadata` (`attn_utils.py`): um único kernel Triton (`_batched_swa_decode_kernel`, grid
+  (tokens, grupos), vetores de ponteiros) preenche `decode_swa_indices/lens` e `is_valid_token` de todos os grupos SWA
+  causais; `DeepseekSparseSWAMetadataBuilder.build` pula o próprio kernel/zeramento (`_swa_prebuilt`). Exige
+  `VLLM_SHARE_TOKEN_TO_REQ`. Cai no caminho por grupo se: <2 grupos, `max_query_len > decode_threshold`, não-causal
+  (drafter), strides/dtypes/janela/block_size diferentes, captura de grafo.
+- `=check` roda também o caminho por grupo e compara (sync; só validação): 0 divergências em prefill 87k + estresse misto.
+- Medido: `greedy_gate` OK, PPL 28,42±0,06, C=1 mediana 60,8 tok/s; perfil py-spy 78,0→62,8 ms/passo,
+  `build_attn_metadata` do último estágio 26,7%→16,7% das amostras. Default 1 em `serve_best_ds41.sh`.
+- Teste: `tests/v1/attention/test_batched_swa_decode.py`.

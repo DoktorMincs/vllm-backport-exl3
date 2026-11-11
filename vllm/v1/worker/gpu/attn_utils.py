@@ -266,6 +266,48 @@ _SHARE_TOKEN_TO_REQ = _SHARE_MODE in ("1", "true", "yes", "on", "check")
 # "check": also verify, with a device sync, that the shared map equals the one each group
 # would have built (skipped while capturing a CUDA graph). Validation runs only.
 _SHARE_CHECK = _SHARE_MODE == "check"
+# VLLM_BATCH_SWA_BUILD=1|check: build the decode SWA indices of all causal SWA KV
+# groups with one batched kernel (needs VLLM_SHARE_TOKEN_TO_REQ). "check" also runs
+# each builder's own path and asserts equality (device sync; validation only).
+_BATCH_SWA_MODE = os.environ.get("VLLM_BATCH_SWA_BUILD", "").strip().lower()
+_BATCH_SWA = _SHARE_TOKEN_TO_REQ and _BATCH_SWA_MODE in ("1", "true", "yes", "on", "check")
+
+
+_BATCH_LOGGED = False
+
+
+def _log_batch_once(idxs):
+    global _BATCH_LOGGED
+    if not _BATCH_LOGGED:
+        _BATCH_LOGGED = True
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
+            "VLLM_BATCH_SWA_BUILD=%s: batched decode SWA build active for KV groups %s",
+            _BATCH_SWA_MODE, idxs,
+        )
+
+
+def _swa_batch_candidates(attn_groups, causal, num_groups):
+    """Indices of KV groups with exactly one causal SWA builder, plus the builders."""
+    from vllm.v1.attention.backends.mla.sparse_swa import (
+        DeepseekSparseSWAMetadataBuilder,
+    )
+
+    idxs, builders = [], []
+    for gi in range(num_groups):
+        gc = causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(gi, True)
+        if gc is not True:
+            continue
+        swa = [
+            g.get_metadata_builder(0)
+            for g in attn_groups[gi]
+            if isinstance(g.get_metadata_builder(0), DeepseekSparseSWAMetadataBuilder)
+        ]
+        if len(swa) == 1 and len(attn_groups[gi]) >= 1:
+            idxs.append(gi)
+            builders.append(swa[0])
+    return idxs, builders
 
 
 def build_attn_metadata(
@@ -300,6 +342,12 @@ def build_attn_metadata(
     attn_metadata: dict[str, Any] = {}
     shared_token_to_req: torch.Tensor | None = None
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+    swa_batch_idxs: set[int] = set()
+    swa_batch_tried = not (
+        _BATCH_SWA
+        and not for_cudagraph_capture
+        and ubatch_idx == 0
+    )
     for i in range(num_kv_cache_groups):
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -350,6 +398,31 @@ def build_attn_metadata(
                     "VLLM_SHARE_TOKEN_TO_REQ=check: shared token->request map differs "
                     f"from the group's own at group {i}"
                 )
+
+        if not swa_batch_tried:
+            swa_batch_tried = True
+            cand_idxs, cand_builders = _swa_batch_candidates(
+                attn_groups, causal, num_kv_cache_groups
+            )
+            if i in cand_idxs and len(cand_idxs) >= 2 and cand_idxs[0] == i:
+                from vllm.v1.attention.backends.mla.sparse_swa import (
+                    prebuild_swa_decode_batched,
+                )
+
+                t2r = common_attn_metadata.token_to_req_indices(
+                    cand_builders[0].token_to_req_indices
+                )
+                if prebuild_swa_decode_batched(
+                    cand_builders,
+                    [block_tables[g] for g in cand_idxs],
+                    [slot_mappings[g] for g in cand_idxs],
+                    common_attn_metadata,
+                    t2r,
+                ):
+                    swa_batch_idxs = set(cand_idxs)
+                    _log_batch_once(cand_idxs)
+        if i in swa_batch_idxs:
+            common_attn_metadata._swa_prebuilt = True
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
