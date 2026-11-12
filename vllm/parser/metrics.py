@@ -15,6 +15,9 @@ _model_name: str | None = None
 _TOOL_CALL_PARSER_INVOCATIONS_TOTAL = "vllm:tool_call_parser_invocations_total"
 _tool_call_parser_invocations: Counter | None = None
 
+_MALFORMED_TOOL_ARGS_TOTAL = "vllm:tool_call_parser_malformed_args_total"
+_malformed_tool_args: Counter | None = None
+
 
 class ToolCallOutcome(Enum):
     TOOL_CALL = "tool_call"
@@ -60,6 +63,33 @@ def init_parser_metrics(*, model_name: str) -> None:
             outcome=outcome.value,
             request_type=request_type.value,
         )
+
+    global _malformed_tool_args
+    try:
+        _malformed_tool_args = Counter(
+            name=_MALFORMED_TOOL_ARGS_TOTAL,
+            documentation=(
+                "Total number of tool-call argument bodies rejected as "
+                "malformed by a parser in strict mode."
+            ),
+            labelnames=["model_name", "parser", "reason"],
+        )
+    except ValueError:
+        _malformed_tool_args = cast(
+            Counter,
+            REGISTRY._names_to_collectors[_MALFORMED_TOOL_ARGS_TOTAL],
+        )
+
+
+def record_malformed_tool_args(*, parser: str, reason: str) -> None:
+    """Increment the malformed-arguments counter when it is registered."""
+    if _malformed_tool_args is None:
+        return
+    _malformed_tool_args.labels(
+        model_name=_model_name or "",
+        parser=parser,
+        reason=reason,
+    ).inc()
 
 
 def record_tool_parser_invocation(

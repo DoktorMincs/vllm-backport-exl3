@@ -203,7 +203,7 @@ class KimiK2Parser(ParserEngine):
         slot.id = tool_id or ""
         super()._emit_name_delta(idx, deltas, tool_name)
 
-    def _handle_tool_end(self, event, deltas) -> None:
+    def _handle_tool_end(self, event, deltas, content_parts) -> None:
         idx = event.tool_index
         if 0 <= idx < len(self._tool_slots) and not self._tool_slots[idx].name_sent:
             tool_id, tool_name = self._extract_tool_id_and_name(
@@ -212,7 +212,7 @@ class KimiK2Parser(ParserEngine):
             if tool_name:
                 self._tool_slots[idx].id = tool_id or ""
                 self._tool_slots[idx].name = tool_name
-        super()._handle_tool_end(event, deltas)
+        super()._handle_tool_end(event, deltas, content_parts)
 
     def _handle_arg_chunk(self, event, deltas) -> None:
         idx = event.tool_index

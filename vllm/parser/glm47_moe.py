@@ -200,11 +200,11 @@ class Glm47MoeParser(ParserEngine):
             name = name.strip()
         super()._emit_name_delta(idx, deltas, name)
 
-    def _handle_tool_end(self, event, deltas) -> None:
+    def _handle_tool_end(self, event, deltas, content_parts) -> None:
         idx = event.tool_index
         if 0 <= idx < len(self._tool_slots):
             self._tool_slots[idx].name = self._tool_slots[idx].name.strip()
-        super()._handle_tool_end(event, deltas)
+        super()._handle_tool_end(event, deltas, content_parts)
 
     def is_reasoning_end(self, input_ids: list[int]) -> bool:
         if not self.thinking_enabled:

@@ -290,6 +290,27 @@ def find_tool_properties(
     return {}
 
 
+def find_tool_required(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> frozenset[str]:
+    """Find a tool by name and return its required property names."""
+    if not tools:
+        return frozenset()
+    for tool in tools:
+        if isinstance(tool, (FunctionTool, NamespaceTool)):
+            for name, params in iter_response_function_tool_info(tool):
+                if name == tool_name:
+                    return frozenset((params or {}).get("required") or ())
+            continue
+        if not _is_function_tool(tool):
+            continue
+        name, params = _extract_tool_info(tool)
+        if name == tool_name:
+            return frozenset((params or {}).get("required") or ())
+    return frozenset()
+
+
 def collect_tool_names(tools: list[Tool] | None) -> frozenset[str]:
     """Collect the names of all declared function tools."""
     if not tools:

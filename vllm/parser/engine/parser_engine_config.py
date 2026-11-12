@@ -21,6 +21,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from functools import cached_property
+from typing import Literal
 
 from vllm.parser.engine.events import EventType
 
@@ -85,6 +86,28 @@ class ParserEngineConfig:
     arg_converter: Callable[[str, bool], str] | None = None
 
     stream_arg_deltas: bool = True
+
+    # Buffer tool-call deltas until the call closes, so a malformed body
+    # can be dropped without leaving a half-announced tool call behind.
+    defer_tool_deltas: bool = False
+
+    # What to do with a tool call whose arguments the converter rejected:
+    # keep the legacy empty-arguments call, or return the raw body as
+    # content instead.
+    on_malformed_args: Literal["call", "content"] = "call"
+
+    # Inert text appended to a body surfaced as content, so a client-side
+    # DSML text recoverer cannot rebuild a call from it.
+    malformed_args_note: str = ""
+
+    # Close a trailing parameter that lost its closing tag when the name
+    # is a declared property of the tool.  Requires ``arg_converter`` to
+    # accept ``strict_headers``.
+    repair_unclosed_param: Callable[[str, dict], str | None] | None = None
+
+    # Reject a call whose arguments omit a property the tool declares as
+    # required, instead of forwarding a call the client must reject.
+    validate_required_args: bool = False
 
     tool_args_json: bool = True
 

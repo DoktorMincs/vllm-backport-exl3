@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import regex as re
 
+from vllm.parser.engine.errors import MalformedToolArgs
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.parser_engine_config import (
@@ -73,15 +74,36 @@ _PARTIAL_PARAM_RE = re.compile(
 )
 
 
+def _dsml_residue(raw_args: str, spans: list[tuple[int, int]]) -> str:
+    """Return the text of *raw_args* that lies outside *spans*."""
+    if not spans:
+        return raw_args
+    parts: list[str] = []
+    pos = 0
+    for start, end in spans:
+        parts.append(raw_args[pos:start])
+        pos = end
+    parts.append(raw_args[pos:])
+    return "".join(parts)
+
+
+def _classify_dsml_residue(residue: str) -> str:
+    if re.search(rf"<{_ESCAPED_DSML}\s*parameter", residue):
+        return "no_param_name"
+    return "unparsed_dsml"
+
+
 def _dsml_arg_converter(
     raw_args: str,
     partial: bool,
     *,
     param_re: re.Pattern = _PARAM_RE,
     partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
+    strict_headers: bool = False,
 ) -> str:
     params: dict[str, object] = {}
 
+    spans: list[tuple[int, int]] = []
     last_end = 0
     for m in param_re.finditer(raw_args):
         name, is_str, value = m.group(1), m.group(2), m.group(3)
@@ -92,6 +114,8 @@ def _dsml_arg_converter(
                 params[name] = json.loads(value)
             except (json.JSONDecodeError, ValueError):
                 params[name] = value
+        if strict_headers:
+            spans.append((m.start(), m.end()))
         last_end = m.end()
 
     if partial:
@@ -103,8 +127,51 @@ def _dsml_arg_converter(
             else:
                 with contextlib.suppress(json.JSONDecodeError, ValueError):
                     params[name] = json.loads(value)
+    elif strict_headers:
+        # Text left over after removing every matched parameter is DSML
+        # the patterns could not read.  A body that is empty or only
+        # whitespace is a legitimate ``{}``; anything else that still
+        # carries the marker is corruption, not arguments.
+        residue = _dsml_residue(raw_args, spans)
+        if residue.strip() and _DSML in residue:
+            raise MalformedToolArgs(_classify_dsml_residue(residue))
 
     return json.dumps(params, ensure_ascii=False)
+
+
+def _repair_unclosed_param(
+    raw_args: str,
+    properties: dict,
+    *,
+    param_re: re.Pattern,
+    open_re: re.Pattern,
+    close: str,
+) -> str | None:
+    """Close a trailing parameter that lost its closing tag.
+
+    Only the last, unterminated parameter is considered, and only when
+    its name is a declared property of the tool and its ``string`` flag
+    agrees with the declared type.  Returns the repaired body or
+    ``None`` when the repair is not provably safe.
+    """
+    matches = list(param_re.finditer(raw_args))
+    tail_start = matches[-1].end() if matches else 0
+    tail = raw_args[tail_start:]
+    # ``search`` rather than ``match``: the tail may start with the newline
+    # that separated it from the previous parameter.
+    m = open_re.search(tail)
+    if not m:
+        return None
+    name, is_str, value = m.group(1), m.group(2), m.group(3)
+    if name not in properties or _DSML in value:
+        return None
+    schema = properties.get(name)
+    declared = schema.get("type") if isinstance(schema, dict) else None
+    if is_str == "true" and declared not in (None, "string"):
+        return None
+    if is_str == "false" and declared == "string":
+        return None
+    return raw_args + close
 
 
 def _unwrap_wrapper_args(
