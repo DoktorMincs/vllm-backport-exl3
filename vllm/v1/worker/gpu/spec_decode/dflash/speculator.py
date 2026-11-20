@@ -19,6 +19,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     get_kv_cache_spec_sliding_window,
@@ -490,6 +491,24 @@ class DFlashSpeculator(DraftModelSpeculator):
             need_eager=is_profile,
             dp_sync=batch_sync,
         )
+        # The draft attention metadata describes exactly
+        # num_reqs_padded * num_query_per_req query rows (query_start_loc
+        # clamps at num_reqs). Eager dispatch rounds num_tokens up to the
+        # 16-token bucket, and FULL graphs round to a capture size: whenever
+        # the rounded count differs, the draft would run more rows than the
+        # metadata covers and FlashInfer's paged prefill rejects the batch
+        # (q.shape[0] != qo_indptr[-1]). Run the exact count instead.
+        if (
+            self.dp_size == 1
+            and batch_desc.num_tokens
+            != (batch_desc.num_reqs or num_reqs) * self.num_query_per_req
+        ):
+            batch_desc = BatchExecutionDescriptor(
+                cg_mode=CUDAGraphMode.NONE,
+                num_tokens=num_batch_tokens,
+                num_reqs=num_reqs,
+                num_active_loras=batch_desc.num_active_loras,
+            )
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
         num_tokens_across_dp = (

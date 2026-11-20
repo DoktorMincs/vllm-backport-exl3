@@ -2706,9 +2706,14 @@ class VllmConfig:
 
         # The DFlash2 candidate selector exists only in the V2 speculator. On
         # V1 the same checkpoint drafts through DFlashProposer, which never
-        # calls it, so the draft would degrade to DFlash1 silently.
+        # calls it, so the draft would degrade to DFlash1 silently: DFlash2
+        # REQUIRES V2 (it is not a V2 limitation). The refactor that moved the
+        # V2-forcing list (#53183) inverted this entry; do not re-add it here.
         if self._is_dflash2_draft():
-            unsupported.append("dflash2 drafts")
+            logger.info_once(
+                "DFlash2 draft detected: keeping Model Runner V2 "
+                "(the candidate selector lives only in the V2 speculator)."
+            )
 
         if self.model_config is not None and self.model_config.is_diffusion:
             unsupported.append("diffusion models")

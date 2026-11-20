@@ -2133,9 +2133,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.draft_tokens[input_batch.idx_mapping],
                     # So' usado com VLLM_DSPARK_CONF_CUT (o handler ignora
                     # se a env estiver vazia); as linhas estao na ordem do
-                    # input_batch, como os drafts acima.
+                    # input_batch, como os drafts acima. getattr: so' o
+                    # DSpark expoe confidencias; DFlash/EAGLE/MTP nao.
                     confidence=(
-                        self.speculator.draft_token_confidence_probs
+                        getattr(
+                            self.speculator,
+                            "draft_token_confidence_probs",
+                            None,
+                        )
                         if self.speculator is not None
                         else None
                     ),

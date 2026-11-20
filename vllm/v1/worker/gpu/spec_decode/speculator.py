@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import replace
+import os
 from typing import Any
 
 import numpy as np
@@ -281,6 +282,16 @@ class DraftModelSpeculator(BaseSpeculator):
                 * num_query_per_req
             )
             max_query_len = num_query_per_req
+        if os.environ.get("VLLM_DF2_DEBUG", "0") not in ("", "0", "false"):
+            logger.info(
+                "DF2 attn meta: num_reqs=%d padded=%d tokens_padded=%d "
+                "qpr=%d qsl=%s",
+                num_reqs,
+                num_reqs_padded,
+                num_tokens_padded,
+                num_query_per_req,
+                query_start_loc_cpu.tolist(),
+            )
         block_tables = [
             x[:num_reqs_padded] for x in self.block_tables.input_block_tables
         ]
