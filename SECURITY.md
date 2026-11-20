@@ -1,76 +1,34 @@
 # Security Policy
 
-## Reporting security issues
+## Scope
 
-Please report security issues privately using [the vulnerability submission form](https://github.com/vllm-project/vllm/security/advisories/new).
+`vllm-backport-exl3` is a fork of `wtdcode/vllm-backport` carrying the
+MiniMax-M3.1-Flash EXL3 engine work. The engine changes live on the
+`exl3-mm31-flash` branch; the EXL3 plugin changes are distributed as diffs
+under `docs/exl3-mm31/patches/`. No model weights are distributed here.
 
-## Issue triage
+## Reporting a vulnerability
 
-Reports will then be triaged by the [vulnerability management team](https://docs.vllm.ai/en/latest/contributing/vulnerability_management.html).
+Report privately through GitHub's private vulnerability reporting:
 
-## Reporter credit
+<https://github.com/DoktorMincs/vllm-backport-exl3/security/advisories/new>
 
-Credit for a vulnerability is given only to the first reporter. Subsequent
-reports of the same issue are not credited, including independent
-rediscoveries.
+Please do not open a public issue for an unfixed vulnerability. Include the
+affected file or commit, the configuration needed to reproduce it, and the
+impact you observed.
 
-We do not credit every submitter. The volume of duplicate and AI-generated
-reports would otherwise create unsustainable workload for the vulnerability
-management team.
+## Upstream and third-party issues
 
-## Threat model
+- Vulnerabilities in upstream vLLM that this fork did not introduce belong to
+  the vLLM project:
+  <https://github.com/vllm-project/vllm/security/advisories/new>
+- Issues in the `vcruz305/vllm-exl3` plugin itself belong to that project:
+  <https://github.com/vcruz305/vllm-exl3>
+- Issues in the engine changes, the documentation, or the scripts in this
+  repository are in scope here.
 
-Please see the [Security Guide in the vLLM documentation](https://docs.vllm.ai/en/latest/usage/security.html) for more information on vLLM's security assumptions and recommendations.
+## Disclosure
 
-Please see [PyTorch's Security Policy](https://github.com/pytorch/pytorch/blob/main/SECURITY.md) for more information and recommendations on how to securely interact with models.
-
-## Issue severity
-
-We will determine the risk of each issue, taking into account our experience dealing with past issues, versions affected, common defaults, and use cases. We use the following severity categories:
-
-### CRITICAL Severity
-
-Vulnerabilities that allow remote attackers to execute arbitrary code, take full control of the system, or significantly compromise confidentiality, integrity, or availability without any interaction or privileges needed, examples include remote code execution via network, deserialization issues that allow exploit chains. Generally those issues which are rated as CVSS  ≥ 9.0.
-
-### HIGH Severity
-
-Serious security flaws that allow elevated impact—like RCE in specific, limited contexts or significant data loss—but require advanced conditions or some trust, examples include RCE in advanced deployment modes (e.g. multi-node), or high impact issues where some sort of privileged network access is required. These issues typically have CVSS scores between 7.0 and 8.9
-
-### MODERATE Severity
-
-Vulnerabilities that cause denial of service or partial disruption, but do not allow arbitrary code execution or data breach and have limited impact. These issues have a CVSS rating between 4.0 and 6.9
-
-### LOW Severity
-
-Minor issues such as informational disclosures, logging errors, non-exploitable flaws, or weaknesses that require local or high-privilege access and offer negligible impact. Examples include side channel attacks or hash collisions. These issues often have CVSS scores less than 4.0
-
-## Fix disclosure policy
-
-When a security report is accepted, the fix process depends on the severity:
-
-* **CRITICAL and HIGH severity**: Fixes are developed in a private security fork and coordinated with the prenotification group before public disclosure.
-* **MODERATE and LOW severity**: Fixes are developed and submitted as public pull requests. These issues do not require embargo since they do not enable arbitrary code execution or significant data breach, and public visibility accelerates community review and adoption of the fix.
-
-The vulnerability management team reserves the right to adjust the disclosure approach on a case-by-case basis, taking into account factors such as active exploitation, unusual attack surface, or coordination requirements with downstream vendors.
-
-## CVE assignment and advisory publication
-
-After a security advisory has been accepted:
-
-* A CVE is requested when a patch for the advisory is merged.
-* The advisory is published when the fix lands in a vLLM release.
-
-## Prenotification policy
-
-For certain security issues of CRITICAL, HIGH, or MODERATE severity level, we may prenotify certain organizations or vendors that ship vLLM. The purpose of this prenotification is to allow for a coordinated release of fixes for severe issues.
-
-* This prenotification will be in the form of a private email notification. It may also include adding security contacts to the GitHub security advisory, typically a few days before release.
-
-* If you wish to be added to the prenotification group, please send an email copying all the members of the [vulnerability management team](https://docs.vllm.ai/en/latest/contributing/vulnerability_management.html). Each vendor contact will be analyzed on a case-by-case basis.
-
-* Organizations and vendors who either ship or use vLLM, are eligible to join the prenotification group if they meet at least one of the following qualifications
-    * Substantial internal deployment leveraging the upstream vLLM project.
-    * Established internal security teams and comprehensive compliance measures.
-    * Active and consistent contributions to the upstream vLLM project.
-
-* We may withdraw organizations from receiving future prenotifications if they release fixes or any other information about issues before they are public. Group membership may also change based on policy refinements for who may be included.
+We will acknowledge a report as soon as possible and coordinate a fix and
+disclosure with the reporter. Please allow time for a fix before publishing
+details.

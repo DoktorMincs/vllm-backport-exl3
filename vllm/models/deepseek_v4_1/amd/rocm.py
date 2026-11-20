@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import os
 from dataclasses import dataclass
 from typing import cast
 
@@ -36,6 +37,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_inv_rope_einsum,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
+    rocm_sparse_attn_prefill_paged,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -109,20 +111,27 @@ def _combine_topk_swa_indices_kernel(
     gather_lens_ptr,
     M,
     N,
+    num_tokens,
+    num_reqs,
     TOP_K: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     WINDOW_SIZE: tl.constexpr,
     TOPK_WIDTH: tl.constexpr,
     PADDED_TOP_K: tl.constexpr,
+    COMBINED_TOPK: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     worker_id = tl.program_id(1)
     num_workers = tl.num_programs(1)
 
     base = tl.load(query_start_loc_ptr)
-    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
-    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
-    query_len = query_end - query_start
+    query_start = tl.maximum(tl.load(query_start_loc_ptr + batch_idx) - base, 0)
+    query_end = tl.minimum(
+        tl.load(query_start_loc_ptr + batch_idx + 1) - base, num_tokens
+    )
+    query_len = tl.load(query_start_loc_ptr + batch_idx + 1) - tl.load(
+        query_start_loc_ptr + batch_idx
+    )
     seq_len = tl.load(seq_lens_ptr + batch_idx)
     gather_len = tl.load(gather_lens_ptr + batch_idx)
     start_pos = seq_len - query_len
@@ -131,36 +140,63 @@ def _combine_topk_swa_indices_kernel(
     for token_idx in range(query_start + worker_id, query_end, num_workers):
         token_idx_in_query = token_idx - query_start
         pos = start_pos + token_idx_in_query
-        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+
+        if COMPRESS_RATIO > 0:
+            topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+            topk_len = tl.maximum(topk_len, 0)
+        else:
+            topk_len = 0
+
         swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+        swa_len = tl.maximum(swa_len, 0)
+        combined_len = topk_len + swa_len
 
-        topk_offset = tl.arange(0, PADDED_TOP_K)
-        topk_mask = topk_offset < topk_len
-        safe_topk_offset = tl.where(topk_offset < TOPK_WIDTH, topk_offset, 0)
-        topk_indices = tl.load(
-            topk_indices_ptr + token_idx * topk_indices_stride + safe_topk_offset,
-            mask=topk_mask,
-            other=-1,
-        )
-        valid_topk = (topk_indices >= 0) & (topk_indices < N)
-        topk_indices = tl.where(valid_topk, topk_indices + M * batch_idx, -1)
-        tl.store(
-            combined_indices_ptr + token_idx * combined_indices_stride + topk_offset,
-            topk_indices,
-            mask=topk_mask,
-        )
+        row_ptr = combined_indices_ptr + token_idx * combined_indices_stride
 
+        # 1. Disjoint range [0, topk_len)
+        if TOP_K > 0:
+            topk_offset = tl.arange(0, PADDED_TOP_K)
+            topk_mask = (topk_offset < topk_len) & (topk_offset < TOPK_WIDTH)
+            topk_vals = tl.load(
+                topk_indices_ptr + token_idx * topk_indices_stride + topk_offset,
+                mask=topk_mask,
+                other=-1,
+            )
+            valid_topk = topk_mask & (topk_vals >= 0) & (topk_vals < N)
+            out_topk = tl.where(valid_topk, topk_vals + M * batch_idx, -1)
+            tl.store(
+                row_ptr + topk_offset,
+                out_topk,
+                mask=topk_mask,
+            )
+
+        # 2. Disjoint range [topk_len, topk_len + swa_len)
         swa_offset = tl.arange(0, WINDOW_SIZE)
+        swa_mask = swa_offset < swa_len
+        swa_vals = M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start
         tl.store(
-            combined_indices_ptr
-            + token_idx * combined_indices_stride
-            + topk_len
-            + swa_offset,
-            M * batch_idx + N + swa_offset + pos - swa_len + 1 - gather_start,
-            mask=swa_offset < swa_len,
+            row_ptr + topk_len + swa_offset,
+            swa_vals,
+            mask=swa_mask,
         )
 
-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
+        # 3. Disjoint range [combined_len, COMBINED_TOPK)
+        for c_start in tl.static_range(0, COMBINED_TOPK, 256):
+            c_offs = c_start + tl.arange(0, 256)
+            pad_mask = (c_offs >= combined_len) & (c_offs < COMBINED_TOPK)
+            tl.store(row_ptr + c_offs, -1, mask=pad_mask)
+
+        tl.store(combined_lens_ptr + token_idx, combined_len)
+
+    # Zero any trailing padding tokens beyond query_start_loc[num_reqs]
+    if batch_idx == 0:
+        total_q = tl.maximum(tl.load(query_start_loc_ptr + num_reqs) - base, 0)
+        for token_idx in range(total_q + worker_id, num_tokens, num_workers):
+            row_ptr = combined_indices_ptr + token_idx * combined_indices_stride
+            for c_start in tl.static_range(0, COMBINED_TOPK, 256):
+                c_offs = c_start + tl.arange(0, 256)
+                tl.store(row_ptr + c_offs, -1, mask=c_offs < COMBINED_TOPK)
+            tl.store(combined_lens_ptr + token_idx, 0)
 
 
 def combine_topk_swa_indices(
@@ -174,15 +210,7 @@ def combine_topk_swa_indices(
     M: int,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Combine compressed-attention and sliding-window indices with Torch.
-
-    The Triton implementation inherited from DeepSeek V4 launches a
-    two-dimensional grid with 128 workers per request.  On gfx950 it can issue
-    an out-of-bounds access for V4.1's mixed prefill metadata (including the
-    synthetic mixed-token warmup).  This path is prefill-only and the tensors
-    are small, so use ordinary Torch indexing until a gfx950-safe fused kernel
-    is available.
-    """
+    """Fused SM80 Triton kernel combining compressed-attention and SWA indices."""
     topk_indices = topk_indices.reshape(topk_indices.shape[0], -1).contiguous()
     num_tokens = topk_indices.shape[0]
     combined_topk = (
@@ -190,64 +218,50 @@ def combine_topk_swa_indices(
         // _SPARSE_PREFILL_TOPK_ALIGNMENT
         * _SPARSE_PREFILL_TOPK_ALIGNMENT
     )
-    combined_indices = torch.full(
+    num_reqs = seq_lens.shape[0]
+    if num_tokens == 0 or num_reqs == 0:
+        return (
+            torch.full(
+                (num_tokens, combined_topk),
+                fill_value=-1,
+                dtype=torch.int32,
+                device=topk_indices.device,
+            ),
+            torch.zeros(num_tokens, dtype=torch.int32, device=topk_indices.device),
+        )
+    combined_indices = torch.empty(
         (num_tokens, combined_topk),
-        fill_value=-1,
         dtype=torch.int32,
         device=topk_indices.device,
     )
     combined_lens = torch.empty(
         num_tokens, dtype=torch.int32, device=topk_indices.device
     )
+    logical_topk_width = min(topk, topk_indices.shape[1]) if topk > 0 else 0
+    padded_top_k = max(16, triton.next_power_of_2(max(1, logical_topk_width)))
+    num_workers = min(256, max(32, triton.next_power_of_2(num_tokens // num_reqs)))
 
-    # query_start_loc may have a non-zero base for a narrowed mixed batch.
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    req_ids = torch.repeat_interleave(
-        torch.arange(seq_lens.shape[0], device=seq_lens.device), query_lens
+    _combine_topk_swa_indices_kernel[(num_reqs, num_workers)](
+        combined_indices,
+        combined_indices.stride(0),
+        combined_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        M,
+        N,
+        num_tokens,
+        num_reqs,
+        TOP_K=logical_topk_width,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        TOPK_WIDTH=max(1, logical_topk_width),
+        PADDED_TOP_K=padded_top_k,
+        COMBINED_TOPK=combined_topk,
+        num_warps=4,
     )
-    query_starts = query_start_loc[:-1] - query_start_loc[0]
-    token_offsets = torch.arange(num_tokens, device=seq_lens.device) - (
-        torch.repeat_interleave(query_starts, query_lens)
-    )
-    positions = seq_lens[req_ids] - query_lens[req_ids] + token_offsets
-
-    logical_topk_width = min(topk, topk_indices.shape[1])
-    topk_lens = torch.minimum(
-        (positions + 1) // compress_ratio,
-        torch.full_like(positions, logical_topk_width),
-    ).clamp_min(0)
-    topk_offsets = torch.arange(logical_topk_width, device=seq_lens.device)
-    topk_mask = topk_offsets[None, :] < topk_lens[:, None]
-    topk_values = topk_indices[:, :logical_topk_width].to(torch.int32)
-    topk_valid = topk_mask & (topk_values >= 0) & (topk_values < N)
-    combined_indices[:, :logical_topk_width] = torch.where(
-        topk_valid,
-        topk_values + (M * req_ids).to(torch.int32)[:, None],
-        -1,
-    )
-
-    swa_lens = torch.minimum(
-        positions + 1, torch.full_like(positions, window_size)
-    ).clamp_min(0)
-    swa_offsets = torch.arange(window_size, device=seq_lens.device)
-    swa_mask = swa_offsets[None, :] < swa_lens[:, None]
-    swa_columns = topk_lens[:, None] + swa_offsets[None, :]
-    gather_starts = seq_lens - gather_lens
-    swa_values = (
-        M * req_ids[:, None]
-        + N
-        + swa_offsets[None, :]
-        + positions[:, None]
-        - swa_lens[:, None]
-        + 1
-        - gather_starts[req_ids, None]
-    ).to(torch.int32)
-    rows = torch.arange(num_tokens, device=seq_lens.device)[:, None].expand_as(
-        swa_columns
-    )
-    flat_dst = rows[swa_mask] * combined_topk + swa_columns[swa_mask]
-    combined_indices.view(-1).index_copy_(0, flat_dst, swa_values[swa_mask])
-    combined_lens.copy_((topk_lens + swa_lens).to(torch.int32))
     return combined_indices, combined_lens
 
 
@@ -391,6 +405,20 @@ def _copy_ragged_to_graph_buffers(
     return ragged_out, indptr_out
 
 
+# VLLM_RAGGED_DIRECT=1: pack the SWA ragged indices straight into the persistent
+# graph buffers (no temporary tensors, no two D2D copies per KV group per step).
+_RAGGED_DIRECT = os.environ.get("VLLM_RAGGED_DIRECT", "0").lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+# VLLM_DS41_PAGED_PREFILL=1: stream prefill KV directly from paged fp8_ds_mla
+# caches instead of reserving and gathering a [chunk, M, 512] BF16 workspace
+# (~513 MiB/rank on PP2 at 512k context). Set to 0 for legacy gather path.
+_PAGED_PREFILL = os.environ.get("VLLM_DS41_PAGED_PREFILL", "1").lower() not in (
+    "", "0", "false", "no", "off",
+)
+
+
 @dataclass
 class DeepseekV4ROCMAiterSparseSWAMetadata(DeepseekSparseSWAMetadata):
     decode_swa_ragged_indices: torch.Tensor | None = None
@@ -439,6 +467,20 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataBu
             and base.decode_swa_indices is not None
             and base.decode_swa_lens is not None
         ):
+            n_rows = base.num_decode_tokens
+            if _RAGGED_DIRECT and not _ON_GFX950:
+                needed = max(n_rows * base.decode_swa_width, 1)
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    base.decode_swa_indices.reshape(n_rows, base.decode_swa_width),
+                    base.decode_swa_lens,
+                    indices_out=self.decode_swa_ragged_indices_buffer[:needed],
+                    indptr_out=self.decode_swa_ragged_indptr_buffer[: n_rows + 1],
+                )
+                return DeepseekV4ROCMAiterSparseSWAMetadata(
+                    **vars(base),
+                    decode_swa_ragged_indices=ragged_indices,
+                    decode_swa_ragged_indptr=ragged_indptr,
+                )
             ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
                 base.decode_swa_indices.reshape(
                     base.num_decode_tokens, base.decode_swa_width
@@ -654,6 +696,15 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             result = self.wo_b(zf)
         return result
 
+    def _use_paged_prefill(self) -> bool:
+        return (
+            _PAGED_PREFILL
+            and self.kv_cache_dtype == "fp8_ds_mla"
+            and self.head_dim == 512
+            and self.nope_head_dim == 448
+            and self.rope_head_dim == 64
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor,
@@ -672,20 +723,20 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # Warmup dummy run: no real metadata. Reserve the same bf16
-            # gather workspace _forward_prefill would; the dequantize / topk
-            # / sparse_fwd kernels are skipped this step.
-            swa_only = self.compress_ratio == 0
-            N = (
-                0
-                if swa_only
-                else (self.max_model_len + self.compress_ratio - 1)
-                // self.compress_ratio
-            )
-            M = N + self.window_size + self.max_num_batched_tokens
-            current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-            )
+            # Warmup dummy run: no real metadata. Reserve the bf16 gather
+            # workspace only when the legacy gather prefill path is active.
+            if not self._use_paged_prefill():
+                swa_only = self.compress_ratio == 0
+                N = (
+                    0
+                    if swa_only
+                    else (self.max_model_len + self.compress_ratio - 1)
+                    // self.compress_ratio
+                )
+                M = N + self.window_size + self.max_num_batched_tokens
+                current_workspace_manager().get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                )
             output.zero_()
             return
 
@@ -751,18 +802,39 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             assert swa_metadata.is_valid_token is not None
             assert self.topk_indices_buffer is not None
             block_size = attn_metadata.block_size // self.compress_ratio
-            is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
-            (
-                topk_ragged_indices,
-                topk_ragged_indptr,
-                topk_lens,
-            ) = compute_global_topk_ragged_indices_and_indptr(
-                self.topk_indices_buffer[:num_decode_tokens],
-                swa_metadata.token_to_req_indices,
-                attn_metadata.block_table[:num_decodes],
+            decode_cache_key = (
+                self.topk_indices_buffer.data_ptr(),
+                attn_metadata.block_table.data_ptr(),
                 block_size,
-                is_valid,
+                num_decode_tokens,
+                num_decodes,
             )
+            cached_decode = getattr(swa_metadata, "_cached_decode_topk", None)
+            if (
+                self.indexer is None
+                and cached_decode is not None
+                and cached_decode[0] == decode_cache_key
+            ):
+                _, topk_ragged_indices, topk_ragged_indptr, topk_lens = cached_decode
+            else:
+                is_valid = swa_metadata.is_valid_token[:num_decode_tokens]
+                (
+                    topk_ragged_indices,
+                    topk_ragged_indptr,
+                    topk_lens,
+                ) = compute_global_topk_ragged_indices_and_indptr(
+                    self.topk_indices_buffer[:num_decode_tokens],
+                    swa_metadata.token_to_req_indices,
+                    attn_metadata.block_table[:num_decodes],
+                    block_size,
+                    is_valid,
+                )
+                swa_metadata._cached_decode_topk = (
+                    decode_cache_key,
+                    topk_ragged_indices,
+                    topk_ragged_indptr,
+                    topk_lens,
+                )
 
         rocm_sparse_attn_decode(
             q=q,
@@ -830,6 +902,55 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             top_k = 0
             N = 0
 
+        if (
+            self._use_paged_prefill()
+            and swa_k_cache.dtype == torch.uint8
+            and (swa_only or (compressed_k_cache is not None and compressed_k_cache.dtype == torch.uint8))
+        ):
+            total_q = int(
+                query_start_loc_cpu[num_decodes + num_prefills] - prefill_token_base
+            )
+            if total_q <= 0:
+                return
+            rocm_sparse_attn_prefill_paged(
+                q=q[:total_q],
+                compressed_k_cache=None if swa_only else compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                topk_indices=None if swa_only else topk_indices[:total_q],
+                query_start_loc=query_start_loc[
+                    num_decodes : num_decodes + num_prefills + 1
+                ],
+                seq_lens=seq_lens[:num_prefills],
+                gather_lens=gather_lens[:num_prefills],
+                mla_block_table=(
+                    None
+                    if swa_only
+                    else attn_metadata.block_table[
+                        num_decodes : num_decodes + num_prefills
+                    ]
+                ),
+                mla_block_size=(
+                    1
+                    if swa_only
+                    else attn_metadata.block_size // self.compress_ratio
+                ),
+                swa_block_table=swa_metadata.block_table[
+                    num_decodes : num_decodes + num_prefills
+                ],
+                swa_block_size=swa_metadata.block_size,
+                scale=self.scale,
+                head_dim=self.head_dim,
+                nope_head_dim=self.nope_head_dim,
+                rope_head_dim=self.rope_head_dim,
+                attn_sink=self.attn_sink,
+                top_k=top_k,
+                compress_ratio=0 if swa_only else self.compress_ratio,
+                window_size=self.window_size,
+                output=output[:total_q],
+                swa_use_fnuz=current_platform.is_fp8_fnuz(),
+            )
+            return
+
         M = N + self.window_size + self.max_num_batched_tokens
         num_chunks = (num_prefills + self.PREFILL_CHUNK_SIZE - 1) // (
             self.PREFILL_CHUNK_SIZE
@@ -878,28 +999,60 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
             )
 
-            combined_indices, combined_lens = combine_topk_swa_indices(
-                topk_indices[query_start:query_end],
-                query_start_loc[
-                    num_decodes + chunk_start : num_decodes + chunk_end + 1
-                ],
-                seq_lens[chunk_start:chunk_end],
-                gather_lens[chunk_start:chunk_end],
-                self.window_size,
+            ragged_key = (
+                swa_only,
                 self.compress_ratio,
-                top_k,
+                chunk_start,
+                chunk_end,
+                query_start,
+                query_end,
                 M,
                 N,
+                self.topk_indices_buffer.data_ptr(),
             )
+            cached_ragged = getattr(swa_metadata, "_cached_prefill_ragged", None)
+            if (
+                self.indexer is None
+                and cached_ragged is not None
+                and cached_ragged[0] == ragged_key
+            ):
+                _, ragged_indices, ragged_indptr = cached_ragged
+            else:
+                combined_indices, combined_lens = combine_topk_swa_indices(
+                    topk_indices[query_start:query_end],
+                    query_start_loc[
+                        num_decodes + chunk_start : num_decodes + chunk_end + 1
+                    ],
+                    seq_lens[chunk_start:chunk_end],
+                    gather_lens[chunk_start:chunk_end],
+                    self.window_size,
+                    self.compress_ratio,
+                    top_k,
+                    M,
+                    N,
+                )
+                ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+                    combined_indices.reshape(combined_indices.shape[0], -1),
+                    combined_lens,
+                    num_rows=self.PREFILL_CHUNK_SIZE * M,
+                )
+                swa_metadata._cached_prefill_ragged = (
+                    ragged_key,
+                    ragged_indices,
+                    ragged_indptr,
+                )
+
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices,
-                topk_length=combined_lens,
+                indices=None,
+                topk_length=None,
                 scale=self.scale,
                 head_dim=self.head_dim,
                 nope_head_dim=self.nope_head_dim,
                 rope_head_dim=self.rope_head_dim,
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
+                ragged_indices=ragged_indices,
+                ragged_indptr=ragged_indptr,
             )

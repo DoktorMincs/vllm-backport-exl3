@@ -2333,6 +2333,60 @@ def update_kv_cache_capacity(
         f"{max_model_len:,}",
         max_concurrency,
     )
+    if os.environ.get("VLLM_LOG_KV_GROUPS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        _log_kv_groups(vllm_config, kv_cache_config)
+
+
+def _log_kv_groups(vllm_config: VllmConfig, kv_cache_config: KVCacheConfig) -> None:
+    """Diagnostic (VLLM_LOG_KV_GROUPS=1): bytes per block of every KV group.
+
+    Shows where the hybrid manager pays page padding: for each group the spec
+    type, block size, page size (padded and unpadded) and layer count, plus the
+    pool tensors. ``bytes/token`` is the pool cost of one token if the group
+    holds one block per ``block_size * tokens_per_state`` tokens of a request.
+    """
+    logger.info(
+        "KV groups: num_blocks=%s tensors=%d tensor_bytes=%s bytes/block=%.0f",
+        kv_cache_config.num_blocks,
+        len(kv_cache_config.kv_cache_tensors),
+        [t.size for t in kv_cache_config.kv_cache_tensors],
+        sum(t.size for t in kv_cache_config.kv_cache_tensors)
+        / max(kv_cache_config.num_blocks, 1),
+    )
+    total = 0.0
+    for i, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        page = spec.page_size_bytes
+        real = getattr(spec, "real_page_size_bytes", page)
+        block = getattr(spec, "block_size", 0) or 1
+        n = len(group.layer_names)
+        per_token = n * page / (block * (getattr(spec, "tokens_per_state", 1) or 1))
+        total += per_token
+        try:
+            req_blocks = cdiv(spec.max_memory_usage_bytes(vllm_config), page)
+        except Exception:  # diagnostic only
+            req_blocks = -1
+        logger.info(
+            "KV group %d: %s layers=%d block_size=%d page=%d real_page=%d "
+            "padding=%.1f%% tokens_per_state=%s bytes/token(group)=%.0f "
+            "blocks/request(max_len)=%d",
+            i,
+            type(spec).__name__,
+            n,
+            block,
+            page,
+            real,
+            100.0 * (page - real) / page if page else 0.0,
+            getattr(spec, "tokens_per_state", None),
+            per_token,
+            req_blocks,
+        )
+    logger.info("KV groups: sum bytes/token over groups = %.0f", total)
 
 
 def _max_memory_usage_bytes_from_groups(
@@ -2587,16 +2641,31 @@ def get_kv_cache_configs(
 
     # When speculating with more than 1 speculative module (e.g. multi-layered MTP)
     # tag every SlidingWindowSpec with how many extra tokens to retain in the window.
+    # Also, under hybrid KV cache (e.g. MLA block_size=128 + SWA block_size=32) with
+    # EAGLE/DSpark block drop, dropping one aligned full-attention block backs a
+    # prefix-cache hit up by `max_block_size` tokens, so SWA must retain at least
+    # `max_block_size` extra trailing tokens below the active sliding window.
     extra_retained_tokens = (
         vllm_config.speculative_config.num_speculative_tokens - 1
         if vllm_config.speculative_config is not None
         and vllm_config.speculative_config.use_multi_module_mtp()
         else 0
     )
+    _max_spec_block_size = max(
+        (s.block_size for s in merged_kv_cache_specs.values()), default=0
+    )
+    _fix_hybrid_swa = (
+        vllm_config.speculative_config is not None
+        and not vllm_config.speculative_config.disable_eagle_block_drop
+        and os.environ.get("VLLM_FIX_HYBRID_SWA_PREFIX", "1") != "0"
+    )
     for layer_name, layer_spec in merged_kv_cache_specs.items():
         if isinstance(layer_spec, SlidingWindowSpec):
+            _layer_extra = extra_retained_tokens
+            if _fix_hybrid_swa and _max_spec_block_size > layer_spec.block_size:
+                _layer_extra = max(_layer_extra, _max_spec_block_size)
             merged_kv_cache_specs[layer_name] = replace(
-                layer_spec, extra_retained_tokens=extra_retained_tokens
+                layer_spec, extra_retained_tokens=_layer_extra
             )
 
     # Get global KV cache groups. This also handles spec unification for

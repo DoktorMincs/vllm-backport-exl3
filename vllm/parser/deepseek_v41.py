@@ -3,6 +3,7 @@
 """DeepSeek V4.1 reasoning and spaced DSML tool calls."""
 
 import functools
+import os
 from dataclasses import replace
 
 import regex as re
@@ -31,6 +32,7 @@ from vllm.parser.deepseek_v4 import (
 from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
     _dsml_arg_converter,
+    _repair_unclosed_param,
     deepseek_v4_config,
 )
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig
@@ -91,6 +93,36 @@ _PARTIAL_PARAM_RE = re.compile(
     r"(.*)$",
     re.DOTALL,
 )
+# Opener of a parameter whose closing tag never arrived; used only by the
+# opt-in repair path.
+_UNCLOSED_PARAM_RE = re.compile(
+    rf'{_PARAM_OPEN}\s+name="([^"]+)"\s+string="(true|false)">'
+    r"(.*)$",
+    re.DOTALL,
+)
+
+_STRICT_ENV = "VLLM_DS41_STRICT_DSML"
+_NOTE_ENV = "VLLM_DS41_MALFORMED_ARGS_NOTE"
+_DEFAULT_NOTE = " [tool call omitted: malformed DSML]"
+
+
+def _strict_dsml_enabled() -> bool:
+    return os.environ.get(_STRICT_ENV, "0").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _malformed_args_note() -> str:
+    note = os.environ.get(_NOTE_ENV)
+    if note is None:
+        return _DEFAULT_NOTE
+    # The note must never be able to start a DSML marker, or the client's
+    # text recoverer could rebuild a call out of it.
+    return note.replace("<", "")
 
 
 @functools.cache
@@ -102,6 +134,7 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
         name: (canon, *_TOLERATED_VARIANTS.get(name, ()))
         for name, canon in _CANONICAL_TERMINALS.items()
     }
+    strict = _strict_dsml_enabled()
     return replace(
         config,
         name="deepseek_v41",
@@ -116,6 +149,25 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
             _dsml_arg_converter,
             param_re=_PARAM_RE,
             partial_param_re=_PARTIAL_PARAM_RE,
+            strict_headers=strict,
+        ),
+        # Opt-in containment.  Everything below is inert by default so the
+        # V4.1 config keeps behaving exactly as before unless the operator
+        # sets VLLM_DS41_STRICT_DSML=1.
+        defer_tool_deltas=strict,
+        on_malformed_args="content" if strict else "call",
+        malformed_args_note=_malformed_args_note() if strict else "",
+        validate_tool_names=strict,
+        validate_required_args=strict,
+        repair_unclosed_param=(
+            functools.partial(
+                _repair_unclosed_param,
+                param_re=_PARAM_RE,
+                open_re=_UNCLOSED_PARAM_RE,
+                close=DSML_PARAM_CLOSE,
+            )
+            if strict
+            else None
         ),
     )
 

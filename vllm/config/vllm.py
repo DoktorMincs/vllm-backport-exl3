@@ -1808,7 +1808,7 @@ class VllmConfig:
                 "Disabling cascade attention when VLLM_BATCH_INVARIANT is enabled.",
             )
 
-        if self.parallel_config.use_ubatching:
+        if self.parallel_config.use_ubatching and not self.parallel_config.dbo_tp_only:
             a2a_backend = self.parallel_config.all2all_backend
             assert a2a_backend in [
                 "deepep_low_latency",
@@ -2706,15 +2706,25 @@ class VllmConfig:
 
         # The DFlash2 candidate selector exists only in the V2 speculator. On
         # V1 the same checkpoint drafts through DFlashProposer, which never
-        # calls it, so the draft would degrade to DFlash1 silently.
+        # calls it, so the draft would degrade to DFlash1 silently: DFlash2
+        # REQUIRES V2 (it is not a V2 limitation). The refactor that moved the
+        # V2-forcing list (#53183) inverted this entry; do not re-add it here.
         if self._is_dflash2_draft():
-            unsupported.append("dflash2 drafts")
+            logger.info_once(
+                "DFlash2 draft detected: keeping Model Runner V2 "
+                "(the candidate selector lives only in the V2 speculator)."
+            )
 
         if self.model_config is not None and self.model_config.is_diffusion:
             unsupported.append("diffusion models")
 
         if self.parallel_config.enable_batch_sharded_sampling:
             unsupported.append("batch-sharded sampling")
+
+        if self.parallel_config.dbo_tp_only:
+            unsupported.append(
+                "dual batch overlap without DP/EP (set VLLM_USE_V2_MODEL_RUNNER=1)"
+            )
 
         return unsupported
 
@@ -2820,11 +2830,12 @@ class VllmConfig:
         model_config = self.model_config
         parallel_config = self.parallel_config
 
+        tp_only_dbo = parallel_config.dbo_tp_only
         if self.lora_config is not None:
             unsupported.append("dual batch overlap with LoRA")
         if self.speculative_config is not None:
             unsupported.append("dual batch overlap with speculative decoding")
-        if parallel_config.pipeline_parallel_size > 1:
+        if parallel_config.pipeline_parallel_size > 1 and not envs.VLLM_DBO_ALLOW_PP:
             unsupported.append("dual batch overlap with pipeline parallelism")
         if (
             parallel_config.decode_context_parallel_size > 1
@@ -2832,13 +2843,15 @@ class VllmConfig:
         ):
             unsupported.append("dual batch overlap with context parallelism")
         if model_config is not None and (
-            model_config.is_multimodal_model or model_config.is_encoder_decoder
+            (model_config.is_multimodal_model and not tp_only_dbo)
+            or model_config.is_encoder_decoder
         ):
             unsupported.append("dual batch overlap with multimodal models")
         if model_config is not None and model_config.is_hybrid:
             unsupported.append("dual batch overlap with hybrid models")
-        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
-            unsupported.append("dual batch overlap with CUDA graphs")
+        if self.compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE:
+            # DBO captures FULL graphs only.
+            unsupported.append("dual batch overlap with PIECEWISE CUDA graphs")
         if self.is_mm_encoder_only:
             unsupported.append("dual batch overlap with encoder only models")
 

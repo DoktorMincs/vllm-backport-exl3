@@ -38,6 +38,10 @@ def _quantize_input(
 
 
 class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
+    def supports_dbo(self) -> bool:
+        # No all2all: the DBO hand-offs are the TP all-reduces.
+        return True
+
     @property
     def activation_format(self) -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard

@@ -47,6 +47,8 @@ from vllm.distributed.parallel_state import (
     checkpoint_restore_distributed_state,
     get_pp_group,
     get_tp_group,
+    proto_step_done,
+    proto_timer,
     resume_device_comms,
     suspend_device_comms,
 )
@@ -223,6 +225,10 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+        # Alternative PP handoff (VLLM_PP_TRANSPORT=host). Stays None -- and
+        # the NCCL path below is then bit-for-bit the default one -- unless the
+        # env asks for it; the transport itself is built in load_model().
+        self._pp_host = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -355,6 +361,23 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        # VLLM_CUSTOM_AR_ENFORCE=1: resolve the enforced custom-AR cutoff
+        # before the distributed environment initializes CustomAllreduce —
+        # the global config context is not active yet at that point, but the
+        # worker owns its VllmConfig here.
+        if envs.VLLM_CUSTOM_AR_ENFORCE and not os.environ.get(
+            "VLLM_CUSTOM_AR_ENFORCED_MB"
+        ):
+            from vllm.distributed.device_communicators.custom_all_reduce import (
+                custom_ar_enforced_size_mb_from_config,
+            )
+
+            enforced_mb = custom_ar_enforced_size_mb_from_config(
+                self.vllm_config
+            )
+            if enforced_mb is not None:
+                os.environ["VLLM_CUSTOM_AR_ENFORCED_MB"] = str(enforced_mb)
+
         # Give every worker process its own Triton JIT cache. By default all
         # local ranks share one cache directory; concurrent compile+load of
         # the same freshly-written kernel across ranks can read a partially
@@ -471,6 +494,10 @@ class Worker(WorkerBase):
 
         # DSpark target and draft CUDA graphs retain workspace views concurrently.
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
+        parallel_config = self.vllm_config.parallel_config
+        if self.use_v2_model_runner and parallel_config.dbo_tp_only:
+            # Both microbatches compute on one stream: one workspace set.
+            num_ubatches = 1
         init_workspace_manager(
             self.device,
             num_ubatches,
@@ -478,6 +505,24 @@ class Worker(WorkerBase):
         )
 
         # Construct the model runner
+        if (
+            envs.VLLM_PP_TRANSPORT == "host"
+            and envs.VLLM_PP_HOST_FORCE_EAGER
+            and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+        ):
+            # Bring-up knob for the host PP transport: disable torch.compile
+            # and CUDA graphs before the runner exists. The transport is only
+            # used outside graph capture (see pp_host.py), so this is
+            # deliberately opt-in and off by default.
+            logger.warning_once(
+                "VLLM_PP_TRANSPORT=host with VLLM_PP_HOST_FORCE_EAGER=1: "
+                "disabling torch.compile and CUDAGraphs on this path."
+            )
+            self.vllm_config.compilation_config.mode = CompilationMode.NONE
+            self.vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            self.vllm_config.compilation_config.max_cudagraph_capture_size = 0
+            self.vllm_config.compilation_config.cudagraph_capture_sizes = []
+
         if self.use_v2_model_runner:
             if self.vllm_config.is_mm_encoder_only:
                 from vllm.v1.worker.mm_encoder_model_runner import (
@@ -517,6 +562,18 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+
+        # Alternative PP handoff. The env check is the only cost on the default
+        # path (VLLM_PP_TRANSPORT=nccl): no import, no allocation.
+        if self._pp_host is None and envs.VLLM_PP_TRANSPORT == "host":
+            if self.vllm_config.parallel_config.pipeline_parallel_size <= 1:
+                raise ValueError(
+                    "VLLM_PP_TRANSPORT=host requires pipeline_parallel_size > 1"
+                )
+            from vllm.v1.worker.gpu import pp_utils
+
+            with set_current_vllm_config(self.vllm_config):
+                self._pp_host = pp_utils.make_host_transport(self)
 
         if has_ec_transfer():
             get_ec_transfer().start_worker_services()
@@ -1162,10 +1219,14 @@ class Worker(WorkerBase):
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # Wait for the previous step's sends so this forward pass cannot
-        # overwrite buffers they are still reading.
+        # overwrite buffers they are still reading. The host transport needs
+        # the same gate (as a stream dependency) at the top of the step.
+        if self._pp_host is not None:
+            self._pp_host.wait_send()
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
+            with proto_timer("wait_prev_send"):
+                for handle in self._pp_send_work:
+                    handle.wait()
             self._pp_send_work = []
 
         intermediate_tensors = None
@@ -1205,18 +1266,34 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            if self._pp_host is not None:
+                # Host transport: the call returns already-ordered GPU tensors
+                # (no comm handles, no gloo metadata round-trip).
+                intermediate_tensors = self._pp_host.recv_tensors(
+                    all_gather_tensors=all_gather_tensors
                 )
-            )
-            assert tensor_dict is not None
-            intermediate_tensors = AsyncIntermediateTensors(
-                tensor_dict,
-                comm_handles=comm_handles,
-                comm_postprocess=comm_postprocess,
-            )
+            else:
+                with proto_timer("recv_total"):
+                    _ag_group = (
+                        get_tp_group()
+                        if (
+                            os.environ.get("VLLM_PP_SKIP_EMPTY_AG", "1") == "0"
+                            or any(all_gather_tensors.values())
+                        )
+                        else None
+                    )
+                    tensor_dict, comm_handles, comm_postprocess = (
+                        get_pp_group().irecv_tensor_dict(
+                            all_gather_group=_ag_group,
+                            all_gather_tensors=all_gather_tensors,
+                        )
+                    )
+                assert tensor_dict is not None
+                intermediate_tensors = AsyncIntermediateTensors(
+                    tensor_dict,
+                    comm_handles=comm_handles,
+                    comm_postprocess=comm_postprocess,
+                )
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -1231,6 +1308,7 @@ class Worker(WorkerBase):
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                proto_step_done(self.rank)
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1243,12 +1321,31 @@ class Worker(WorkerBase):
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
-        handles = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
-        self._pp_send_work = handles[1:]
+        if self._pp_host is not None:
+            # The transport orders the caller's main stream after its own
+            # copies, so there is no handle to wait at the top of the next step.
+            self._pp_host.send_tensors(
+                output.tensors, all_gather_tensors=all_gather_tensors
+            )
+            self._pp_send_work = []
+        else:
+            with proto_timer("isend_total"):
+                _ag_group_send = (
+                    get_tp_group()
+                    if (
+                        os.environ.get("VLLM_PP_SKIP_EMPTY_AG", "1") == "0"
+                        or any(all_gather_tensors.values())
+                    )
+                    else None
+                )
+                handles = get_pp_group().isend_tensor_dict(
+                    output.tensors,
+                    all_gather_group=_ag_group_send,
+                    all_gather_tensors=all_gather_tensors,
+                )
+            self._pp_send_work = handles[1:]
+
+        proto_step_done(self.rank)
 
         return None
 
@@ -1503,6 +1600,12 @@ class Worker(WorkerBase):
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        # Release the host PP transport's segments and relay thread (None on
+        # the default NCCL path).
+        if pp_host := getattr(self, "_pp_host", None):
+            pp_host.close()
+            self._pp_host = None
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to

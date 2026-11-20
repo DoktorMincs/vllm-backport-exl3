@@ -34,6 +34,14 @@ chunk-by-chunk while an n-gram at position ``p`` needs the token ids at
   cache for the rest.
 """
 
+import concurrent.futures
+import functools
+import json
+import os
+import re
+import struct
+import threading
+import time
 import weakref
 
 import numpy as np
@@ -59,6 +67,159 @@ logger = init_logger(__name__)
 
 # Cache value for tokens that take no part in an n-gram (image spans).
 DEAD_ID = -1
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+# --- Frente 3 experiments (all default off, behaviour is unchanged) ---------
+# None of these is read on the default path: every call site is behind a
+# module-level boolean, so the disabled code is the pre-existing code.
+_ENGRAM_TIME = _env_flag("VLLM_DS41_ENGRAM_TIME")
+"""A2: per-phase wall-clock accounting on the disk engram hot path."""
+
+try:
+    _ENGRAM_REUSE_HASH = int(os.environ.get("VLLM_DS41_ENGRAM_REUSE_HASH", "0"))
+    if _ENGRAM_REUSE_HASH not in (0, 1, 2):
+        raise ValueError("must be 0, 1 or 2")
+except ValueError as _e:
+    logger.warning("ignoring VLLM_DS41_ENGRAM_REUSE_HASH: %s", _e)
+    _ENGRAM_REUSE_HASH = 0
+"""3.1: 0 = hash twice per step (today), 1 = reuse the staged hashes,
+2 = reuse but recompute and compare (verification mode)."""
+
+_ENGRAM_OVERLAP = _env_flag("VLLM_DS41_ENGRAM_OVERLAP")
+"""3.2: gather the disk rows of every engram layer on worker threads and join
+them only right before each layer's lookup kernel.
+
+The fallback allowed by the plan is what is implemented here: all host work
+stays in the eager model-state hook (``stage_engram_rows``). Moving the join
+into ``Engram.forward`` would overlap the preads with the decoder-layer
+compute of the same step, but that forward is CUDA-graph capturable and a
+host round trip inside it is illegal (see ``rows_staged_by_runner``). What we
+do overlap is the per-layer gathers with each other -- submit layer 0..N, then
+join+launch kernel 0..N -- and with GPU work still in flight from the previous
+step. Generic over any number of engram layers; no layer count is assumed.
+"""
+
+_ENGRAM_ASYNC_D2H = _env_flag("VLLM_DS41_ENGRAM_ASYNC_D2H")
+"""3.3: copy the hash ids to a pinned host buffer on a side CUDA stream."""
+
+_ENGRAM_THREADS: int | None
+try:
+    _ENGRAM_THREADS = int(os.environ["VLLM_DS41_ENGRAM_THREADS"])
+    if _ENGRAM_THREADS < 1:
+        raise ValueError("must be >= 1")
+except KeyError:
+    _ENGRAM_THREADS = None
+except ValueError as _e:  # bad value: fall back to the built-in formula
+    logger.warning("ignoring VLLM_DS41_ENGRAM_THREADS: %s", _e)
+    _ENGRAM_THREADS = None
+
+_ENGRAM_THREAD_FLOOR = _env_flag("VLLM_DS41_ENGRAM_THREAD_FLOOR")
+"""3.4: cap the reader threads at 2 when a lookup stages fewer than 256 rows."""
+
+_ENGRAM_FAST_GATHER = _env_flag("VLLM_DS41_ENGRAM_FAST_GATHER")
+"""Wave 3 (DEC-4): persistent C pthread pool + striped direct-mapped row cache
++ stream-ordered pinned D2H/H2D on current_stream (0 = legacy path)."""
+
+try:
+    _ENGRAM_CACHE_POW2 = max(
+        12, min(20, int(os.environ.get("VLLM_DS41_ENGRAM_CACHE_POW2", "17")))
+    )
+except ValueError:
+    _ENGRAM_CACHE_POW2 = 17
+
+
+class _EngramTimer:
+    """Opt-in (``VLLM_DS41_ENGRAM_TIME=1``) decomposition of the engram cost.
+
+    ``record`` is called from the timed branches only; ``tick`` closes one
+    model step and emits, every ``REPORT_EVERY`` steps, one line per layer
+    with the per-step mean of each phase. Tags are the engram layer id
+    (``layer=14``) or ``hash`` for the n-gram hash launches.
+    """
+
+    REPORT_EVERY = 20
+
+    def __init__(self) -> None:
+        self.steps = 0
+        self._window = 0
+        self._fields: dict[tuple[str, str], list[float]] = {}
+        self._rows: dict[str, int] = {}
+        self._tokens = 0
+        # 3.2 records from the gather worker threads.
+        self._lock = threading.Lock()
+
+    def record(self, tag: str, phase: str, seconds: float) -> None:
+        with self._lock:
+            acc = self._fields.get((tag, phase))
+            if acc is None:
+                self._fields[(tag, phase)] = [seconds, 1.0]
+            else:
+                acc[0] += seconds
+                acc[1] += 1.0
+
+    def add_rows(self, tag: str, rows: int, tokens: int | None = None) -> None:
+        with self._lock:
+            if rows:
+                self._rows[tag] = self._rows.get(tag, 0) + rows
+            if tokens is not None:
+                self._tokens = tokens
+
+    def tick(self) -> None:
+        """Close one model step; flush every ``REPORT_EVERY`` steps."""
+        self.steps += 1
+        self._window += 1
+        if self._window >= self.REPORT_EVERY:
+            self.flush()
+
+    def flush(self) -> None:
+        window = self._window
+        if window == 0:
+            return
+        tags = sorted({tag for tag, _ in self._fields} | set(self._rows), key=str)
+        hash_parts = [
+            f"{phase}={self._mean('hash', phase) * 1e3:.2f}ms"
+            for phase in ("stage", "fwd")
+            if ("hash", phase) in self._fields
+        ]
+        for tag in tags:
+            phases = (
+                ("stage", "fwd")
+                if tag == "hash"
+                else ("d2h", "uniq", "preads", "h2d", "wait")
+            )
+            parts = [
+                f"{phase}={self._mean(tag, phase) * 1e3:.2f}ms"
+                for phase in phases
+                if (tag, phase) in self._fields
+            ]
+            if tag != "hash" and hash_parts:
+                parts.extend(hash_parts)  # the hash covers every layer
+            if tag in self._rows:
+                parts.append(f"rows={self._rows[tag] / window:.1f}")
+            if self._tokens:
+                parts.append(f"tokens={self._tokens}")
+            if parts:
+                logger.info(
+                    "ENGRAM-TIME steps=%d layer=%s %s",
+                    self.steps,
+                    tag,
+                    " ".join(parts),
+                )
+        self._fields.clear()
+        self._rows.clear()
+        self._tokens = 0
+        self._window = 0
+
+    def _mean(self, tag: str, phase: str) -> float:
+        total, count = self._fields[(tag, phase)]
+        return total / count
+
+
+_ENGRAM_TIMER = _EngramTimer()
 
 
 def _is_prime(n: int) -> bool:
@@ -584,8 +745,10 @@ def _engram_lookup_kernel(
     """Gather fp8 rows, apply their ue8m0 block scales, write bf16.
 
     Only this rank's heads are read; padded heads write zeros for all-gather.
-    `weight`/`scales` may address pinned host memory through UVA. `weight` is
-    the uint8 view of the e4m3 rows so the decode also compiles below SM89.
+    `weight`/`scales` may address pinned host memory through UVA. `weight`
+    is the e4m3 table viewed as uint8: Triton has no fp8 convert below SM89,
+    so the bytes are decoded by ``_decode_fp8_f32`` (hardware convert where
+    it exists, ALU decode on SM8x).
     """
     cols = tl.arange(0, DIM)
     scale_cols = cols // QUANT_BLOCK
@@ -602,12 +765,12 @@ def _engram_lookup_kernel(
         owned = valid & (head < TOTAL_HEADS)
         owned &= (index >= vocab_start) & (index < vocab_end)
         local = tl.where(owned, index - vocab_start, 0)
-        values = tl.load(
+        values_u8 = tl.load(
             weight + local[:, None] * DIM + cols[None, :],
             mask=owned[:, None],
             other=0,
         )
-        values = _decode_fp8_f32(values, False)
+        values = _decode_fp8_f32(values_u8, False)
         scale = tl.load(
             scales + local[:, None] * (DIM // QUANT_BLOCK) + scale_cols[None, :],
             mask=owned[:, None],
@@ -620,6 +783,1034 @@ def _engram_lookup_kernel(
             (values * scale).to(tl.bfloat16),
             mask=valid[:, None],
         )
+
+
+_ENGRAM_EMBED_KEY_RE = re.compile(r"(layers\.\d+\.engram)\b")
+
+
+def _hf_engram_prefix(prefix: str) -> str:
+    """``model.layers.1.engram`` (vLLM prefix) -> ``layers.1.engram`` (checkpoint)."""
+    m = _ENGRAM_EMBED_KEY_RE.search(prefix)
+    if m is None:
+        raise ValueError(f"cannot derive the checkpoint engram key from {prefix!r}")
+    return m.group(1)
+
+
+_ENGRAM_PREAD_C = r"""
+#include <pthread.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+typedef struct {
+    int fd_w, fd_s;
+    int64_t base_w, base_s;
+    const int64_t *rows;
+    int64_t lo, hi;
+    uint8_t *vals, *scales;
+    int dim, sdim;
+    int64_t short_reads;
+} job_t;
+
+static void *worker(void *arg) {
+    job_t *j = (job_t *)arg;
+    for (int64_t i = j->lo; i < j->hi; i++) {
+        int64_t r = j->rows[i];
+        ssize_t a = pread(j->fd_w, j->vals + i * j->dim, j->dim, j->base_w + r * j->dim);
+        ssize_t b = pread(j->fd_s, j->scales + i * j->sdim, j->sdim, j->base_s + r * j->sdim);
+        if (a != j->dim || b != j->sdim) j->short_reads++;
+    }
+    return NULL;
+}
+
+/* Gather rows[0..n) of a (values, scales) table with `threads` pthreads.
+   Returns the number of short/failed reads (0 = success). */
+int64_t engram_gather(int fd_w, int fd_s, int64_t base_w, int64_t base_s,
+                      const int64_t *rows, int64_t n, uint8_t *vals,
+                      uint8_t *scales, int dim, int sdim, int threads) {
+    if (n <= 0) return 0;
+    if (threads < 1) threads = 1;
+    if (threads > n) threads = (int)n;
+    pthread_t tid[256];
+    job_t jobs[256];
+    if (threads > 256) threads = 256;
+    int64_t per = (n + threads - 1) / threads;
+    int started = 0;
+    for (int t = 0; t < threads; t++) {
+        int64_t lo = t * per, hi = lo + per > n ? n : lo + per;
+        if (lo >= hi) break;
+        jobs[t] = (job_t){fd_w, fd_s, base_w, base_s, rows, lo, hi, vals, scales, dim, sdim, 0};
+        if (pthread_create(&tid[t], NULL, worker, &jobs[t]) != 0) {
+            worker(&jobs[t]);
+            continue;
+        }
+        started = t + 1;
+    }
+    int64_t bad = 0;
+    for (int t = 0; t < started; t++) {
+        pthread_join(tid[t], NULL);
+        bad += jobs[t].short_reads;
+    }
+    return bad;
+}
+
+/* --- Persistent pthread pool + striped direct-mapped row cache (DEC-4) --- */
+#define ENGRAM_CACHE_STRIPES 256
+
+typedef struct engram_pool_s engram_pool_t;
+
+typedef struct {
+    engram_pool_t *pool;
+    int tid;
+    uint64_t target_epoch;
+    pthread_cond_t cv;
+} pool_worker_arg_t;
+
+struct engram_pool_s {
+    pid_t owner_pid;
+    int num_threads;
+    int dim, sdim;
+    int cache_pow2;
+    uint64_t cache_slots;
+    int64_t *cache_tags;
+    uint8_t *cache_vals;
+    uint8_t *cache_scales;
+    pthread_mutex_t stripe_mu[ENGRAM_CACHE_STRIPES];
+
+    /* Deduplication hash table + scratch */
+    uint64_t ht_size;
+    uint64_t ht_mask;
+    uint32_t ht_cur_gen;
+    uint32_t *ht_gen;
+    int64_t *ht_key;
+    int32_t *ht_val;
+    int64_t max_cap;
+    int64_t *uniq_buf;
+    int32_t *miss_idx;
+
+    /* Work dispatch */
+    pthread_mutex_t mu;
+    pthread_cond_t cv_done;
+    uint64_t work_epoch;
+    int stop;
+    int active_threads;
+    int remaining;
+    int fd_w, fd_s;
+    int64_t base_w, base_s;
+    int64_t n_miss;
+    uint8_t *vals;
+    uint8_t *scales;
+    int64_t short_reads;
+
+    pthread_t *tids;
+    pool_worker_arg_t *wargs;
+};
+
+static inline uint64_t engram_hash64(uint64_t x) {
+    return x * 11400714819323198485ULL;
+}
+
+static int cmp_i64(const void *a, const void *b) {
+    int64_t va = *(const int64_t *)a;
+    int64_t vb = *(const int64_t *)b;
+    return (va > vb) - (va < vb);
+}
+
+static inline void read_and_cache_one(
+    engram_pool_t *p, int fd_w, int fd_s, int64_t base_w, int64_t base_s,
+    int64_t r, uint8_t *dst_v, uint8_t *dst_s, int64_t *bad_acc
+) {
+    ssize_t a = pread(fd_w, dst_v, p->dim, base_w + r * p->dim);
+    ssize_t b = pread(fd_s, dst_s, p->sdim, base_s + r * p->sdim);
+    if (a != p->dim || b != p->sdim) {
+        __atomic_fetch_add(bad_acc, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    uint64_t slot = engram_hash64((uint64_t)r) >> (64 - p->cache_pow2);
+    pthread_mutex_t *smu = &p->stripe_mu[slot & (ENGRAM_CACHE_STRIPES - 1)];
+    pthread_mutex_lock(smu);
+    p->cache_tags[slot] = r;
+    memcpy(p->cache_vals + slot * (size_t)p->dim, dst_v, (size_t)p->dim);
+    memcpy(p->cache_scales + slot * (size_t)p->sdim, dst_s, (size_t)p->sdim);
+    pthread_mutex_unlock(smu);
+}
+
+static void *pool_worker_main(void *arg) {
+    pool_worker_arg_t *wa = (pool_worker_arg_t *)arg;
+    engram_pool_t *p = wa->pool;
+    int tid = wa->tid;
+    uint64_t seen_epoch = 0;
+
+    for (;;) {
+        pthread_mutex_lock(&p->mu);
+        while (!p->stop && wa->target_epoch == seen_epoch) {
+            pthread_cond_wait(&wa->cv, &p->mu);
+        }
+        if (p->stop) {
+            pthread_mutex_unlock(&p->mu);
+            return NULL;
+        }
+        seen_epoch = wa->target_epoch;
+        int active = p->active_threads;
+        int64_t n_miss = p->n_miss;
+        int fd_w = p->fd_w, fd_s = p->fd_s;
+        int64_t base_w = p->base_w, base_s = p->base_s;
+        uint8_t *vals = p->vals, *scales = p->scales;
+        pthread_mutex_unlock(&p->mu);
+
+        int64_t per = (n_miss + active - 1) / active;
+        int64_t lo = (int64_t)tid * per;
+        int64_t hi = lo + per > n_miss ? n_miss : lo + per;
+        for (int64_t m = lo; m < hi; m++) {
+            int32_t u = p->miss_idx[m];
+            int64_t r = p->uniq_buf[u];
+            read_and_cache_one(
+                p, fd_w, fd_s, base_w, base_s, r,
+                vals + (size_t)u * (size_t)p->dim,
+                scales + (size_t)u * (size_t)p->sdim,
+                &p->short_reads
+            );
+        }
+        pthread_mutex_lock(&p->mu);
+        if (--p->remaining == 0) {
+            pthread_cond_signal(&p->cv_done);
+        }
+        pthread_mutex_unlock(&p->mu);
+    }
+}
+
+void *engram_pool_create(int num_threads, int dim, int sdim, int cache_pow2, int64_t max_cap) {
+    if (num_threads < 1) num_threads = 1;
+    if (num_threads > 256) num_threads = 256;
+    if (cache_pow2 < 12) cache_pow2 = 12;
+    if (cache_pow2 > 20) cache_pow2 = 20;
+    if (max_cap < 1024) max_cap = 1024;
+
+    engram_pool_t *p = (engram_pool_t *)calloc(1, sizeof(engram_pool_t));
+    if (!p) return NULL;
+    p->owner_pid = getpid();
+    p->num_threads = num_threads;
+    p->dim = dim;
+    p->sdim = sdim;
+    p->cache_pow2 = cache_pow2;
+    p->cache_slots = 1ULL << cache_pow2;
+    p->max_cap = max_cap;
+
+    uint64_t ht_size = 4096;
+    while (ht_size < (uint64_t)max_cap * 4ULL) ht_size <<= 1;
+    p->ht_size = ht_size;
+    p->ht_mask = ht_size - 1;
+    p->ht_cur_gen = 1;
+
+    p->cache_tags = (int64_t *)malloc(p->cache_slots * sizeof(int64_t));
+    p->cache_vals = (uint8_t *)malloc(p->cache_slots * (size_t)dim);
+    p->cache_scales = (uint8_t *)malloc(p->cache_slots * (size_t)sdim);
+    p->ht_gen = (uint32_t *)calloc(ht_size, sizeof(uint32_t));
+    p->ht_key = (int64_t *)malloc(ht_size * sizeof(int64_t));
+    p->ht_val = (int32_t *)malloc(ht_size * sizeof(int32_t));
+    p->uniq_buf = (int64_t *)malloc((size_t)max_cap * sizeof(int64_t));
+    p->miss_idx = (int32_t *)malloc((size_t)max_cap * sizeof(int32_t));
+    p->tids = (pthread_t *)calloc((size_t)num_threads, sizeof(pthread_t));
+    p->wargs = (pool_worker_arg_t *)calloc((size_t)num_threads, sizeof(pool_worker_arg_t));
+
+    if (!p->cache_tags || !p->cache_vals || !p->cache_scales || !p->ht_gen ||
+        !p->ht_key || !p->ht_val || !p->uniq_buf || !p->miss_idx || !p->tids || !p->wargs) {
+        free(p->cache_tags); free(p->cache_vals); free(p->cache_scales);
+        free(p->ht_gen); free(p->ht_key); free(p->ht_val);
+        free(p->uniq_buf); free(p->miss_idx); free(p->tids); free(p->wargs);
+        free(p);
+        return NULL;
+    }
+    memset(p->cache_tags, 0xff, p->cache_slots * sizeof(int64_t));
+
+    for (int i = 0; i < ENGRAM_CACHE_STRIPES; i++) {
+        pthread_mutex_init(&p->stripe_mu[i], NULL);
+    }
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv_done, NULL);
+
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+
+    int started = 0;
+    for (int t = 0; t < num_threads; t++) {
+        p->wargs[t].pool = p;
+        p->wargs[t].tid = t;
+        p->wargs[t].target_epoch = 0;
+        pthread_cond_init(&p->wargs[t].cv, NULL);
+        if (pthread_create(&p->tids[t], &attr, pool_worker_main, &p->wargs[t]) != 0) {
+            pthread_cond_destroy(&p->wargs[t].cv);
+            break;
+        }
+        started++;
+    }
+    pthread_attr_destroy(&attr);
+    p->num_threads = started;
+    if (started == 0) {
+        free(p->cache_tags); free(p->cache_vals); free(p->cache_scales);
+        free(p->ht_gen); free(p->ht_key); free(p->ht_val);
+        free(p->uniq_buf); free(p->miss_idx); free(p->tids); free(p->wargs);
+        free(p);
+        return NULL;
+    }
+    return p;
+}
+
+void engram_pool_destroy(void *ptr) {
+    engram_pool_t *p = (engram_pool_t *)ptr;
+    if (!p) return;
+    if (p->owner_pid == getpid()) {
+        pthread_mutex_lock(&p->mu);
+        p->stop = 1;
+        for (int t = 0; t < p->num_threads; t++) {
+            pthread_cond_signal(&p->wargs[t].cv);
+        }
+        pthread_mutex_unlock(&p->mu);
+        for (int t = 0; t < p->num_threads; t++) {
+            pthread_join(p->tids[t], NULL);
+            pthread_cond_destroy(&p->wargs[t].cv);
+        }
+        for (int i = 0; i < ENGRAM_CACHE_STRIPES; i++) {
+            pthread_mutex_destroy(&p->stripe_mu[i]);
+        }
+        pthread_mutex_destroy(&p->mu);
+        pthread_cond_destroy(&p->cv_done);
+    }
+    free(p->cache_tags); free(p->cache_vals); free(p->cache_scales);
+    free(p->ht_gen); free(p->ht_key); free(p->ht_val);
+    free(p->uniq_buf); free(p->miss_idx); free(p->tids); free(p->wargs);
+    free(p);
+}
+
+int64_t engram_pool_gather_ids(
+    void *ptr, int fd_w, int fd_s, int64_t base_w, int64_t base_s,
+    const int64_t *ids, int64_t numel, int64_t vocab_start, int64_t vocab_end,
+    int32_t *inv_out, uint8_t *vals, uint8_t *scales, int64_t cap,
+    int max_threads, int64_t *out_n_unique
+) {
+    engram_pool_t *p = (engram_pool_t *)ptr;
+    if (!p || p->owner_pid != getpid()) return -3;
+    if (cap > p->max_cap) return -2;
+    if (numel <= 0) {
+        *out_n_unique = 0;
+        return 0;
+    }
+
+    uint32_t gen = ++p->ht_cur_gen;
+    if (gen == 0) {
+        memset(p->ht_gen, 0, p->ht_size * sizeof(uint32_t));
+        gen = p->ht_cur_gen = 1;
+    }
+    int64_t vocab_len = vocab_end - vocab_start;
+    uint64_t mask = p->ht_mask;
+    int ht_shift = 64 - __builtin_ctzll(p->ht_size);
+    int64_t n = 0;
+
+    for (int64_t i = 0; i < numel; i++) {
+        int64_t local = ids[i] - vocab_start;
+        if ((uint64_t)local >= (uint64_t)vocab_len) {
+            inv_out[i] = -1;
+            continue;
+        }
+        uint64_t h = (engram_hash64((uint64_t)local) >> ht_shift) & mask;
+        while (p->ht_gen[h] == gen && p->ht_key[h] != local) {
+            h = (h + 1) & mask;
+        }
+        if (p->ht_gen[h] != gen) {
+            if (n >= cap) return -2;
+            p->ht_gen[h] = gen;
+            p->ht_key[h] = local;
+            p->ht_val[h] = (int32_t)n;
+            p->uniq_buf[n++] = local;
+        }
+        inv_out[i] = (int32_t)h;
+    }
+
+    *out_n_unique = n;
+    if (n == 0) return 0;
+
+    /* Sort uniq_buf ascending to match np.unique bit-for-bit and linearize preads */
+    if (n <= 64) {
+        for (int64_t i = 1; i < n; i++) {
+            int64_t v = p->uniq_buf[i];
+            int64_t j = i - 1;
+            while (j >= 0 && p->uniq_buf[j] > v) {
+                p->uniq_buf[j + 1] = p->uniq_buf[j];
+                j--;
+            }
+            p->uniq_buf[j + 1] = v;
+        }
+    } else {
+        qsort(p->uniq_buf, (size_t)n, sizeof(int64_t), cmp_i64);
+    }
+
+    for (int64_t u = 0; u < n; u++) {
+        int64_t local = p->uniq_buf[u];
+        uint64_t h = (engram_hash64((uint64_t)local) >> ht_shift) & mask;
+        while (p->ht_key[h] != local) {
+            h = (h + 1) & mask;
+        }
+        p->ht_val[h] = (int32_t)u;
+    }
+    for (int64_t i = 0; i < numel; i++) {
+        int32_t h = inv_out[i];
+        if (h >= 0) inv_out[i] = p->ht_val[h];
+    }
+
+    /* Check striped direct-mapped row cache and compact misses */
+    int64_t n_miss = 0;
+    int dim = p->dim, sdim = p->sdim;
+    int cshift = 64 - p->cache_pow2;
+    for (int64_t u = 0; u < n; u++) {
+        int64_t r = p->uniq_buf[u];
+        uint64_t slot = engram_hash64((uint64_t)r) >> cshift;
+        pthread_mutex_t *smu = &p->stripe_mu[slot & (ENGRAM_CACHE_STRIPES - 1)];
+        pthread_mutex_lock(smu);
+        if (p->cache_tags[slot] == r) {
+            memcpy(vals + (size_t)u * (size_t)dim, p->cache_vals + slot * (size_t)dim, (size_t)dim);
+            memcpy(scales + (size_t)u * (size_t)sdim, p->cache_scales + slot * (size_t)sdim, (size_t)sdim);
+            pthread_mutex_unlock(smu);
+        } else {
+            pthread_mutex_unlock(smu);
+            p->miss_idx[n_miss++] = (int32_t)u;
+        }
+    }
+
+    if (n_miss == 0) return 0;
+
+    if (n_miss <= 2 || max_threads <= 1 || p->num_threads <= 1) {
+        int64_t bad = 0;
+        for (int64_t m = 0; m < n_miss; m++) {
+            int32_t u = p->miss_idx[m];
+            int64_t r = p->uniq_buf[u];
+            read_and_cache_one(
+                p, fd_w, fd_s, base_w, base_s, r,
+                vals + (size_t)u * (size_t)dim,
+                scales + (size_t)u * (size_t)sdim,
+                &bad
+            );
+        }
+        return bad;
+    }
+
+    int active = max_threads < p->num_threads ? max_threads : p->num_threads;
+    if (n_miss < 256 && active > 8) active = 8;
+    int64_t quarter_miss = (n_miss + 3) / 4;
+    if (active > quarter_miss) active = (int)quarter_miss;
+    if (active < 1) active = 1;
+
+    pthread_mutex_lock(&p->mu);
+    p->fd_w = fd_w;
+    p->fd_s = fd_s;
+    p->base_w = base_w;
+    p->base_s = base_s;
+    p->n_miss = n_miss;
+    p->vals = vals;
+    p->scales = scales;
+    p->short_reads = 0;
+    p->active_threads = active;
+    p->remaining = active;
+    uint64_t ep = ++p->work_epoch;
+    for (int t = 0; t < active; t++) {
+        p->wargs[t].target_epoch = ep;
+        pthread_cond_signal(&p->wargs[t].cv);
+    }
+    while (p->remaining > 0) {
+        pthread_cond_wait(&p->cv_done, &p->mu);
+    }
+    int64_t bad = p->short_reads;
+    pthread_mutex_unlock(&p->mu);
+    return bad;
+}
+"""
+
+
+@functools.cache
+def _engram_pread_lib():
+    """Compile (once per host, cached on disk) and load the C gather helper.
+
+    The Python ``preadv`` loop caps at ~125k syscalls/s regardless of thread
+    count (per-call interpreter overhead under the GIL), which made a
+    4096-token prefill chunk cost 1.6 s on the ranks owning an Engram layer
+    and capped prefill at ~2.5k tok/s. The C loop issues the same reads
+    from pthreads with the GIL released.
+    """
+    import ctypes
+    import hashlib
+    import subprocess
+    import tempfile
+
+    cache_dir = os.path.join(
+        os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm")),
+        "engram_pread",
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    digest = hashlib.sha256(_ENGRAM_PREAD_C.encode()).hexdigest()[:16]
+    so_path = os.path.join(cache_dir, f"engram_pread_{digest}.so")
+    if not os.path.exists(so_path):
+        # Build inside the cache directory: /tmp is a tmpfs on the Maya host, so
+        # os.replace() from a tempfile.TemporaryDirectory() fails with EXDEV
+        # ("Invalid cross-device link") and every worker silently fell back to the
+        # Python thread pool. On the 2D7 port that fallback cost ~70 ms per engram
+        # layer per decode step (64 serial preads on 2 threads).
+        with tempfile.TemporaryDirectory(dir=cache_dir) as tmp:
+            src = os.path.join(tmp, "engram_pread.c")
+            with open(src, "w") as f:
+                f.write(_ENGRAM_PREAD_C)
+            out = os.path.join(tmp, "engram_pread.so")
+            subprocess.run(
+                ["gcc", "-O2", "-shared", "-fPIC", "-pthread", src, "-o", out],
+                check=True,
+                capture_output=True,
+            )
+            os.replace(out, so_path)
+    lib = ctypes.CDLL(so_path)
+    lib.engram_gather.restype = ctypes.c_int64
+    lib.engram_gather.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ]
+    lib.engram_pool_create.restype = ctypes.c_void_p
+    lib.engram_pool_create.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int64,
+    ]
+    lib.engram_pool_destroy.restype = None
+    lib.engram_pool_destroy.argtypes = [ctypes.c_void_p]
+    lib.engram_pool_gather_ids.restype = ctypes.c_int64
+    lib.engram_pool_gather_ids.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
+        ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
+    ]
+    return lib
+
+
+class _DiskEngramTable:
+    """Rows of one engram table gathered straight from the safetensors shard.
+
+    ``storage="disk"``: nothing of the ~98 GiB table is ever loaded. A lookup
+    takes the batch's hash ids to the host, deduplicates them, reads each
+    unique row (256 e4m3 bytes + 8 UE8M0 scale bytes) with ``pread`` from a
+    thread pool -- NVMe queue depth is what makes this fast -- into pinned
+    staging buffers, copies them to the device and dequantizes there with the
+    same Triton kernel the resident tables use (the staged rows are simply a
+    tiny table addressed by the inverse-unique index).
+
+    Costs: one device sync per lookup (the ids must reach the host) and NVMe
+    random-read latency, both once per step per engram layer. Meant for the
+    eager model-state hook that runs before the forward, never inside a
+    captured CUDA graph.
+    """
+
+    HEADER_PREFIX = 8  # safetensors: u64 header length, then the JSON header
+
+    def __init__(
+        self,
+        model_path: str,
+        hf_prefix: str,
+        num_embeddings: int,
+        dim: int,
+        block_size: int,
+        vocab_start: int,
+        vocab_end: int,
+        num_threads: int,
+        device: torch.device,
+        staging_rows: int,
+        layer_tag: int | None = None,
+    ) -> None:
+        if not os.path.isdir(model_path):
+            raise ValueError(
+                "engram storage='disk' needs a local checkpoint directory "
+                f"(got {model_path!r}); download the checkpoint first."
+            )
+        self.dim = dim
+        self.scale_dim = dim // block_size
+        self.vocab_start = vocab_start
+        self.vocab_end = vocab_end
+        self.num_threads = max(1, num_threads)
+        self.device = device
+        self.weight_key = f"{hf_prefix}.embed.weight"
+        self.scale_key = f"{hf_prefix}.embed.scale"
+        (self.weight_path, self.weight_base) = self._locate(
+            model_path, self.weight_key, (num_embeddings, dim), "F8_E4M3"
+        )
+        (self.scale_path, self.scale_base) = self._locate(
+            model_path, self.scale_key, (num_embeddings, self.scale_dim), "F8_E8M0"
+        )
+        self._fds: dict[str, int] = {}
+        # Pinned host + device staging for at most ``staging_rows`` unique
+        # rows per lookup (batch tokens x local hash columns). ~26 MiB each
+        # at 4096 x 24 rows.
+        self.capacity = max(1, staging_rows)
+        # Explicit device: model init runs under a ``torch.device("cuda")``
+        # context, under which a bare ``torch.empty`` is not a CPU tensor.
+        self.host_vals = torch.empty(
+            (self.capacity, dim), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
+        self.host_scales = torch.empty(
+            (self.capacity, self.scale_dim),
+            dtype=torch.uint8,
+            device="cpu",
+            pin_memory=True,
+        )
+        self.dev_vals = torch.empty((self.capacity, dim), dtype=torch.uint8, device=device)
+        self.dev_scales = torch.empty(
+            (self.capacity, self.scale_dim), dtype=torch.uint8, device=device
+        )
+        self._np_vals = self.host_vals.numpy()
+        self._np_scales = self.host_scales.numpy()
+        self._pool = concurrent.futures.ThreadPoolExecutor(self.num_threads)
+        # --- 3.1/3.2/3.3 experiment state (unused on the default path) ------
+        # Tag used by the A2 timer; set by ParallelEngramEmbedding.
+        self.layer_tag = str(layer_tag) if layer_tag is not None else "?"
+        # 3.2: a second staging set, so a gather submitted on a worker thread
+        # never writes the set a previous lookup kernel may still read. Kept
+        # out of the default path because it doubles ~26 MiB of pinned host
+        # memory (plus the device mirror) per engram layer per rank.
+        # (host_vals, host_scales, dev_vals, dev_scales, np_vals, np_scales)
+        self._alt: tuple | None = None
+        self._slot = 0
+        self._prefetch_pool: concurrent.futures.ThreadPoolExecutor | None = None
+        if _ENGRAM_OVERLAP:
+            host_vals2 = torch.empty(
+                (self.capacity, dim), dtype=torch.uint8, device="cpu",
+                pin_memory=True,
+            )
+            host_scales2 = torch.empty(
+                (self.capacity, self.scale_dim), dtype=torch.uint8,
+                device="cpu", pin_memory=True,
+            )
+            self._alt = (
+                host_vals2,
+                host_scales2,
+                torch.empty((self.capacity, dim), dtype=torch.uint8, device=device),
+                torch.empty(
+                    (self.capacity, self.scale_dim), dtype=torch.uint8,
+                    device=device,
+                ),
+                host_vals2.numpy(),
+                host_scales2.numpy(),
+            )
+            # Dedicated pool: a prefetch task must not queue behind (or ahead
+            # of) the Python pread tasks on ``self._pool``.
+            self._prefetch_pool = concurrent.futures.ThreadPoolExecutor(4)
+        # 3.3: side stream + event for the non-blocking D2H of the hash ids.
+        self._d2h_stream: torch.cuda.Stream | None = None
+        self._d2h_event: torch.cuda.Event | None = None
+        self._host_ids: torch.Tensor | None = None
+        if _ENGRAM_ASYNC_D2H:
+            self._d2h_stream = torch.cuda.Stream(device=device)
+            self._d2h_event = torch.cuda.Event()
+        try:
+            self._lib = _engram_pread_lib()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "engram disk gather: C helper unavailable (%s); using the slower "
+                "Python thread pool", e
+            )
+            self._lib = None
+        self._c_pool: int | None = None
+        self._fast_d2h_event: torch.cuda.Event | None = None
+        self._fast_host_ids: torch.Tensor | None = None
+        self._fast_host_inv: torch.Tensor | None = None
+        self._fast_dev_inv: torch.Tensor | None = None
+        if _ENGRAM_FAST_GATHER and self._lib is not None:
+            pool_ptr = self._lib.engram_pool_create(
+                self.num_threads,
+                self.dim,
+                self.scale_dim,
+                _ENGRAM_CACHE_POW2,
+                self.capacity,
+            )
+            if pool_ptr:
+                self._c_pool = pool_ptr
+                weakref.finalize(self, self._lib.engram_pool_destroy, pool_ptr)
+                self._fast_d2h_event = torch.cuda.Event()
+                self._fast_host_ids = torch.empty(
+                    self.capacity, dtype=torch.int64, device="cpu", pin_memory=True
+                )
+                self._fast_host_inv = torch.empty(
+                    self.capacity, dtype=torch.int32, device="cpu", pin_memory=True
+                )
+                self._fast_dev_inv = torch.empty(
+                    self.capacity, dtype=torch.int32, device=device
+                )
+                logger.info(
+                    "Engram fast gather enabled for %s: persistent pool (%d threads), "
+                    "%d-row striped cache (%.1f MiB)",
+                    hf_prefix,
+                    self.num_threads,
+                    1 << _ENGRAM_CACHE_POW2,
+                    ((1 << _ENGRAM_CACHE_POW2) * (self.dim + self.scale_dim + 8))
+                    / (1024 * 1024),
+                )
+        logger.info(
+            "Engram table %s served from disk (%s, %.1f GiB never loaded); "
+            "%d reader threads, staging %d rows",
+            hf_prefix,
+            os.path.basename(self.weight_path),
+            num_embeddings * (dim + self.scale_dim) / 1024**3,
+            self.num_threads,
+            self.capacity,
+        )
+
+    @staticmethod
+    def _locate(
+        model_path: str, key: str, shape: tuple[int, int], dtype: str
+    ) -> tuple[str, int]:
+        index_path = os.path.join(model_path, "model.safetensors.index.json")
+        shard = None
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                shard = json.load(f)["weight_map"].get(key)
+        candidates = (
+            [os.path.join(model_path, shard)]
+            if shard is not None
+            else sorted(
+                os.path.join(model_path, f)
+                for f in os.listdir(model_path)
+                if f.endswith(".safetensors")
+            )
+        )
+        for path in candidates:
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(header_len))
+            meta = header.get(key)
+            if meta is None:
+                continue
+            if tuple(meta["shape"]) != tuple(shape) or meta["dtype"] != dtype:
+                raise ValueError(
+                    f"{key} in {path} is {meta['dtype']} {meta['shape']}, expected "
+                    f"{dtype} {list(shape)}"
+                )
+            start, end = meta["data_offsets"]
+            assert end - start == shape[0] * shape[1], (key, start, end, shape)
+            return path, _DiskEngramTable.HEADER_PREFIX + header_len + start
+        raise ValueError(f"{key} not found in the safetensors shards under {model_path}")
+
+    def _fd(self, path: str) -> int:
+        fd = self._fds.get(path)
+        if fd is None:
+            fd = os.open(path, os.O_RDONLY)
+            self._fds[path] = fd
+        return fd
+
+    def _reader_threads(self, n: int) -> int:
+        """Reader thread count for ``n`` rows (3.4 overrides, default formula)."""
+        if _ENGRAM_THREADS is not None:
+            threads = max(1, min(_ENGRAM_THREADS, n))
+        else:
+            threads = min(self.num_threads, max(8, (n + 1) // 2))
+        if _ENGRAM_THREAD_FLOOR and n < 256:
+            threads = min(threads, 2)
+        return threads
+
+    def _read_rows(
+        self,
+        rows: np.ndarray,
+        np_vals: np.ndarray | None = None,
+        np_scales: np.ndarray | None = None,
+    ) -> None:
+        """Fill host staging rows [0, len(rows)) with table rows ``rows``.
+
+        ``np_vals``/``np_scales`` select a staging set; None means the primary
+        one (the only one that exists unless the overlap experiment is on).
+        """
+        n = len(rows)
+        if n == 0:
+            return
+        wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
+        lib = self._lib
+        if lib is not None:
+            rows64 = np.ascontiguousarray(rows, dtype=np.int64)
+            if _ENGRAM_THREADS is None and not _ENGRAM_THREAD_FLOOR:
+                # A decode step stages ~128 rows (a prefill chunk 6144): past
+                # one thread per two rows the preads just queue against
+                # themselves. Measured on the Maya NVMe, n=128: 64 threads
+                # 3.0 ms, 128 threads 5.0 ms; n=6144: 128 threads 103 ms,
+                # 64 threads 160 ms.
+                threads = min(self.num_threads, max(8, (n + 1) // 2))
+            else:
+                threads = self._reader_threads(n)
+            if np_vals is None:
+                np_vals, np_scales = self._np_vals, self._np_scales
+            assert np_scales is not None
+            bad = lib.engram_gather(
+                wfd, sfd, self.weight_base, self.scale_base,
+                rows64.ctypes.data, n,
+                np_vals.ctypes.data, np_scales.ctypes.data,
+                self.dim, self.scale_dim, threads,
+            )
+            if bad:
+                raise RuntimeError(f"engram disk gather: {bad} short reads")
+            return
+        if np_vals is None:
+            np_vals, np_scales = self._np_vals, self._np_scales
+        assert np_scales is not None
+        vals, scales = np_vals, np_scales
+        dim, sdim = self.dim, self.scale_dim
+        wbase, sbase = self.weight_base, self.scale_base
+
+        def work(lo: int, hi: int) -> None:
+            for i in range(lo, hi):
+                r = int(rows[i])
+                os.preadv(wfd, [memoryview(vals[i])], wbase + r * dim)
+                os.preadv(sfd, [memoryview(scales[i])], sbase + r * sdim)
+
+        # One task per thread. The old floor of 64 rows per task left a decode
+        # batch (a few hundred rows) on 2 threads, i.e. 64 serial NVMe preads,
+        # ~70 ms per step per layer; preads are latency-bound, so parallelism is
+        # the whole cost.
+        nthreads = self.num_threads if _ENGRAM_THREADS is None else max(
+            1, _ENGRAM_THREADS
+        )
+        if _ENGRAM_THREAD_FLOOR and n < 256:
+            nthreads = min(nthreads, 2)
+        step = max(1, -(-n // nthreads))
+        futures = [
+            self._pool.submit(work, lo, min(lo + step, n)) for lo in range(0, n, step)
+        ]
+        for fut in futures:
+            fut.result()
+
+    def _gather_fast(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Wave 3 (DEC-4): stream-ordered pinned D2H/H2D + persistent C pool & row cache."""
+        import ctypes
+
+        assert (
+            self._lib is not None
+            and self._c_pool is not None
+            and self._fast_d2h_event is not None
+            and self._fast_host_ids is not None
+            and self._fast_host_inv is not None
+            and self._fast_dev_inv is not None
+        )
+        numel = indices.numel()
+        if numel == 0:
+            return (
+                self.dev_vals,
+                self.dev_scales,
+                self._fast_dev_inv[:0].view(indices.shape),
+                0,
+            )
+        if self._fast_host_ids.numel() < numel:
+            self._fast_host_ids = torch.empty(
+                numel, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+            self._fast_host_inv = torch.empty(
+                numel, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            self._fast_dev_inv = torch.empty(
+                numel, dtype=torch.int32, device=self.device
+            )
+
+        # Materialize contiguous int64 on current_stream BEFORE async pinned DMA:
+        # indices is typically a non-contiguous head slice (stride=(n_hash_cols, 1)).
+        stream = torch.cuda.current_stream(indices.device)
+        idx64 = indices.to(dtype=torch.int64).contiguous()
+        host_ids = self._fast_host_ids[:numel]
+        host_ids.copy_(idx64.view(-1), non_blocking=True)
+        self._fast_d2h_event.record(stream)
+        self._fast_d2h_event.synchronize()
+
+        wfd, sfd = self._fd(self.weight_path), self._fd(self.scale_path)
+        max_threads = (
+            self.num_threads
+            if _ENGRAM_THREADS is None
+            else max(1, _ENGRAM_THREADS)
+        )
+        n_unique = ctypes.c_int64(0)
+        bad = self._lib.engram_pool_gather_ids(
+            self._c_pool,
+            wfd,
+            sfd,
+            self.weight_base,
+            self.scale_base,
+            host_ids.data_ptr(),
+            numel,
+            self.vocab_start,
+            self.vocab_end,
+            self._fast_host_inv.data_ptr(),
+            self._np_vals.ctypes.data,
+            self._np_scales.ctypes.data,
+            self.capacity,
+            max_threads,
+            ctypes.byref(n_unique),
+        )
+        if bad == -2:
+            raise RuntimeError(
+                f"engram disk staging too small: unique rows > {self.capacity}"
+            )
+        if bad != 0:
+            raise RuntimeError(f"engram fast disk gather failed (code={bad})")
+
+        n = int(n_unique.value)
+        if n > 0:
+            self.dev_vals[:n].copy_(self.host_vals[:n], non_blocking=True)
+            self.dev_scales[:n].copy_(self.host_scales[:n], non_blocking=True)
+        inv_dev_flat = self._fast_dev_inv[:numel]
+        inv_dev_flat.copy_(self._fast_host_inv[:numel], non_blocking=True)
+        return self.dev_vals, self.dev_scales, inv_dev_flat.view(indices.shape), n
+
+    def gather(
+        self, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """indices: [T, local_heads] global hash ids -> (dev_vals, dev_scales,
+        inverse ids [T, local_heads] int32 (-1 = not owned), num_unique)."""
+        if _ENGRAM_FAST_GATHER and self._c_pool is not None and not (
+            _ENGRAM_TIME or _ENGRAM_OVERLAP or _ENGRAM_ASYNC_D2H
+        ):
+            return self._gather_fast(indices)
+        # Frente 3 paths (timing / overlap / async D2H). Off by default, in
+        # which case the body below is the pre-existing, untouched code.
+        if _ENGRAM_TIME or _ENGRAM_OVERLAP or _ENGRAM_ASYNC_D2H:
+            return self._gather_instrumented(indices, None)
+        ids = indices.to("cpu", torch.int64).numpy()  # one sync per lookup
+        local = ids - self.vocab_start
+        valid = (local >= 0) & (local < self.vocab_end - self.vocab_start)
+        uniq, inv = np.unique(local[valid], return_inverse=True)
+        n = len(uniq)
+        if n > self.capacity:
+            raise RuntimeError(
+                f"engram disk staging too small: {n} unique rows > {self.capacity}"
+            )
+        self._read_rows(uniq)
+        inv_ids = np.full(ids.shape, -1, dtype=np.int32)
+        inv_ids[valid] = inv.astype(np.int32)
+        if n > 0:
+            self.dev_vals[:n].copy_(self.host_vals[:n], non_blocking=True)
+            self.dev_scales[:n].copy_(self.host_scales[:n], non_blocking=True)
+        inv_dev = torch.from_numpy(inv_ids).to(self.device, non_blocking=True)
+        return self.dev_vals, self.dev_scales, inv_dev, n
+
+    # --- Frente 3 (experimental; see the env flags at the top) --------------
+    def _next_buffers(self) -> tuple | None:
+        """Pick the staging set for the next gather (double buffered under
+        ``VLLM_DS41_ENGRAM_OVERLAP=1``). None = the primary set."""
+        if self._alt is None:
+            return None
+        slot = self._slot
+        self._slot ^= 1
+        return self._alt if slot else None
+
+    def _copy_indices_to_host(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None"
+    ) -> np.ndarray:
+        """D2H of the hash ids (3.3): pinned buffer + side stream when enabled."""
+        if not _ENGRAM_ASYNC_D2H:
+            return indices.to("cpu", torch.int64).numpy()
+        assert self._d2h_stream is not None and self._d2h_event is not None
+        numel = indices.numel()
+        if self._host_ids is None or self._host_ids.numel() < numel:
+            self._host_ids = torch.empty(
+                numel, dtype=torch.int64, device="cpu", pin_memory=True
+            )
+        host = self._host_ids[:numel].view(indices.shape)
+        stream = sync_stream
+        if stream is None:
+            stream = torch.cuda.current_stream(indices.device)
+        # The copy only waits for the work enqueued on ``stream`` up to here
+        # (the hash kernels), not for whatever is enqueued on it later.
+        self._d2h_stream.wait_stream(stream)
+        with torch.cuda.stream(self._d2h_stream):
+            host.copy_(indices, non_blocking=True)
+            self._d2h_event.record()
+        self._d2h_event.synchronize()
+        return host.numpy()
+
+    def _gather_instrumented(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None"
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Same gather with the A2 timing hooks and the 3.2/3.3 variants."""
+        timer = _ENGRAM_TIMER if _ENGRAM_TIME else None
+        buffers = self._next_buffers()
+        if buffers is None:
+            host_vals, host_scales = self.host_vals, self.host_scales
+            dev_vals, dev_scales = self.dev_vals, self.dev_scales
+            np_vals, np_scales = self._np_vals, self._np_scales
+        else:
+            host_vals, host_scales, dev_vals, dev_scales, np_vals, np_scales = (
+                buffers
+            )
+        t0 = time.perf_counter() if timer is not None else 0.0
+        ids = self._copy_indices_to_host(indices, sync_stream)
+        t1 = time.perf_counter() if timer is not None else 0.0
+        local = ids - self.vocab_start
+        valid = (local >= 0) & (local < self.vocab_end - self.vocab_start)
+        uniq, inv = np.unique(local[valid], return_inverse=True)
+        t2 = time.perf_counter() if timer is not None else 0.0
+        n = len(uniq)
+        if n > self.capacity:
+            raise RuntimeError(
+                f"engram disk staging too small: {n} unique rows > {self.capacity}"
+            )
+        self._read_rows(uniq, np_vals, np_scales)
+        t3 = time.perf_counter() if timer is not None else 0.0
+        inv_ids = np.full(ids.shape, -1, dtype=np.int32)
+        inv_ids[valid] = inv.astype(np.int32)
+        if n > 0:
+            dev_vals[:n].copy_(host_vals[:n], non_blocking=True)
+            dev_scales[:n].copy_(host_scales[:n], non_blocking=True)
+        inv_dev = torch.from_numpy(inv_ids).to(self.device, non_blocking=True)
+        if timer is not None:
+            t4 = time.perf_counter()
+            timer.record(self.layer_tag, "d2h", t1 - t0)
+            timer.record(self.layer_tag, "uniq", t2 - t1)
+            timer.record(self.layer_tag, "preads", t3 - t2)
+            timer.record(self.layer_tag, "h2d", t4 - t3)
+            timer.add_rows(self.layer_tag, n, indices.shape[0])
+        return dev_vals, dev_scales, inv_dev, n
+
+    def submit_gather(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None" = None
+    ) -> concurrent.futures.Future:
+        """Start the host half of a lookup on a worker thread (3.2).
+
+        The caller must join with ``future.result()`` before launching the
+        lookup kernel. The worker sets the caller's CUDA stream so the D2H /
+        H2D copies keep the same stream order as the default path.
+        """
+        if self._prefetch_pool is None:
+            raise RuntimeError(
+                "engram disk prefetch needs VLLM_DS41_ENGRAM_OVERLAP=1"
+            )
+        return self._prefetch_pool.submit(
+            self._gather_in_worker, indices, sync_stream
+        )
+
+    def _gather_in_worker(
+        self, indices: torch.Tensor, sync_stream: "torch.cuda.Stream | None"
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        with torch.cuda.device(indices.device):
+            if sync_stream is not None:
+                with torch.cuda.stream(sync_stream):
+                    return self._gather_instrumented(indices, sync_stream)
+            return self._gather_instrumented(indices, None)
+
+
+def _pinned_exact(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+    """A CPU tensor pinned at its exact size (cudaHostRegister on a plain
+    allocation), bypassing the caching host allocator's power-of-two rounding.
+    Registered memory is page-locked and UVA-addressable like cudaHostAlloc
+    memory (``is_pinned()`` is true, ``get_cuda_view_from_cpu_tensor`` works).
+    Never unregistered: the tables live for the whole process."""
+    t = torch.empty(shape, dtype=dtype, device="cpu")
+    nbytes = t.numel() * t.element_size()
+    if nbytes:
+        err = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 0)
+        if int(err) != 0:
+            raise RuntimeError(
+                f"cudaHostRegister of {nbytes / 1024**3:.1f} GiB failed with {err}"
+            )
+        assert t.is_pinned()
+    return t
 
 
 class ParallelEngramEmbedding(nn.Module):
@@ -637,8 +1828,17 @@ class ParallelEngramEmbedding(nn.Module):
         head_sizes: tuple[int, ...],
         block_size: int = 32,
         cpu_offload: bool = False,
+        storage: str | None = None,
+        hf_prefix: str | None = None,
+        disk_threads: int = 32,
+        staging_rows: int | None = None,
+        layer_tag: int | None = None,
     ):
         super().__init__()
+        if storage is None:
+            storage = "cpu" if cpu_offload else "gpu"
+        assert storage in ("cpu", "gpu", "disk"), storage
+        cpu_offload = storage == "cpu"
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         assert head_sizes and all(size > 0 for size in head_sizes)
@@ -657,30 +1857,91 @@ class ParallelEngramEmbedding(nn.Module):
         self.part_num_embeddings = self.vocab_end_idx - self.vocab_start_idx
         self.tp_size = tp_size
         self.cpu_offload = cpu_offload
+        self.storage = storage
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         self._num_sms = torch.cuda.get_device_properties(
             torch.accelerator.current_device_index()
         ).multi_processor_count
 
+        if storage == "disk":
+            # No parameters at all: the loader never sees these tensors (they
+            # are registered as skipped by name), the "weights not
+            # initialized" check has nothing to miss, and rows are gathered
+            # from the shard per step (see _DiskEngramTable).
+            assert hf_prefix is not None
+            from vllm.model_executor.model_loader.weight_utils import (
+                register_skip_weight_names,
+            )
+
+            register_skip_weight_names(
+                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
+            )
+            self.weight = None
+            self.weight_scale_inv = None
+            vllm_config = get_current_vllm_config()
+            self.disk = _DiskEngramTable(
+                vllm_config.model_config.model,
+                hf_prefix,
+                num_embeddings,
+                dim,
+                block_size,
+                self.vocab_start_idx,
+                self.vocab_end_idx,
+                disk_threads,
+                torch.device(torch.accelerator.current_device_index()),
+                staging_rows
+                if staging_rows is not None
+                else vllm_config.scheduler_config.max_num_batched_tokens
+                * self.part_n_hash_cols,
+                layer_tag,
+            )
+            return
+        self.disk = None
+
+        # cpu mode: the generic loader would materialise the whole 98 GiB
+        # table in host RAM (safe_open().get_tensor copies) before copy_()
+        # into the pinned parameter -- ~200 GiB per table at peak, which is
+        # what OOM-killed the workers on a 278 GB host. Skip the tensors in
+        # the loader and fill the pinned buffers straight from the shard in
+        # chunks after loading (fill_pinned_from_checkpoint).
+        self._pinned_fill: tuple[str, str] | None = None
+        if cpu_offload and hf_prefix is not None:
+            from vllm.model_executor.model_loader.weight_utils import (
+                register_skip_weight_names,
+            )
+
+            register_skip_weight_names(
+                [f"{hf_prefix}.embed.weight", f"{hf_prefix}.embed.scale"]
+            )
+            self._pinned_fill = (get_current_vllm_config().model_config.model, hf_prefix)
+
         # Explicit device: model init runs under a `torch.device("cuda")`
-        # context, which would otherwise put the shard in HBM.
-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
-        self.weight = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
-            ),
-            requires_grad=False,
-        )
-        self.weight_scale_inv = nn.Parameter(
-            torch.empty(
-                self.part_num_embeddings,
-                dim // block_size,
-                dtype=torch.uint8,
-                **kwargs,
-            ),
-            requires_grad=False,
-        )
+        # context, which would otherwise put the shard in HBM. In cpu mode
+        # the buffers are pinned with cudaHostRegister at their exact size:
+        # torch's pinned allocator rounds every block up to a power of two,
+        # which turns a 98.3 GB table into a 128 GiB pinned block (the two
+        # tables would need 264 GiB of host memory before anything else).
+        if cpu_offload:
+            self.weight = nn.Parameter(
+                _pinned_exact((self.part_num_embeddings, dim), torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                _pinned_exact((self.part_num_embeddings, dim // block_size), torch.uint8),
+                requires_grad=False,
+            )
+        else:
+            self.weight = nn.Parameter(
+                torch.empty(self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = nn.Parameter(
+                torch.empty(
+                    self.part_num_embeddings, dim // block_size, dtype=torch.uint8
+                ),
+                requires_grad=False,
+            )
         for param in (self.weight, self.weight_scale_inv):
             set_weight_attrs(
                 param,
@@ -698,18 +1959,72 @@ class ParallelEngramEmbedding(nn.Module):
                 self.part_num_embeddings * (dim + dim // block_size) / 1024**3,
             )
 
+    def needs_checkpoint_fill(self) -> bool:
+        return self._pinned_fill is not None
+
+    def fill_pinned_from_checkpoint(self, threads: int = 8) -> None:
+        """Read this rank's rows of the two table tensors from the safetensors
+        shard straight into the pinned parameters (chunked ``preadv``, no
+        intermediate copy). The page cache the reads leave behind is
+        evictable, so the only resident cost is the parameters themselves."""
+        assert self._pinned_fill is not None
+        model_path, hf_prefix = self._pinned_fill
+        t0 = time.perf_counter()
+        for key, param, width, dtype in (
+            (f"{hf_prefix}.embed.weight", self.weight, self.dim, "F8_E4M3"),
+            (
+                f"{hf_prefix}.embed.scale",
+                self.weight_scale_inv,
+                self.dim // self.block_size,
+                "F8_E8M0",
+            ),
+        ):
+            path, base = _DiskEngramTable._locate(
+                model_path, key, (self.num_embeddings, width), dtype
+            )
+            dst = param.data.view(torch.uint8).reshape(-1).numpy()
+            nbytes = dst.nbytes
+            assert nbytes == self.part_num_embeddings * width
+            start = base + self.vocab_start_idx * width
+            step = 256 << 20
+            fd = os.open(path, os.O_RDONLY)
+            try:
+
+                def read_chunk(off: int) -> None:
+                    end = min(off + step, nbytes)
+                    view = memoryview(dst)[off:end]
+                    pos = 0
+                    while pos < end - off:
+                        pos += os.preadv(fd, [view[pos:]], start + off + pos)
+
+                with concurrent.futures.ThreadPoolExecutor(threads) as pool:
+                    list(pool.map(read_chunk, range(0, nbytes, step)))
+            finally:
+                os.close(fd)
+        self._pinned_fill = None
+        logger.info(
+            "Engram table %s: %.1f GiB read into pinned host memory in %.0f s",
+            hf_prefix,
+            (self.weight.numel() + self.weight_scale_inv.numel()) / 1024**3,
+            time.perf_counter() - t0,
+        )
+
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Parameters when resident, else cached UVA views of the pinned shard.
 
         Rebuilt if anything swaps `.data`, so a stale device pointer cannot
         survive silently.
         """
+        # The lookup kernel takes the e4m3 table as bytes (no fp8 convert
+        # below SM89); a uint8 view shares storage, so nothing is copied.
         if not self.cpu_offload:
-            return self.weight.data, self.weight_scale_inv.data
+            return self.weight.data.view(torch.uint8), self.weight_scale_inv.data
         src = (self.weight.data_ptr(), self.weight_scale_inv.data_ptr())
         if self._view_src != src:
             self._views = (
-                get_accelerator_view_from_cpu_tensor(self.weight.data),
+                get_accelerator_view_from_cpu_tensor(
+                    self.weight.data.view(torch.uint8)
+                ),
                 get_accelerator_view_from_cpu_tensor(self.weight_scale_inv.data),
             )
             self._view_src = src
@@ -726,13 +2041,16 @@ class ParallelEngramEmbedding(nn.Module):
         rows = indices.shape[0] * self.part_n_hash_cols
         if not rows:
             return
+        if self.disk is not None:
+            self._lookup_from_disk(indices, out, background)
+            return
         weight, scales = self._storage()
         # The table dwarfs TLB reach, so a persistent grid near the SM count
         # beats one program per row; halve it to leave SMs for the main stream.
         tiles = triton.cdiv(rows, 16)
         grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
         _engram_lookup_kernel[(grid,)](
-            weight.view(torch.uint8),
+            weight,
             scales,
             indices,
             out,
@@ -744,6 +2062,86 @@ class ParallelEngramEmbedding(nn.Module):
             HEAD_START=self.head_start,
             LOCAL_HEADS=self.part_n_hash_cols,
             TOTAL_HEADS=self.n_hash_cols,
+            DIM=self.dim,
+            QUANT_BLOCK=self.block_size,
+            BLOCK_R=16,
+            GRID=grid,
+        )
+
+    def _local_head_ids(self, indices: torch.Tensor) -> torch.Tensor:
+        head_end = min(self.head_start + self.part_n_hash_cols, self.n_hash_cols)
+        return indices[:, self.head_start : head_end]
+
+    def _lookup_from_disk(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool
+    ) -> None:
+        """``storage="disk"``: stage the batch's unique rows from the shard,
+        then run the ordinary lookup kernel over that staged mini-table with
+        the inverse-unique ids (padded/unowned heads map to -1 -> zeros)."""
+        assert self.disk is not None
+        vals, scales, inv_ids, num_unique = self.disk.gather(
+            self._local_head_ids(indices)
+        )
+        self._launch_disk_lookup(
+            indices, out, background, vals, scales, inv_ids, num_unique
+        )
+
+    def submit_disk_lookup(
+        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
+    ) -> tuple[concurrent.futures.Future, torch.Tensor, torch.Tensor, bool]:
+        """3.2: run the host half of a disk lookup on a worker thread.
+
+        Returns an opaque handle for :meth:`finish_disk_lookup`. The gather
+        only reads ``indices`` and writes this table's staging buffers, so it
+        can run while the caller does other work; the lookup kernel is
+        launched by ``finish_disk_lookup`` after the join.
+        """
+        assert self.disk is not None
+        stream = torch.cuda.current_stream(indices.device)
+        future = self.disk.submit_gather(self._local_head_ids(indices), stream)
+        return (future, indices, out, background)
+
+    def finish_disk_lookup(
+        self,
+        pending: tuple[concurrent.futures.Future, torch.Tensor, torch.Tensor, bool],
+    ) -> None:
+        """Join a :meth:`submit_disk_lookup` gather and launch its kernel."""
+        future, indices, out, background = pending
+        vals, scales, inv_ids, num_unique = future.result()
+        self._launch_disk_lookup(
+            indices, out, background, vals, scales, inv_ids, num_unique
+        )
+
+    def _launch_disk_lookup(
+        self,
+        indices: torch.Tensor,
+        out: torch.Tensor,
+        background: bool,
+        vals: torch.Tensor,
+        scales: torch.Tensor,
+        inv_ids: torch.Tensor,
+        num_unique: int,
+    ) -> None:
+        if inv_ids.shape[1] != self.part_n_hash_cols:
+            padded = inv_ids.new_full((inv_ids.shape[0], self.part_n_hash_cols), -1)
+            padded[:, : inv_ids.shape[1]] = inv_ids
+            inv_ids = padded
+        rows = indices.shape[0] * self.part_n_hash_cols
+        tiles = triton.cdiv(rows, 16)
+        grid = min(tiles, self._num_sms // 2 if background else self._num_sms)
+        _engram_lookup_kernel[(grid,)](
+            vals,
+            scales,
+            inv_ids,
+            out,
+            0,
+            num_unique,
+            rows,
+            inv_ids.stride(0),
+            inv_ids.stride(1),
+            HEAD_START=0,
+            LOCAL_HEADS=self.part_n_hash_cols,
+            TOTAL_HEADS=self.part_n_hash_cols,
             DIM=self.dim,
             QUANT_BLOCK=self.block_size,
             BLOCK_R=16,
@@ -900,6 +2298,15 @@ class Engram(nn.Module):
     ) -> None:
         super().__init__()
         self.layer_hash_index = layer_hash_index
+        # Backbone layer id (1, 14, ...): the A2 timer and 3.1 key tag them.
+        self.layer_id = int(layout.layer_ids[layer_hash_index])
+        # 3.1: ``stage_engram_rows`` deposits the already-computed hash slice
+        # (plus the full [tokens, layers, cols] tensor) here, with a key
+        # proving it belongs to the forward that follows; the forward takes it
+        # instead of hashing the batch a second time.
+        self._staged_hash_ids: torch.Tensor | None = None
+        self._staged_full_hashes: torch.Tensor | None = None
+        self._staged_hash_key: tuple | None = None
         self.dim = config.hidden_size
         self.hc_mult = config.hc_mult
         self.eps = config.rms_norm_eps
@@ -914,7 +2321,10 @@ class Engram(nn.Module):
             layout.num_embeddings[layer_hash_index],
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
-            cpu_offload=engram_config.cpu_offload if engram_config else True,
+            storage=engram_config.resolved_storage() if engram_config else "cpu",
+            hf_prefix=_hf_engram_prefix(prefix),
+            disk_threads=engram_config.disk_threads if engram_config else 32,
+            layer_tag=self.layer_id,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -943,9 +2353,87 @@ class Engram(nn.Module):
             dtype=torch.bfloat16,
         )
 
+    @property
+    def rows_staged_by_runner(self) -> bool:
+        """``storage="disk"``: rows are gathered by the model-state hook before
+        the forward (host round trip; illegal inside graph capture), so the
+        forward must not call :meth:`prepare_embeddings` itself."""
+        return self.embed_tokens.storage == "disk"
+
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Gather this layer's rows on the main stream before decoder layers."""
         self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+
+    def submit_embeddings(self, hash_ids: torch.Tensor):
+        """3.2: start this layer's disk gather on a worker thread.
+
+        Returns a handle for :meth:`join_embeddings`; ``None`` for a layer
+        whose rows the runner does not stage (only disk tables do) and for an
+        empty batch (``lookup`` would return without launching a kernel).
+        """
+        if self.embed_tokens.disk is None or hash_ids.shape[0] == 0:
+            return None
+        return self.embed_tokens.submit_disk_lookup(
+            hash_ids, self.staged_rows[: hash_ids.shape[0]]
+        )
+
+    def join_embeddings(self, pending) -> None:
+        """3.2: join a :meth:`submit_embeddings` gather and launch its kernel."""
+        if pending is None:
+            return
+        if _ENGRAM_TIME:
+            _join_t0 = time.perf_counter()
+        self.embed_tokens.finish_disk_lookup(pending)
+        if _ENGRAM_TIME:
+            _ENGRAM_TIMER.record(
+                str(self.layer_id), "wait", time.perf_counter() - _join_t0
+            )
+
+    def stage_hash_ids(
+        self,
+        hash_ids: torch.Tensor,
+        key: tuple,
+        full_hashes: torch.Tensor,
+    ) -> None:
+        """3.1: deposit the hashes computed by the runner-side staging hook."""
+        self._staged_hash_ids = hash_ids
+        self._staged_full_hashes = full_hashes
+        self._staged_hash_key = key
+
+    def take_staged_hashes(self, key: tuple) -> torch.Tensor | None:
+        """3.1: consume the full staged hashes if ``key`` still applies.
+
+        One-shot (the full tensor is dropped on the first take); the per-layer
+        slice stays for :meth:`verify_staged_hash_ids`. Returns None when
+        there is nothing to reuse, so the caller hashes as before.
+        """
+        full = self._staged_full_hashes
+        staged_key = self._staged_hash_key
+        self._staged_full_hashes = None
+        if full is None or staged_key != key:
+            return None
+        return full
+
+    def verify_staged_hash_ids(self, full_hashes: torch.Tensor) -> bool:
+        """3.1 verification mode: is the staged layer slice the right one?
+
+        Called with the freshly recomputed ``[tokens, layers, cols]`` tensor
+        when ``VLLM_DS41_ENGRAM_REUSE_HASH=2``; consumes (and drops) the
+        staged slice either way.
+        """
+        staged = self._staged_hash_ids
+        self.clear_staged_hash_ids()
+        if staged is None:
+            return True
+        return bool(
+            torch.equal(staged, full_hashes[:, self.layer_hash_index])
+        )
+
+    def clear_staged_hash_ids(self) -> None:
+        """3.1: drop a staged key (dummy runs and graph capture do not stage)."""
+        self._staged_hash_ids = None
+        self._staged_full_hashes = None
+        self._staged_hash_key = None
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""

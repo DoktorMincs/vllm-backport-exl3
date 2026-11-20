@@ -516,6 +516,12 @@ _MULTIMODAL_MODELS = {
         "vllm.models.minimax_m3",
         "MiniMaxM3SparseForConditionalGeneration",
     ),
+    # Drafter DSpark do MiniMax-M3.1-Flash (LOCAL): DFlash denso de 5 camadas
+    # com fc dos 5 estados do alvo e as cabecas markov/confidence.
+    "DSparkMiniMaxDraftModel": (
+        "vllm.models.minimax_m3.nvidia.dflash",
+        "DSparkMiniMaxM3ForCausalLM",
+    ),
     "MiniCPMO": ("minicpmo", "MiniCPMO"),
     "MiniCPMV": ("minicpmv", "MiniCPMV"),
     "MiniCPMV4_6ForConditionalGeneration": (

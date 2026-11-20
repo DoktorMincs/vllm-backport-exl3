@@ -33,10 +33,12 @@ from vllm.parser.deepseek_v4 import (
     DSML_TOOL_START,
     DSML_TOOL_START_VARIANTS,
     DeepSeekV4Parser,
+    _DSML,
     _dsml_arg_converter,
     _unwrap_wrapper_args,
     deepseek_v4_config,
 )
+from vllm.parser.engine.errors import MalformedToolArgs
 from vllm.parser.engine.registered_adapters import (
     DeepSeekV4ParserReasoningAdapter,
     DeepSeekV4ParserToolAdapter,
@@ -2264,3 +2266,60 @@ class TestMalformedDsmlNoise:
         assert output.tool_calls[0]["name"] == "get_weather"
         assert json.loads(output.tool_calls[0]["arguments"]) == {"city": "Seoul"}
         assert "DSML" not in (output.content or "")
+
+
+# ── Strict header checking (opt-in) ──────────────────────────────────
+#
+# The converter used to answer ``"{}"`` for any body its patterns could not
+# read, which turned a corrupted block into a tool call with no arguments.
+# ``strict_headers`` makes it say so instead, and only for the final value:
+# a streaming partial must never raise, or every chunk of an ordinary call
+# would abort the parse.
+
+_BROKEN_HEADER = '<｜DSML｜ path" string="true">/etc/hostname' + _PARAM_CLOSE
+
+
+def test_strict_headers_rejects_a_body_the_patterns_cannot_read():
+    body = _param("path", "true", "/etc/hostname")
+    assert json.loads(_dsml_arg_converter(body, False, strict_headers=True)) == {
+        "path": "/etc/hostname"
+    }
+
+    with pytest.raises(MalformedToolArgs) as exc:
+        _dsml_arg_converter(_BROKEN_HEADER, False, strict_headers=True)
+    assert exc.value.reason == "unparsed_dsml"
+
+    # The marker is there but the header has no ``string`` flag, so the
+    # parameter pattern cannot read it.
+    no_string = '<｜DSML｜parameter name="path">/etc/hostname' + _PARAM_CLOSE
+    with pytest.raises(MalformedToolArgs) as exc:
+        _dsml_arg_converter(no_string, False, strict_headers=True)
+    assert exc.value.reason == "no_param_name"
+
+
+def test_strict_headers_never_raises_while_streaming():
+    assert _dsml_arg_converter(_BROKEN_HEADER, True, strict_headers=True) == "{}"
+
+
+@pytest.mark.parametrize("body", ["", "  \n\t"])
+def test_strict_headers_accepts_an_empty_body(body):
+    assert _dsml_arg_converter(body, False, strict_headers=True) == "{}"
+
+
+def test_strict_headers_keeps_the_legacy_result_without_a_marker():
+    """Text the patterns cannot read but that carries no marker is not DSML."""
+    assert _dsml_arg_converter("garbage", False, strict_headers=True) == "{}"
+
+
+def test_strict_headers_ignores_the_marker_inside_a_value():
+    """A legitimate value may contain the marker; only residue counts."""
+    value = f"<{_DSML}parameter>"
+    body = _param("text", "true", value)
+    assert json.loads(_dsml_arg_converter(body, False, strict_headers=True)) == {
+        "text": value
+    }
+
+
+def test_strict_headers_is_off_by_default():
+    """V3.2 shares this converter and must keep its behaviour."""
+    assert _dsml_arg_converter(_BROKEN_HEADER, False) == "{}"

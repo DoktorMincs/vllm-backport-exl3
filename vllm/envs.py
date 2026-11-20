@@ -48,6 +48,12 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_TRANSPORT: Literal["nccl", "host"] = "nccl"
+    VLLM_PP_HOST_SLOTS: int = 1
+    VLLM_PP_HOST_MAX_BYTES: int = 67108864
+    VLLM_PP_HOST_DIR: str = "/dev/shm"
+    VLLM_PP_HOST_TIMEOUT_S: float = 300.0
+    VLLM_PP_HOST_FORCE_EAGER: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -134,6 +140,11 @@ if TYPE_CHECKING:
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
+    VLLM_CUSTOM_AR_ENFORCE: bool = False
+    # Disable pinned-host staging for multimodal H2D transfers (fall back to
+    # pageable copies). Workaround for cudaHostAlloc failures during encoder
+    # profiling under host-memory pressure or memlock limits.
+    VLLM_MM_DISABLE_PINNED_H2D: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
@@ -323,6 +334,14 @@ if TYPE_CHECKING:
     VLLM_MHC_FIXED_NUM_SPLIT: int = 0
     VLLM_TOKEN_BUCKET_PAD: bool = True
     VLLM_DSPARK_FUSED_MARKOV: bool = True
+    VLLM_M3_DEBUG_DRAFT: bool = False
+    VLLM_M3_TIME_DRAFT: bool = False
+    VLLM_M3_DEBUG: str = ""
+    VLLM_M3_DEBUG_MAX: int = 2
+    VLLM_M3_DEBUG_ATTN: str = ""
+    VLLM_M3_DUMP: str = ""
+    VLLM_M3_DUMP_MAXT: int = 64
+    VLLM_M3_DUMP_T: int = 0
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
@@ -658,6 +677,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable batch-invariant mode: deterministic results regardless of
     # batch composition. Requires NVIDIA GPU with compute capability >= 9.0.
     "VLLM_BATCH_INVARIANT": lambda: bool(int(os.getenv("VLLM_BATCH_INVARIANT", "0"))),
+    # Fork-local experiment gates for dual batch overlap (DBO).
+    # VLLM_DBO_ALLOW_PP lifts the pipeline-parallel refusal so the overlap can be
+    # measured on TP x PP topologies, which upstream does not support (default 0:
+    # upstream behaviour untouched).
+    "VLLM_DBO_ALLOW_PP": lambda: bool(int(os.getenv("VLLM_DBO_ALLOW_PP", "0"))),
+    # VLLM_DBO_TP_GRAPH makes a pure-TP split dispatch to a captured FULL graph
+    # instead of running the step eager (port of the DP microbatch path). The
+    # upstream pure-TP split is eager-only, which loses 7x against our graphs.
+    "VLLM_DBO_TP_GRAPH": lambda: bool(int(os.getenv("VLLM_DBO_TP_GRAPH", "0"))),
+    # Diagnostic: log (once per unique call site) which Python code issues each
+    # collective of a GroupCoordinator. Decode runs from CUDA graphs, so the
+    # sites are recorded during capture/warmup -- that is exactly what is
+    # needed to attribute a NCCL kernel seen in an nsys trace (kernel -> graph
+    # node loses the caller). Default 0: no logging, no stack walks.
+    "VLLM_LOG_COLLECTIVE_CALLERS": lambda: bool(
+        int(os.getenv("VLLM_LOG_COLLECTIVE_CALLERS", "0"))
+    ),
     "VLLM_REPLICATE_EMBED": lambda: (
         os.getenv("VLLM_REPLICATE_EMBED", "0").strip().lower() in ("1", "true")
     ),
@@ -903,6 +939,31 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Transport for the pipeline-parallel intermediate-tensor handoff.
+    # - "nccl" (default): the existing NCCL + gloo-metadata path, untouched.
+    # - "host": host-relayed handoff (see vllm/v1/worker/gpu/pp_host.py).
+    "VLLM_PP_TRANSPORT": env_with_choices(
+        "VLLM_PP_TRANSPORT",
+        "nccl",
+        ["nccl", "host"],
+    ),
+    # Number of slots in the shared segment of one host-transport PP edge.
+    "VLLM_PP_HOST_SLOTS": lambda: int(os.getenv("VLLM_PP_HOST_SLOTS", "1")),
+    # Hard cap, in bytes, of one host-transport PP edge buffer (the real size
+    # is min(cap, bytes/token x max_num_batched_tokens x 1.5)).
+    "VLLM_PP_HOST_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_PP_HOST_MAX_BYTES", str(64 << 20))
+    ),
+    # Directory for the per-edge shared segment of the host transport.
+    "VLLM_PP_HOST_DIR": lambda: os.getenv("VLLM_PP_HOST_DIR", "/dev/shm"),
+    # Timeout, in seconds, for one host-transport send/recv.
+    "VLLM_PP_HOST_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_PP_HOST_TIMEOUT_S", "300")
+    ),
+    # Disable torch.compile/CUDA graphs when VLLM_PP_TRANSPORT=host (bring-up).
+    "VLLM_PP_HOST_FORCE_EAGER": lambda: (
+        os.getenv("VLLM_PP_HOST_FORCE_EAGER", "0") == "1"
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -1292,6 +1353,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CudaCommunicator on ROCm.
     "VLLM_ROCM_USE_AITER_CUSTOM_AR": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_CUSTOM_AR", "True").lower() in ("true", "1")
+    ),
+    "VLLM_CUSTOM_AR_ENFORCE": lambda: (
+        os.getenv("VLLM_CUSTOM_AR_ENFORCE", "0").lower() in ("true", "1")
+    ),
+    "VLLM_MM_DISABLE_PINNED_H2D": lambda: (
+        os.getenv("VLLM_MM_DISABLE_PINNED_H2D", "0").lower() in ("true", "1")
     ),
     # use aiter linear op if aiter ops are enabled
     # The following list of related ops
@@ -2290,6 +2357,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DSPARK_FUSED_MARKOV": lambda: (
         os.environ.get("VLLM_DSPARK_FUSED_MARKOV", "1") == "1"
     ),
+    "VLLM_M3_DEBUG_DRAFT": lambda: (
+        os.environ.get("VLLM_M3_DEBUG_DRAFT", "0") == "1"
+    ),
+    "VLLM_M3_TIME_DRAFT": lambda: (
+        os.environ.get("VLLM_M3_TIME_DRAFT", "0") == "1"
+    ),
+    # Debug instrumentation for the MiniMax-M3 engine path (model.py and
+    # sparse_attention.py). Registered here so they follow the same rules as
+    # every other knob: typed access, envs cache and centralized documentation.
+    "VLLM_M3_DEBUG": lambda: os.environ.get("VLLM_M3_DEBUG", ""),
+    "VLLM_M3_DEBUG_MAX": lambda: int(os.environ.get("VLLM_M3_DEBUG_MAX", "2")),
+    "VLLM_M3_DEBUG_ATTN": lambda: os.environ.get("VLLM_M3_DEBUG_ATTN", ""),
+    "VLLM_M3_DUMP": lambda: os.environ.get("VLLM_M3_DUMP", ""),
+    "VLLM_M3_DUMP_MAXT": lambda: int(os.environ.get("VLLM_M3_DUMP_MAXT", "64")),
+    "VLLM_M3_DUMP_T": lambda: int(os.environ.get("VLLM_M3_DUMP_T", "0")),
     # Fix the DSv4 split-K sparse-decode split count (capped at 16) instead of
     # the batch-adaptive heuristic, which picks splits from the query count and
     # batch-average KV lengths so a request's reduction order can depend on the
@@ -2505,6 +2587,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
+    # How long the shm-broadcast reader keeps busy-spinning (sched_yield) after a
+    # read before parking on the zmq notify socket, in microseconds. The upstream
+    # constant is one *second*, which turns every pipeline wait of a PP stage
+    # (5-30 ms) into a full busy-spin and shows up as ~28% of EngineCore's CPU
+    # time. 0 parks immediately (no spin at all); 1000000 reproduces the
+    # upstream one-second spin for an A/B.
+    "VLLM_SHM_BUSY_LOOP_US": lambda: int(
+        os.getenv("VLLM_SHM_BUSY_LOOP_US", "200")
+    ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),
@@ -2678,6 +2769,13 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ASSETS_CACHE",
         "VLLM_ASSETS_CACHE_MODEL_CLEAN",
         "VLLM_WORKER_MULTIPROC_METHOD",
+        # PP transport selection changes no compiled artifact.
+        "VLLM_PP_TRANSPORT",
+        "VLLM_PP_HOST_SLOTS",
+        "VLLM_PP_HOST_MAX_BYTES",
+        "VLLM_PP_HOST_DIR",
+        "VLLM_PP_HOST_TIMEOUT_S",
+        "VLLM_PP_HOST_FORCE_EAGER",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",

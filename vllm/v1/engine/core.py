@@ -1487,8 +1487,13 @@ class EngineCoreProc(EngineCore):
         # If no model execution happened but there is still scheduler work
         # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
         # the GIL briefly to allow background transfer threads to make progress.
+        # Under PP batch_queue drain (`outputs` non-empty or `batch_queue` has
+        # in-flight microbatches), sleeping 1 ms burns ~4.5 ms/step on the host.
         if not model_executed and self.scheduler.has_requests():
-            time.sleep(0.001)
+            if os.environ.get("VLLM_PP_NO_DRAIN_SLEEP", "1") == "0" or (
+                not outputs and not self.batch_queue
+            ):
+                time.sleep(0.001)
 
         return model_executed
 

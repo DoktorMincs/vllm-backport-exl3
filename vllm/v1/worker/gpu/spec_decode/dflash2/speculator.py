@@ -2,14 +2,19 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from typing import Any
+import os
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+logger = init_logger(__name__)
+_DF2_DEBUG = os.environ.get("VLLM_DF2_DEBUG", "0") not in ("", "0", "false")
 
 
 @triton.jit
@@ -187,6 +192,15 @@ class DFlash2Speculator(DFlashSpeculator):
         num_tokens_across_dp: torch.Tensor | None,
         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     ) -> None:
+        if _DF2_DEBUG:
+            logger.info(
+                "DF2 draft call: num_reqs=%d num_tokens_padded=%d cg=%s "
+                "num_query_per_req=%d",
+                num_reqs,
+                num_tokens_padded,
+                cudagraph_runtime_mode,
+                self.num_query_per_req,
+            )
         last_hidden_states = self._run_model(
             num_tokens_padded,
             attn_metadata,

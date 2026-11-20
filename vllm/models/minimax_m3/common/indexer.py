@@ -118,10 +118,17 @@ class MiniMaxM3IndexerCache(nn.Module, AttentionLayerBase):
             cache_dtype = torch.float8_e4m3fn
         elif indexer_kv_dtype == "bf16":
             cache_dtype = torch.bfloat16
+        elif indexer_kv_dtype in ("fp16", "float16"):
+            # Follow the qkv dtype: the fused QK-norm/RoPE/KV-insert kernel
+            # stores index-K in the qkv dtype and the Triton indexer scores it
+            # with tl.dot against index_q (also qkv dtype). Hardcoded bf16
+            # raises a dtype mismatch with an fp16 model.
+            indexer_kv_dtype = "fp16"
+            cache_dtype = torch.float16
         else:
             raise NotImplementedError(
                 f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
-                "MiniMax M3 indexer cache (only 'bf16' or 'fp8'/'fp8_e4m3')."
+                "MiniMax M3 indexer cache (only 'bf16', 'fp16' or 'fp8'/'fp8_e4m3')."
             )
         self.kv_cache = torch.tensor([])
         self.head_dim = head_dim
@@ -528,7 +535,11 @@ def select_indexer_impl_cls(
             indexer_kv_dtype,
         )
         return MiniMaxM3IndexerMSAImpl
-    if indexer_kv_dtype != "bf16":
+    # bf16 and fp16 are both fine for the Triton kernels: index_q and the side
+    # cache share the qkv dtype and every score path goes through tl.dot with
+    # fp32 accumulate. fp16 exists so the side cache can follow an fp16 model
+    # (the fused qk-norm/rope/kv-insert kernel requires equal dtypes).
+    if indexer_kv_dtype not in ("bf16", "fp16"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."

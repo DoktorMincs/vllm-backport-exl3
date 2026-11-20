@@ -249,6 +249,22 @@ class MiniMaxM3VLProcessingInfo(BaseProcessingInfo):
     ) -> int:
         max_videos = mm_counts.get("video", 0)
         max_total_frames = self._get_max_video_frames(seq_len)
+        # Bound the dummy by what the encoder can actually see in one call:
+        # MiniMaxVLVisionModel._apply_max_frames_limit splits any video into
+        # segments of `vision_segment_max_frames` (4 for M3.1). Without this the
+        # profiling dummy is sized from seq_len alone — with max_model_len
+        # 262144 that asked for hundreds of frames, and the memory-profiling
+        # forward OOM'd inside the vision tower's first layer_norm, which has
+        # nothing to do with the memory the real 4-frame path needs.
+        vision_config = self.get_hf_config().vision_config
+        # vLLM keeps this as a plain dict (the model rebuilds it with
+        # PretrainedConfig.from_dict), so getattr alone silently finds nothing.
+        if isinstance(vision_config, Mapping):
+            segment_cap = vision_config.get("vision_segment_max_frames")
+        else:
+            segment_cap = getattr(vision_config, "vision_segment_max_frames", None)
+        if segment_cap:
+            max_frames_per_video = min(max_frames_per_video, int(segment_cap))
         max_frames_per_video = min(
             max_total_frames // max(max_videos, 1), max_frames_per_video
         )

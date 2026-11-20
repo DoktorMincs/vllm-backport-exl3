@@ -27,6 +27,20 @@ def _resolve_dspark_attention_backend(
                 target_backend.name,
             )
         return target_backend
+    if "DSparkMiniMaxDraftModel" in (
+        getattr(draft_model_config, "architectures", None) or ()
+    ):
+        # O alvo MiniMax-M3 roda num backend esparso proprio
+        # (MINIMAX_M3_SPARSE_INDEXER): as camadas do drafter nao tem pesos de
+        # indexer nem metadata esparsa, entao herdar esse backend faria a
+        # atencao do drafter rodar no caminho errado (aceitacao 0%). O drafter
+        # e' GQA denso com janela deslizante -> backend denso padrao.
+        logger.info_once(
+            "Using %s for the MiniMax-M3 DSpark drafter (the target's sparse "
+            "indexer backend does not apply to draft layers).",
+            AttentionBackendEnum.FLASH_ATTN.name,
+        )
+        return AttentionBackendEnum.FLASH_ATTN
     return None
 
 

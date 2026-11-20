@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -880,7 +881,11 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         if self.enable_partial_hash_hits
                         and manager_cls.supports_fine_grained_hash_lookup
                         and group_block_size > self.hash_block_size
-                        else group_block_size
+                        else (
+                            max(group_block_size, self._cache_hit_alignment_tokens)
+                            if os.environ.get("VLLM_FIX_HYBRID_SWA_PREFIX", "1") != "0"
+                            else group_block_size
+                        )
                     )
                     _max_length = min(
                         curr_hit_length + eagle_margin, max_cache_hit_length

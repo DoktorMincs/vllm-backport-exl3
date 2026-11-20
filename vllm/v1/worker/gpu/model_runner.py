@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
@@ -272,6 +273,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
+        # VLLM_DSPARK_REST: pular o drafter no passo seguinte a uma rodada
+        # inteira sem aceite (regra do Maya). Alterna draft/descanso: o
+        # descanso nunca se repete duas vezes seguidas.
+        self.dspark_rest_enabled = __import__("os").environ.get(
+            "VLLM_DSPARK_REST", ""
+        ).strip().lower() not in ("", "0", "false", "no", "off")
+        self._dspark_rested_last = True
+        self._dspark_skip_drafts = False
+        self._dspark_had_spec = True
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
@@ -483,6 +493,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculative_config,
                     self.device,
                 )
+            if self.speculator is not None:
+                self.speculator._sampler = self.sampler
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,
                 logprobs_mode=self.model_config.logprobs_mode,
@@ -693,6 +705,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_query_len=self.decode_query_len,
             lora_capture_cases=self.lora_capture_cases,
             varlen_decode=self.adaptive_verification is not None,
+            ubatch_runner=self.ubatch_runner,
         )
         check_attention_cp_compatibility(self.vllm_config)
         if isinstance(self.speculator, DraftModelSpeculator):
@@ -1727,7 +1740,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert self.ubatch_runner is not None
             assert block_tables is not None and slot_mappings is not None
             ubatch_state = self.ubatch_runner.prepare(
-                input_batch, block_tables, slot_mappings
+                input_batch,
+                block_tables,
+                slot_mappings,
+                cg_mode=batch_desc.cg_mode,
+                for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
         elif not (dummy_run and skip_attn_for_dummy_run):
             assert slot_mappings is not None
@@ -1900,6 +1917,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts = capturer.get_routed_experts(slot_mappings, num_toks)
 
         finished_req_ids = scheduler_output.finished_req_ids
+        if self.dspark_rest_enabled:
+            # `sample_tokens` nao recebe o SchedulerOutput; guardamos aqui o
+            # unico dado que a regra de descanso precisa dele.
+            self._dspark_had_spec = bool(
+                scheduler_output.scheduled_spec_decode_tokens
+            )
+
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -2043,7 +2067,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        self._dspark_skip_drafts = False
+        if (
+            self.speculator is not None
+            and input_batch.has_prefill
+            and input_batch.num_reqs > 0
+            and os.environ.get("VLLM_SKIP_PREFILL_PROPOSE", "1") != "0"
+        ):
+            _post_prefill = (
+                input_batch.num_computed_prefill_tokens_np
+                + input_batch.num_scheduled_tokens
+            )
+            _rem_prefill = input_batch.prefill_len_np - _post_prefill
+            if bool(np.all(_rem_prefill >= 512)):
+                self._dspark_skip_drafts = True
+        if self.speculator is not None and self.dspark_rest_enabled and not self._dspark_skip_drafts:
+            # Descansa so' quando o passo anterior draftou e este nao tem
+            # draft agendado (o scheduler cortou por nada aceito).
+            if not self._dspark_had_spec:
+                if not self._dspark_rested_last:
+                    self._dspark_skip_drafts = True
+                    self._dspark_rested_last = True
+            else:
+                self._dspark_rested_last = False
+        if self.speculator is not None and not self._dspark_skip_drafts:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -2078,10 +2125,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
-            )
+            if self._dspark_skip_drafts:
+                self.draft_tokens_handler.set_skip_batch(input_batch)
+            else:
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[input_batch.idx_mapping],
+                    # So' usado com VLLM_DSPARK_CONF_CUT (o handler ignora
+                    # se a env estiver vazia); as linhas estao na ordem do
+                    # input_batch, como os drafts acima. getattr: so' o
+                    # DSpark expoe confidencias; DFlash/EAGLE/MTP nao.
+                    confidence=(
+                        getattr(
+                            self.speculator,
+                            "draft_token_confidence_probs",
+                            None,
+                        )
+                        if self.speculator is not None
+                        else None
+                    ),
+                )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch

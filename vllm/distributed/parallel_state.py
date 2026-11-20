@@ -25,7 +25,9 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
+import time
 import weakref
 from collections import deque, namedtuple
 from collections.abc import Callable
@@ -418,6 +420,55 @@ direct_register_custom_op(
 )
 
 
+# --- Timing do protocolo de PP (VLLM_PP_PROTO_TIME=1) ---------------------
+# Medido em 06/11 com isto: o handshake de metadados no gloo custa 0,1–0,2 ms e
+# o isend do tensor 0,1-1,6 ms, mas o `recv` bloqueante aparece com 37-60 ms por
+# passo porque e' ali que a bolha do pipeline se materializa (o rank fica
+# parado esperando o upstream inteiro). Ou seja: o TRANSPORTE do PP nao e' o
+# custo; trocar NCCL por staging em host nao ajuda (VLLM_PP_TRANSPORT=host).
+# Serve como instrumentacao: separa espera de handshake de espera de tensor.
+# Desligado por default: o `if` nao aloca, nao loga e nao muda o caminho.
+_PP_PROTO_ON = bool(os.environ.get("VLLM_PP_PROTO_TIME", "").strip())
+_PP_PROTO_STATS: dict[str, list[float]] = {}
+_PP_PROTO_STEPS = [0]
+
+
+@contextlib.contextmanager
+def proto_timer(name: str):
+    if not _PP_PROTO_ON:
+        yield
+        return
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        _PP_PROTO_STATS.setdefault(name, []).append(
+            (time.perf_counter() - t0) * 1000.0
+        )
+
+
+def proto_step_done(rank: int, every: int = 20) -> None:
+    """Chamado uma vez por passo no worker: loga e zera a cada `every` passos."""
+    if not _PP_PROTO_ON:
+        return
+    _PP_PROTO_STEPS[0] += 1
+    if _PP_PROTO_STEPS[0] % every:
+        return
+    parts = []
+    for name, vals in sorted(_PP_PROTO_STATS.items()):
+        n = len(vals)
+        if n:
+            vals.sort()
+            parts.append(
+                "%s med=%.2f p90=%.2f n=%d"
+                % (name, vals[n // 2], vals[int(0.9 * (n - 1))], n)
+            )
+    if parts:
+        logger.info("PP-PROTO rank=%d step=%d | %s", rank, _PP_PROTO_STEPS[0],
+                    " | ".join(parts))
+    _PP_PROTO_STATS.clear()
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -446,6 +497,8 @@ class GroupCoordinator:
     # device communicator (if use_device_communicator=True)
     device_communicator: DeviceCommunicatorBase | None
     mq_broadcaster: Any | None  # shared memory broadcaster
+    # microbatch all-reduces run on the DBO comm stream; set by enable_dbo_tp_overlap
+    dbo_overlap: bool = False
 
     def __init__(
         self,
@@ -746,13 +799,27 @@ class GroupCoordinator:
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
-        return self.device_communicator.all_reduce(input_)
+        _log_collective_caller("all_reduce", self.unique_name, input_)
+        if not self.dbo_overlap:
+            return self.device_communicator.all_reduce(input_)
+        # DBO hand-off, on the comm stream. Under the vllm.all_reduce custom op,
+        # so compiled graphs reach it too; no-ops outside a microbatch.
+        from vllm.v1.worker.ubatching import (
+            dbo_switch_to_compute_sync,
+            dbo_yield_and_switch_from_compute_to_comm,
+        )
+
+        dbo_yield_and_switch_from_compute_to_comm()
+        out = self.device_communicator.all_reduce(input_)
+        dbo_switch_to_compute_sync()
+        return out
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
+        _log_collective_caller("all_gather", self.unique_name, input_)
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
         )
@@ -775,6 +842,7 @@ class GroupCoordinator:
         dim: int = 0,
         sizes: list[int] | None = None,
     ):
+        _log_collective_caller("all_gatherv", self.unique_name, input_)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
@@ -832,6 +900,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
+        _log_collective_caller("broadcast", self.unique_name, input_)
         # Broadcast.
         torch.distributed.broadcast(
             input_, src=self.ranks[src], group=self.device_group
@@ -918,21 +987,22 @@ class GroupCoordinator:
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
-        # Receive object size
-        rank_size = torch.distributed.recv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+        with proto_timer("meta_recv"):
+            # Receive object size
+            rank_size = torch.distributed.recv(
+                size_tensor, src=self.ranks[src], group=self.cpu_group
+            )
 
-        # Tensor to receive serialized objects into.
-        object_tensor = torch.empty(  # type: ignore[call-overload]
-            size_tensor.item(),  # type: ignore[arg-type]
-            dtype=torch.uint8,
-            device="cpu",
-        )
+            # Tensor to receive serialized objects into.
+            object_tensor = torch.empty(  # type: ignore[call-overload]
+                size_tensor.item(),  # type: ignore[arg-type]
+                dtype=torch.uint8,
+                device="cpu",
+            )
 
-        rank_object = torch.distributed.recv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
-        )
+            rank_object = torch.distributed.recv(
+                object_tensor, src=self.ranks[src], group=self.cpu_group
+            )
 
         assert rank_object == rank_size, (
             "Received object sender rank does not match the size sender rank."
@@ -960,12 +1030,13 @@ class GroupCoordinator:
 
         retained = (size_tensor, object_tensor)
         works: list[Any] = []
-        for tensor in retained:
-            work = torch.distributed.isend(
-                tensor, dst=self.ranks[dst], group=self.cpu_group
-            )
-            if work is not None:
-                works.append(work)
+        with proto_timer("meta_send"):
+            for tensor in retained:
+                work = torch.distributed.isend(
+                    tensor, dst=self.ranks[dst], group=self.cpu_group
+                )
+                if work is not None:
+                    works.append(work)
 
         return _RetainedHandle(works, retained)
 
@@ -1366,6 +1437,7 @@ class GroupCoordinator:
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
+        _log_collective_caller("send", self.unique_name, tensor)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         self.device_communicator.send(tensor, dst)
@@ -1375,6 +1447,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         """Receives a tensor from the source rank."""
         """NOTE: `src` is the local rank of the source rank."""
+        _log_collective_caller("recv", self.unique_name, size)
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.recv(size, dtype, src)
@@ -1645,6 +1718,39 @@ def graph_capture(
 
 
 logger = init_logger(__name__)
+
+# VLLM_LOG_COLLECTIVE_CALLERS: one line per unique (collective, group, call
+# site). Decode is replayed from CUDA graphs, so an nsys kernel cannot be traced
+# back to Python; the capture pass can, and these sites are what the graph was
+# built from.
+_LOGGED_CALLERS: set[tuple] = set()
+
+
+def _log_collective_caller(kind: str, group: str, tensor: Any) -> None:
+    if not envs.VLLM_LOG_COLLECTIVE_CALLERS:
+        return
+    import traceback
+
+    frames = traceback.extract_stack()[-8:-1]
+    key = (
+        kind,
+        group,
+        tuple((f.filename.rsplit("/", 2)[-1], f.lineno) for f in frames),
+    )
+    if key in _LOGGED_CALLERS:
+        return
+    _LOGGED_CALLERS.add(key)
+    shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else "?"
+    dtype = tensor.dtype if isinstance(tensor, torch.Tensor) else "?"
+    logger.info(
+        "collective caller: %s[%s] shape=%s dtype=%s\n%s",
+        kind,
+        group,
+        shape,
+        dtype,
+        "".join(traceback.format_list(frames)),
+    )
+
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 

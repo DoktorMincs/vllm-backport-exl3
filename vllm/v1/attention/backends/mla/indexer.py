@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -185,7 +186,10 @@ class PrepareUniformDecodeKernel(
 #   T=8192 -> 9.2x    T=4096 -> 7.4x    T=2048 -> 5.0x    T=1024 -> 2.8x
 # 2048 is the crossover, and is above the cudagraph capture cap
 # (min(max_num_seqs*2, 512)), so a sharded batch is always an eager one.
-MIN_SHARD_TOKENS = 2048
+# Keep MIN_SHARD_TOKENS strictly above the PIECEWISE cudagraph capture cap (512)
+# so captured graphs stay collective-free while eager prefill chunks (e.g. 1152)
+# shard queries across TP=2.
+MIN_SHARD_TOKENS = int(os.environ.get("VLLM_INDEXER_MIN_SHARD_TOKENS", "513"))
 
 
 class ShardedChunkSpec(NamedTuple):
@@ -824,16 +828,9 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
-    max_model_len = vllm_config.model_config.max_model_len
-    # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
-    # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
-    # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.
-    # The memory usage of the workspace there is 576 * 2 bytes; so we size this as
-    # (576 * 2 // 132) * 5 = 40 to maximize this workspace size while still fitting
-    # within the flashmla_sparse workspace.
-    # For DeepSeek-V3.2, the max_model_len is 163840.
-    #   40 * 163840 * 132 = 865075200 bytes = 825 MB
-    return max_model_len * 40
+    from vllm.v1.attention.backends.mla.streamed_workspace import gather_capacity
+
+    return gather_capacity(vllm_config)
 
 
 def _supports_varlen_paged_mqa_logits() -> bool:
@@ -949,6 +946,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 f"{self.cp_kv_cache_interleave_size})."
             )
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
+        from vllm.v1.attention.backends.mla.streamed_workspace import (
+            assert_resolved_block_size,
+        )
+
+        assert_resolved_block_size(self.vllm_config)
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
             self.vllm_config.speculative_config.num_speculative_tokens
@@ -1376,10 +1378,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            from vllm.v1.attention.backends.mla.streamed_workspace import (
+                chunk_capacity,
+                eligible,
+            )
+
+            gather_budget = chunk_capacity(
+                self.vllm_config,
+                self.max_prefill_buffer_size,
+                self.compress_ratio,
+            )
+            if eligible(self.vllm_config) and torch.any(
+                compressed_seq_lens_cpu[num_decodes:] > gather_budget
+            ):
+                raise ValueError(
+                    "A single indexer context exceeds its qualified gather allocation"
+                )
             chunk_specs = self._split_indexer_prefill_chunks(
                 compressed_seq_lens_cpu[num_decodes:],
                 prefill_query_lens_cpu,
-                self.max_prefill_buffer_size,
+                gather_budget,
                 max_logits_bytes,
                 request_offset=num_decodes,
             )

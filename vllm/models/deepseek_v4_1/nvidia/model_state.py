@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from itertools import islice
 from typing import Any
 
 import torch
@@ -66,6 +67,18 @@ class DeepseekV41ModelState(DefaultModelState):
             self.lookback_token_ids = torch.full(
                 (self.max_num_reqs, depth), -1, dtype=torch.int32, device=device
             )
+        # Disk-backed engram tables (--engram-config '{"storage": "disk"}'):
+        # the row gather needs a host round trip, so it runs here, eagerly,
+        # before each forward instead of inside the (capturable) model code.
+        language_model = (
+            model.get_language_model()
+            if hasattr(model, "get_language_model")
+            else model
+        )
+        inner = getattr(language_model, "model", None)
+        self._disk_engram_model = (
+            inner if inner is not None and getattr(inner, "has_disk_engram", False) else None
+        )
 
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
@@ -87,6 +100,13 @@ class DeepseekV41ModelState(DefaultModelState):
             BLOCK_DEPTH=triton.next_power_of_2(depth),
         )
         model_inputs["lookback_token_ids"] = window
+        if self._disk_engram_model is not None:
+            self._disk_engram_model.stage_engram_rows(
+                input_batch.input_ids,
+                input_batch.positions,
+                input_batch.query_start_loc,
+                window,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
@@ -95,4 +115,16 @@ class DeepseekV41ModelState(DefaultModelState):
             # The captured graph reads this buffer; replays refill it in place.
             self.lookback_token_ids.fill_(-1)
             model_inputs["lookback_token_ids"] = self.lookback_token_ids
+        if self._disk_engram_model is not None:
+            # Frente 3.1: dummy/capture runs never call stage_engram_rows, so
+            # a hash staged by the last real step must not be reused here --
+            # the captured graph must contain the hash kernel itself.
+            for layer in islice(
+                self._disk_engram_model.layers,
+                self._disk_engram_model.start_layer,
+                self._disk_engram_model.end_layer,
+            ):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.clear_staged_hash_ids()
         return model_inputs

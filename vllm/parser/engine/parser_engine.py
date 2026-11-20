@@ -24,15 +24,18 @@ from vllm.entrypoints.generate.base.protocol import (
 )
 from vllm.logger import init_logger
 from vllm.parser.abstract_parser import Parser, StreamState
+from vllm.parser.engine.errors import MalformedToolArgs
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
+from vllm.parser.metrics import record_malformed_tool_args
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
     collect_tool_names,
     extract_types_from_schema,
     find_tool_name,
     find_tool_properties,
+    find_tool_required,
 )
 
 if TYPE_CHECKING:
@@ -55,6 +58,11 @@ class ToolCallSlot:
         "name_sent",
         "string_keys",
         "streamed_json",
+        "finalized",
+        "final_args",
+        "malformed_reason",
+        "surfaced",
+        "published",
     )
 
     def __init__(self) -> None:
@@ -65,6 +73,11 @@ class ToolCallSlot:
         self.name_sent: bool = False
         self.string_keys: set[str] | None = None
         self.streamed_json: str = ""
+        self.finalized: bool = False
+        self.final_args: str | None = None
+        self.malformed_reason: str | None = None
+        self.surfaced: bool = False
+        self.published: bool = False
 
     @property
     def args(self) -> str:
@@ -782,6 +795,7 @@ class ParserEngine(Parser):
         carried_deferred = self._deferred_content
         seen_tool_event = False
         suppress = self._suppress_tool_calls
+        defer = self.parser_engine_config.defer_tool_deltas
         for event in events:
             match event.type:
                 case EventType.TEXT_CHUNK:
@@ -804,11 +818,24 @@ class ParserEngine(Parser):
                 case EventType.ARG_VALUE_CHUNK:
                     if not suppress:
                         seen_tool_event = True
-                        self._handle_arg_chunk(event, tool_call_deltas)
+                        if defer:
+                            # Hold everything until the block closes: a
+                            # rejected body must leave no announced call.
+                            self._ensure_slot(event.tool_index)
+                            self._tool_slots[event.tool_index].append_args(event.value)
+                        else:
+                            self._handle_arg_chunk(event, tool_call_deltas)
                 case EventType.TOOL_CALL_END:
                     if not suppress:
                         seen_tool_event = True
-                        self._handle_tool_end(event, tool_call_deltas)
+                        if defer:
+                            self._handle_tool_end_deferred(
+                                event, tool_call_deltas, content_parts
+                            )
+                        else:
+                            self._handle_tool_end(
+                                event, tool_call_deltas, content_parts
+                            )
                 case EventType.REASONING_START:
                     pass  # no delta-level effect
 
@@ -929,13 +956,23 @@ class ParserEngine(Parser):
         self,
         event: SemanticEvent,
         deltas: list[DeltaToolCall],
+        content_parts: list[str],
     ) -> None:
+        """Close the slot of *event*.
+
+        A rejected body is appended to *content_parts* instead of being
+        announced as a tool call.
+        """
         idx = event.tool_index
         if idx >= len(self._tool_slots):
             return
 
-        remaining = self._flush_arg_converter(idx)
         slot = self._tool_slots[idx]
+        if not self._finalize_slot(idx) and self._on_malformed_args() != "call":
+            self._surface_body(slot, content_parts)
+            return
+
+        remaining = self._flush_arg_converter(idx)
 
         if not slot.name_sent:
             name = slot.name or self._try_extract_name(idx) or ""
@@ -966,6 +1003,73 @@ class ParserEngine(Parser):
                     function=DeltaFunctionCall(arguments=remaining),
                 )
             )
+
+    def _handle_tool_end_deferred(
+        self,
+        event: SemanticEvent,
+        deltas: list[DeltaToolCall],
+        content_parts: list[str],
+    ) -> None:
+        """Publish a closed tool call, or surface its body as content.
+
+        Nothing is emitted before the block closes, so a rejected body
+        leaves no announced call behind.  A published call carries its
+        final arguments in a single delta, which keeps the streamed value
+        identical to the non-streaming one and makes the index contiguous
+        even when an earlier call in the same response was rejected.
+        """
+        idx = event.tool_index
+        if idx >= len(self._tool_slots):
+            return
+
+        slot = self._tool_slots[idx]
+        if slot.published:
+            # The engine closes an already closed block again when the
+            # generation ends inside TOOL_BETWEEN.
+            return
+        if not self._finalize_slot(idx):
+            self._surface_body(slot, content_parts)
+            return
+
+        name = slot.name.strip() or self._try_extract_name(idx) or ""
+        if not self._accept_tool_name(name):
+            # A name the request never declared cannot be called, so the
+            # block is content like any other rejected body.
+            self._note_rejected(idx, "unknown_tool")
+            self._surface_body(slot, content_parts)
+            return
+
+        slot.name = name
+        slot.name_sent = True
+        slot.published = True
+        self._ensure_tool_id(slot, name)
+        deltas.append(
+            DeltaToolCall(
+                index=len(deltas),
+                id=slot.id,
+                type="function",
+                function=DeltaFunctionCall(
+                    name=name,
+                    arguments=self._fix_arg_types(slot.final_args or "{}", name),
+                ),
+            )
+        )
+
+    def _surface_body(self, slot: ToolCallSlot, content_parts: list[str]) -> None:
+        """Append a rejected block to the content of the current delta.
+
+        The inert note keeps a client-side DSML text recoverer from
+        rebuilding a call out of the body.  A slot is surfaced at most
+        once, so the streaming and non-streaming paths cannot both add it.
+        """
+        if slot.surfaced:
+            return
+        slot.surfaced = True
+        note = self.parser_engine_config.malformed_args_note
+        if slot.args:
+            content_parts.append(slot.args + note)
+        elif note:
+            content_parts.append(note)
 
     # ── Tool-call delta coalescing ──────────────────────────────────────
 
@@ -1050,10 +1154,15 @@ class ParserEngine(Parser):
             return None
 
         slot = self._tool_slots[idx]
-        try:
-            final_json = converter(slot.args, False)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            logger.debug("arg converter failed (flush): %s", slot.args[:80])
+        if self._finalize_slot(idx):
+            final_json = slot.final_args or "{}"
+        elif (
+            self._on_malformed_args() == "call"
+            and slot.malformed_reason != "converter_error"
+        ):
+            # Legacy behaviour: announce the call with empty arguments.
+            final_json = "{}"
+        else:
             return None
 
         if final_json:
@@ -1067,6 +1176,95 @@ class ParserEngine(Parser):
             slot.streamed_json = final_json
             return diff
         return None
+
+    def _on_malformed_args(self) -> str:
+        return self.parser_engine_config.on_malformed_args
+
+    def _note_rejected(self, idx: int, reason: str) -> None:
+        """Record a rejected tool call, once per reason."""
+        slot = self._tool_slots[idx]
+        slot.malformed_reason = reason
+        logger.warning_once(
+            "Rejected a tool call whose arguments could not be read (%s); "
+            "returning the block as content instead of an empty call.",
+            reason,
+        )
+        record_malformed_tool_args(
+            parser=self.parser_engine_config.name,
+            reason=reason,
+        )
+
+    def _finalize_slot(self, idx: int) -> bool:
+        """Convert a slot's argument body once and record the outcome.
+
+        Repairs are tried before anything is rejected, and only when they
+        are verifiable against the tool schema.  Never raises: a rejected
+        body is recorded on the slot and the caller decides whether it
+        becomes content or a legacy empty-arguments call.
+        """
+        slot = self._tool_slots[idx]
+        if slot.finalized:
+            return slot.malformed_reason is None
+        slot.finalized = True
+
+        converter = self._arg_converter
+        if converter is None:
+            return True
+
+        raw_body = slot.args
+        name = slot.name.strip() or self._try_extract_name(idx) or ""
+        if not raw_body.strip():
+            # An empty body is a legitimate call without arguments, unless
+            # the tool declares a property it cannot do without.
+            if self._missing_required(name, "{}"):
+                self._note_rejected(idx, "missing_required")
+                return False
+            slot.final_args = "{}"
+            return True
+
+        candidates = [raw_body]
+        repair = self.parser_engine_config.repair_unclosed_param
+        if repair is not None and name:
+            properties = find_tool_properties(self._tools, name)
+            if properties:
+                repaired = repair(raw_body, properties)
+                if repaired is not None and repaired != raw_body:
+                    candidates.append(repaired)
+
+        reason = "unparsed_dsml"
+        for body in candidates:
+            try:
+                args_json = converter(body, False)
+            except MalformedToolArgs as exc:
+                reason = exc.reason
+                continue
+            except (json.JSONDecodeError, ValueError, TypeError):
+                logger.debug("arg converter failed (finalize): %s", raw_body[:80])
+                reason = "converter_error"
+                continue
+            if self._missing_required(name, args_json):
+                reason = "missing_required"
+                continue
+            slot.final_args = args_json
+            return True
+
+        self._note_rejected(idx, reason)
+        return False
+
+    def _missing_required(self, name: str, args_json: str) -> bool:
+        """Whether *args_json* omits a property the tool declares required."""
+        if not self.parser_engine_config.validate_required_args or not name:
+            return False
+        required = find_tool_required(self._tools, name)
+        if not required:
+            return False
+        try:
+            parsed = json.loads(args_json)
+        except (json.JSONDecodeError, ValueError):
+            return False
+        if not isinstance(parsed, dict):
+            return False
+        return bool(required - parsed.keys())
 
     _NAME_RE = re.compile(r'"name"\s*:\s*"([^"]*)"')
 
@@ -1099,30 +1297,37 @@ class ParserEngine(Parser):
 
             if not name and raw_body.strip():
                 name, args_json = self._extract_name_and_args(raw_body)
-            elif raw_body.strip():
-                converter = self._arg_converter
-                if converter is not None:
-                    try:
-                        args_json = converter(raw_body, False)
-                    except (json.JSONDecodeError, ValueError, TypeError):
-                        logger.debug(
-                            "arg converter failed (extract): %s", raw_body[:80]
-                        )
-                        args_json = self._extract_args_json(raw_body, name)
-                else:
+            elif not self._finalize_slot(idx):
+                if slot.malformed_reason == "converter_error":
                     args_json = self._extract_args_json(raw_body, name)
+                elif self._on_malformed_args() == "call":
+                    args_json = "{}"
+                else:
+                    # The block could not be read: return it as content
+                    # instead of a call the client has to reject.
+                    self._surface_body(slot, content_parts)
+                    continue
             else:
-                args_json = "{}"
+                if slot.final_args is not None:
+                    args_json = slot.final_args
+                elif raw_body.strip():
+                    args_json = self._extract_args_json(raw_body, name)
+                else:
+                    args_json = "{}"
 
-            if self._accept_tool_name(name):
-                self._ensure_tool_id(slot, name)
-                args_json = self._fix_arg_types(args_json, name)
-                tool_calls.append(
-                    ToolCall(
-                        id=slot.id,
-                        function=FunctionCall(name=name, arguments=args_json),
-                    )
+            if not self._accept_tool_name(name):
+                if self._on_malformed_args() != "call":
+                    self._surface_body(slot, content_parts)
+                continue
+
+            self._ensure_tool_id(slot, name)
+            args_json = self._fix_arg_types(args_json, name)
+            tool_calls.append(
+                ToolCall(
+                    id=slot.id,
+                    function=FunctionCall(name=name, arguments=args_json),
                 )
+            )
 
         content_str = "".join(content_parts)
         content = self._strip_content_whitespace(content_str, len(tool_calls) > 0)

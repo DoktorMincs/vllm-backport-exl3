@@ -4,6 +4,7 @@
 
 from collections import deque
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -13,6 +14,53 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.input_batch import InputBatch
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pp_host import HostPPTransport
+
+
+def make_host_transport(worker) -> "HostPPTransport | None":
+    """Build the alternative PP handoff when ``VLLM_PP_TRANSPORT=host``.
+
+    Returns ``None`` -- the untouched NCCL path -- for the default
+    (``VLLM_PP_TRANSPORT`` unset or ``nccl``). The ``None`` branch allocates
+    nothing, imports nothing and has no side effects: the env string compare is
+    the whole cost. ``pp_host`` is imported lazily so the default path never
+    loads the module (no mmap, no threads, no extra torch state).
+
+    The transport is sized once, from the model's own
+    ``make_empty_intermediate_tensors(max_num_tokens)``: that template is
+    exactly ``bytes/token x max_num_batched_tokens`` of PP payload (it already
+    includes the ``pp_share`` entries), which is what the per-edge buffer is
+    dimensioned by (times a headroom factor, capped by
+    ``VLLM_PP_HOST_MAX_BYTES``).
+    """
+    from vllm import envs
+
+    if envs.VLLM_PP_TRANSPORT != "host":
+        return None
+
+    from vllm.v1.worker.gpu.pp_host import HostPPTransport
+
+    model = worker.model_runner.get_model()
+    max_tokens = getattr(worker.model_runner, "max_num_tokens", None)
+    if max_tokens is None:
+        max_tokens = worker.vllm_config.scheduler_config.max_num_batched_tokens
+    max_tokens = int(max_tokens)
+    template = model.make_empty_intermediate_tensors(
+        batch_size=max_tokens,
+        dtype=worker.vllm_config.model_config.dtype,
+        device=worker.device,
+    )
+    template_bytes = sum(
+        t.numel() * t.element_size() for t in template.tensors.values()
+    )
+    del template
+    return HostPPTransport(
+        device=worker.device,
+        max_num_batched_tokens=max_tokens,
+        template_bytes=template_bytes,
+    )
 
 
 @dataclass

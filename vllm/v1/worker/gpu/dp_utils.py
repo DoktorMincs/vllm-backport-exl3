@@ -7,14 +7,18 @@ from dataclasses import dataclass, replace
 import torch
 import torch.distributed as dist
 
+import vllm.envs as envs
 from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
     CudaGraphManager,
 )
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -108,23 +112,45 @@ def sync_cudagraph_and_dp_padding(
             int(num_tokens_across_dp.min()),
             uniform_decode=uniform_decode_across_dp,
         ):
-            # Microbatching is all-or-nothing: the expert all-to-all is
-            # collective, so every rank splits and pads to the same token count.
-            # A rank too small to fill a microbatch does no work in it, like a
-            # dummy run. Microbatched steps run eager; nothing is captured yet.
+            # Expert all-to-all requires every rank to split and pad equally.
+            # Empty microbatches run as dummy batches.
             ubatch_num_tokens = int(num_tokens_across_dp.max())
-            return BatchExecutionDescriptor(
-                cg_mode=CUDAGraphMode.NONE,
-                num_tokens=ubatch_num_tokens,
-                num_reqs=num_reqs,
-                num_ubatches=get_num_ubatches(parallel_config),
-            ), DPSyncState(
+            num_ubatches = get_num_ubatches(parallel_config)
+            ubatch_desc = None
+            if cudagraph_manager is not None:
+                # Match a FULL microbatched CUDA graph, falling back to an eager
+                # descriptor if no graph matches.
+                ubatch_desc = cudagraph_manager.dispatch(
+                    num_reqs,
+                    ubatch_num_tokens,
+                    synced_uniform_token_count,
+                    num_active_loras=num_active_loras,
+                    num_ubatches=num_ubatches,
+                )
+                if 2 * int(num_tokens_across_dp.min()) < ubatch_desc.num_tokens:
+                    # If one rank has an empty second microbatch, run without
+                    # CUDA graphs.
+                    ubatch_desc = None
+            if ubatch_desc is None:
+                ubatch_desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.NONE,
+                    num_tokens=ubatch_num_tokens,
+                    num_reqs=num_reqs,
+                    num_ubatches=num_ubatches,
+                )
+            # Refresh the token count to include CUDA graph padding.
+            ubatch_num_tokens = ubatch_desc.num_tokens
+            num_reqs = int(num_reqs_across_dp.max())
+            if ubatch_desc.cg_mode == CUDAGraphMode.FULL:
+                assert ubatch_desc.num_reqs is not None
+                num_reqs = ubatch_desc.num_reqs
+            return ubatch_desc, DPSyncState(
                 num_tokens_across_dp=torch.full_like(
                     num_tokens_across_dp, ubatch_num_tokens
                 ),
                 uniform_token_count=synced_uniform_token_count,
-                eager=True,
-                num_reqs=int(num_reqs_across_dp.max()),
+                eager=ubatch_desc.cg_mode == CUDAGraphMode.NONE,
+                num_reqs=num_reqs,
             )
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
@@ -255,6 +281,58 @@ def dispatch_cg_and_sync_dp(
         )
 
     if dp_size == 1:
+        # Pure-TP DBO: the split is a local decision, so no DP handshake. With
+        # VLLM_DBO_TP_GRAPH the split step replays a captured FULL microbatch
+        # graph (the same dispatch the DP path below uses); upstream runs it
+        # eager, which loses 7x against CUDA graphs on this model.
+        if (
+            allow_ubatching
+            and parallel_config is not None
+            and parallel_config.dbo_tp_only
+            and check_ubatch_thresholds(
+                parallel_config, num_tokens, uniform_decode=uniform_decode
+            )
+        ):
+            num_ubatches = get_num_ubatches(parallel_config)
+            ubatch_desc = None
+            if (
+                envs.VLLM_DBO_TP_GRAPH
+                and cudagraph_manager is not None
+                and not need_eager
+            ):
+                ubatch_desc = cudagraph_manager.dispatch(
+                    num_reqs,
+                    num_tokens,
+                    uniform_token_count,
+                    num_active_loras=num_active_loras,
+                    max_query_len=max_query_len,
+                    num_ubatches=num_ubatches,
+                )
+                if (
+                    ubatch_desc.cg_mode == CUDAGraphMode.NONE
+                    or 2 * num_tokens < ubatch_desc.num_tokens
+                ):
+                    # No captured microbatch graph, or an empty microbatch.
+                    ubatch_desc = None
+            if ubatch_desc is None:
+                ubatch_desc = BatchExecutionDescriptor(
+                    cg_mode=CUDAGraphMode.NONE,
+                    num_tokens=num_tokens,
+                    num_reqs=num_reqs,
+                    num_active_loras=num_active_loras,
+                    num_ubatches=num_ubatches,
+                )
+            if envs.VLLM_DBO_TP_GRAPH:
+                # One-shot proof that the split is active, and with which graph.
+                logger.info_once(
+                    "Pure-TP DBO split active (first step): cg=%s num_tokens=%d "
+                    "num_reqs=%d num_ubatches=%d",
+                    ubatch_desc.cg_mode.name,
+                    ubatch_desc.num_tokens,
+                    ubatch_desc.num_reqs,
+                    ubatch_desc.num_ubatches,
+                )
+            return ubatch_desc, None
         return batch_desc, None
 
     if dp_sync is not None:

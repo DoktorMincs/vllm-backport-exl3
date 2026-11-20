@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+import os
 from typing import Any
 
 from transformers import TokenizersBackend
@@ -76,6 +77,12 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 effort = None
             if effort is None:
                 effort = "high"
+            if (
+                isinstance(effort, str)
+                and effort in ("minimal", "medium")
+                and os.environ.get("VLLM_DS41_ALLOW_OPENAI_EFFORT", "1") != "0"
+            ):
+                effort = "low" if effort == "minimal" else "high"
             if not (
                 (type(effort) is int and 1 <= effort <= 100)
                 or (isinstance(effort, str) and effort in REASONING_EFFORT_MAPPINGS)
