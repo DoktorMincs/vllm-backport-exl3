@@ -1,11 +1,1439 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Derivative work of vcruz305/vllm-exl3 (AGPL-3.0-only). Apply at commit 053c634.
-# Full license text: LICENSE-AGPL-3.0 in this directory; see NOTICE-plugin.md.
+diff --git a/csrc/bindings.cpp b/csrc/bindings.cpp
+index bd7c4bf..b1f742f 100644
+--- a/csrc/bindings.cpp
++++ b/csrc/bindings.cpp
+@@ -10,6 +10,13 @@
+ #include "exl3_gemm.cuh"
+ #include "exl3_fat_gemm.cuh"
+ 
++// Expert codebook the kernels were compiled for: 1 = MCG (historical default),
++// 2 = mul1. Same default and meaning as the guard in p2b_moe.cu; the build
++// passes it with -DP2B_CB=2 for mul1 packs (see setup.py's VLLM_EXL3_P2B_CB).
++#ifndef P2B_CB
++#define P2B_CB 1
++#endif
++
+ namespace {
+ 
+ at::Tensor dequant_cpu(const at::Tensor& trellis, const at::Tensor& suh,
+@@ -255,6 +262,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     // p2b_fused_moe_padded rides the same .so; Python gates on the flag and
+     // degrades to the per-row mk path when it is absent.
+     m.attr("P2B_MOE_PADDED") = true;
++    // Expert codebook this .so was compiled for (1 = MCG, 2 = mul1). It is a
++    // compile-time switch: the kernels instantiate one codebook and the entry
++    // points TORCH_CHECK that the caller's `mcg` matches. Without this flag the
++    // only way for Python to know is to try a call and read the exception --
++    // and the historical gate simply hard-coded MCG, which silently disabled
++    // the native path for every mul1 pack (both DeepSeek-V4.1 packs are mul1:
++    // the trace shows path=batched/coop, never native).
++    m.attr("P2B_CB") = P2B_CB;
++    // Whether the kernels can decode a half-integer K (2.5 -> 40-word tile).
++    // Absent on binaries that predate the half-K decoders.
++#ifdef P2B_MOE_HALF_K
++    m.attr("P2B_MOE_HALF_K") = true;
++#endif
+ 
+     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
+           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
+diff --git a/experiments/b12x_moe/README.md b/experiments/b12x_moe/README.md
+new file mode 100644
+index 0000000..3e796e5
+--- /dev/null
++++ b/experiments/b12x_moe/README.md
+@@ -0,0 +1,38 @@
++# b12x MoE backend — required tree patch
++
++`src/vllm_exl3/b12x_moe.py` (selected only by `VLLM_EXL3_MOE_KERNEL=b12x`)
++drives the b12x W4A16 trellis MoE over the live EXL3 arenas. The b12x tree
++that ships in the flashinfer experiment does not accept the `mul1` codebook
++that our EXL3 packs use, so the backend needs `patches/b12x-route-a.patch`
++applied to it first.
++
++What the patch adds:
++
++* `mul1` registered as a codebook (sentinel `0x83DCD12D`, projection flag
++  `(False, True)`, bitrates 2/3/4) and treated as LUT-free like `mcg`.
++* `packed_dequant_trellis_mul1_to_half2x4` — the fp16 arm, bit-exact to
++  `codebook.cuh` `cb == 2`. The pre-existing b12x intrinsic for mul1 finishes
++  with `cvt.rn.satfinite.e4m3x2.f16x2`; that rounding is 2.6% rel-L2 on the
++  weights, so it is not used for serving.
++* the dispatch hook in the W4A16 GEMM decode plus the codebook sets in the
++  4 sites that enumerate them, and the joint gate/up projection-major layout.
++
++Apply from the directory that *contains* the `b12x` package (for this host,
++`~/b12x-vendor`, or whatever `VLLM_EXL3_B12X_PATH` points at):
++
++```bash
++git apply -p3 /path/to/b12x-route-a.patch
++# note: -p3, not -p4 — the vendored layout is b12x/_lib/... , not _lib/...
++```
++
++Verify against an already-patched tree with
++`git apply -R --check -p3 b12x-route-a.patch` (this is how the copy in this
++repo was checked: it matches the vendor tree under `~/b12x-vendor/b12x`
++exactly).
++
++Measured on the DS41 mia-v1 pack (TP2xPP5, 512k): routed-expert prefill
++1.57–1.72x the fused `exl3_moe`, decode unchanged (the backend only takes
++batches at or above `VLLM_EXL3_B12X_MIN_M`, default 64, because at 8
++rows/expert b12x wins but at decode sizes it is 5–9x slower).
++
++sha256 of the patch as added: `2a227150970d1aacfcaf94f1e13ae6ef349f5471d1ce2abc86a6f961d5e1b6c4`
+diff --git a/experiments/b12x_moe/patches/b12x-route-a.patch b/experiments/b12x_moe/patches/b12x-route-a.patch
+new file mode 100644
+index 0000000..d5493af
+--- /dev/null
++++ b/experiments/b12x_moe/patches/b12x-route-a.patch
+@@ -0,0 +1,425 @@
++diff --git a/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py b/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py
++index 406dd7233..23e5d70aa 100644
++--- a/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py
+++++ b/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py
++@@ -166,6 +166,116 @@ def packed_decode_trellis_mul1_e4m3_to_e4m3x8(
++     return Uint32(lo), Uint32(hi)
++ 
++ 
+++@dsl_user_op
+++def packed_dequant_trellis_mul1_to_half2x4(
+++    win_a, win_b, bits: int = 3, *, loc=None, ip=None
+++):
+++    """Decode eight MUL1 lanes straight to fp16, bit-faithful to ExLlamaV3.
+++
+++    ExLlamaV3 ``codebook.cuh`` (``cb == 2``) computes, per weight::
+++
+++        sum = dp4a(win * 0x83DCD12D, 0x01010101, 0x6400)   # 1024..2047
+++        h   = (half)(uint16)sum
+++        v   = __hfma(h, 0x1eee, 0xc931)                    # fp16 ramp
+++
+++    ``packed_decode_trellis_mul1_e4m3_to_e4m3x8`` runs the same sequence but
+++    ends in ``cvt.rn.satfinite.e4m3x2.f16x2``, which rounds the value to E4M3.
+++    That rounding is part of the E4M3 reconstruction law, not of the fp16 one:
+++    over the full ramp it costs up to 0.125 absolute (~2.6% relative L2), so a
+++    W4A16 kernel decoding fp16 weights must not reuse it.  This primitive is
+++    that sequence minus the conversion, so its output is the EXL3 law exactly.
+++
+++    Lane order matches ``packed_dequant_trellis_to_half2x4``:
+++      o0=(w0,w1) o1=(w2,w3) o2=(w4,w5) o3=(w6,w7),
+++    with w7..w4 from ``win_a`` and w3..w0 from ``win_b``.
+++    """
+++    bits = int(bits)
+++    if bits not in (2, 3, 4):
+++        raise ValueError(
+++            f"unsupported MUL1 trellis bitrate {bits}; expected 2, 3, or 4"
+++        )
+++    asm = """
+++        {
+++            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+++            .reg .b32 h01,h23,h45,h67, M, ones, acc, kinv, kbias;
+++            mov.b32 M, __MUL1__;
+++            mov.b32 ones, 0x01010101;
+++            mov.b32 acc, 0x00006400;
+++            mov.b32 kinv, 0x1eee1eee;
+++            mov.b32 kbias, 0xc931c931;
+++            and.b32 w7, $4, 0xffff;
+++            shr.u32 w6, $4, __B1__;  and.b32 w6, w6, 0xffff;
+++            shr.u32 w5, $4, __B2__;  and.b32 w5, w5, 0xffff;
+++            shr.u32 w4, $4, __B3__;  and.b32 w4, w4, 0xffff;
+++            and.b32 w3, $5, 0xffff;
+++            shr.u32 w2, $5, __B1__;  and.b32 w2, w2, 0xffff;
+++            shr.u32 w1, $5, __B2__;  and.b32 w1, w1, 0xffff;
+++            shr.u32 w0, $5, __B3__;  and.b32 w0, w0, 0xffff;
+++            mul.lo.u32 w0, w0, M;  dp4a.u32.u32 w0, w0, ones, acc;
+++            mul.lo.u32 w1, w1, M;  dp4a.u32.u32 w1, w1, ones, acc;
+++            mul.lo.u32 w2, w2, M;  dp4a.u32.u32 w2, w2, ones, acc;
+++            mul.lo.u32 w3, w3, M;  dp4a.u32.u32 w3, w3, ones, acc;
+++            mul.lo.u32 w4, w4, M;  dp4a.u32.u32 w4, w4, ones, acc;
+++            mul.lo.u32 w5, w5, M;  dp4a.u32.u32 w5, w5, ones, acc;
+++            mul.lo.u32 w6, w6, M;  dp4a.u32.u32 w6, w6, ones, acc;
+++            mul.lo.u32 w7, w7, M;  dp4a.u32.u32 w7, w7, ones, acc;
+++            prmt.b32 h01, w0, w1, 0x5410;
+++            prmt.b32 h23, w2, w3, 0x5410;
+++            prmt.b32 h45, w4, w5, 0x5410;
+++            prmt.b32 h67, w6, w7, 0x5410;
+++            fma.rn.f16x2 h01, h01, kinv, kbias;
+++            fma.rn.f16x2 h23, h23, kinv, kbias;
+++            fma.rn.f16x2 h45, h45, kinv, kbias;
+++            fma.rn.f16x2 h67, h67, kinv, kbias;
+++            mov.b32 $0, h01;
+++            mov.b32 $1, h23;
+++            mov.b32 $2, h45;
+++            mov.b32 $3, h67;
+++        }
+++        """
+++    asm = (
+++        asm.replace("__MUL1__", f"{_TRELLIS_MUL1:#010x}")
+++        .replace("__B1__", str(bits))
+++        .replace("__B2__", str(2 * bits))
+++        .replace("__B3__", str(3 * bits))
+++    )
+++    result = llvm.inline_asm(
+++        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
+++        [
+++            Uint32(win_a).ir_value(loc=loc, ip=ip),
+++            Uint32(win_b).ir_value(loc=loc, ip=ip),
+++        ],
+++        asm,
+++        "=r,=r,=r,=r,r,r",
+++        has_side_effects=False,
+++        is_align_stack=False,
+++        asm_dialect=llvm.AsmDialect.AD_ATT,
+++        loc=loc,
+++        ip=ip,
+++    )
+++    o0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
+++    o1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
+++    o2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
+++    o3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
+++    return Uint32(o0), Uint32(o1), Uint32(o2), Uint32(o3)
+++
+++
+++@dsl_user_op
+++def packed_dequant_trellis_mul1_to_bfloat2x4(
+++    win_a, win_b, bits: int = 3, *, loc=None, ip=None
+++):
+++    """Diagnostic bf16 conversion of the fp16 MUL1 decode."""
+++    h0, h1, h2, h3 = packed_dequant_trellis_mul1_to_half2x4(
+++        win_a, win_b, bits, loc=loc, ip=ip
+++    )
+++    return (
+++        _f16x2_to_bf16x2(h0, loc=loc, ip=ip),
+++        _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
+++        _f16x2_to_bf16x2(h2, loc=loc, ip=ip),
+++        _f16x2_to_bf16x2(h3, loc=loc, ip=ip),
+++    )
+++
+++
++ @dsl_user_op
++ def packed_decode_lut_e4m3_to_e4m3x8(
++     win_a,
++diff --git a/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py b/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py
++index 7b1a3768c..d1bf3a8fa 100644
++--- a/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py
+++++ b/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py
++@@ -17,6 +17,7 @@ from b12x.preparation import (
++     current_plan,
++ )
++ from b12x.moe._shared.kernels.w4a16.prepare import PreparedTrellis256DenseWeight
+++from b12x.moe._shared.trellis_codebooks import is_lut_free
++ from ._tuning import TUNING, TrellisConfig, TrellisQuery
++ 
++ _INTERNAL_C_TMPS = weakref.WeakValueDictionary()
++@@ -126,7 +127,7 @@ def _c_tmp_elements(query: TrellisQuery, config: TrellisConfig, sm_count: int) -
++ 
++ 
++ def _lut_memory(query: TrellisQuery, device) -> PersistentMemory | None:
++-    if query.codebook == "mcg":
+++    if is_lut_free(query.codebook):
++         return None
++     resolved = torch.device("cuda", device.ordinal)
++     if query.codebook == "lut_e4m3":
++diff --git a/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py b/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py
++index fba9bc2b3..ce9229cd0 100644
++--- a/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py
+++++ b/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py
++@@ -101,10 +101,14 @@ def validate_query(query):
++     if query.pair_kind != pair_kind.upper() or query.rate_axis != rate_axis:
++         raise ValueError("Trellis pair layout and explicit pair/rate metadata differ")
++     size = query.in_features if rate_axis == "k" else query.out_features
++-    if query.bits != 3 or size != 256 or query.codebook not in ("mcg", "lut_e4m3"):
+++    if query.bits != 3 or size != 256 or query.codebook not in (
+++        "mcg",
+++        "mul1",
+++        "lut_e4m3",
+++    ):
++         raise ValueError(
++             "compact Trellis pairs require three stored bits per weight, a 256-channel "
++-            "rate axis, and the mcg or lut_e4m3 codebook"
+++            "rate axis, and the mcg, mul1, or lut_e4m3 codebook"
++         )
++ 
++ 
++diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py
++index 42148f003..fc1c82213 100644
++--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py
+++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py
++@@ -5,6 +5,7 @@ from __future__ import annotations
++ from b12x._lib.quant.block_codec import BLOCK_CODECS
++ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
++ from b12x.moe._shared.trellis_codebooks import LUT_FP16
+++from b12x.moe._shared.trellis_codebooks import MUL1
++ from b12x.moe._shared.trellis_codebooks import MCG
++ from cutlass.cutlass_dsl import T
++ from cutlass.cutlass_dsl import Uint32
++@@ -152,7 +153,7 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
++ # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
++ _TRELLIS256_BITS = (2, 3, 4, 5, 6)
++ 
++-_TRELLIS256_CODEBOOKS = {MCG, LUT_E4M3, LUT_FP16}
+++_TRELLIS256_CODEBOOKS = {MCG, MUL1, LUT_E4M3, LUT_FP16}
++ 
++ _LUT_E4M3_VALUE_TABLE_ENTRIES = 1 << 12
++ 
++diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
++index 6b53b4fb0..406b06ae9 100644
++--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
+++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
++@@ -4,6 +4,7 @@ from __future__ import annotations
++ 
++ from b12x._lib.quant.block_codec import BLOCK_CODECS
++ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
+++from b12x.moe._shared.trellis_codebooks import is_lut_free
++ from b12x.moe._shared.kernels.w4a16.route_pack import (
++     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
++ )
++@@ -405,7 +406,7 @@ def _run_trellis256_dense_current_device(
++     tile_n = int(launch.kernel.tile_n)
++     n_tiles = size_n // tile_n
++     grid_x = min(int(grid_cap), max(route_blocks * n_tiles, 1))
++-    if trellis_codebook != "mcg" and execution_lut is None:
+++    if not is_lut_free(trellis_codebook) and execution_lut is None:
++         raise ValueError("prepared Trellis decoder is missing its execution LUT")
++     stream = current_cuda_stream() if stream is None else stream
++     dummy_i32 = prepared_dense.workspace[:1]
++@@ -437,8 +438,8 @@ def _run_trellis256_dense_current_device(
++         prepared_dense.global_scale,
++         launch.c_tmp,
++         prepared_dense.workspace,
++-        # MCG kernels never dereference the LUT ABI slot.
++-        dummy_i32 if trellis_codebook == "mcg" else execution_lut,
+++        # Register-only decoders (MCG/MUL1) never dereference the LUT ABI slot.
+++        dummy_i32 if is_lut_free(trellis_codebook) else execution_lut,
++         m,
++         grid_x,
++         stream,
++diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py
++index 9425e6071..817f9bdd2 100644
++--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py
+++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py
++@@ -286,10 +286,20 @@ class W4A16FusedMoeKernel:
++                 raise ValueError(
++                     "intermediate_rotation is only supported for trellis_t256"
++                 )
++-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
+++            # LOCAL PATCH (EXL3): the swiglu limit is supported on this path.
+++            # The rotation-aware epilogue clamps the *effective* gate/up (after
+++            # had128 and svh, which is the value the EXL3 reference loop clamps
+++            # and feeds to silu), so gated silu with a limit is well defined
+++            # here; swiglu-oai has its own alpha/beta law and situ is only
+++            # implemented unclamped in this branch.
+++            if (
+++                not is_gated
+++                or self.activation_is_swigluoai
+++                or (self.activation_is_situ and self.has_swiglu_limit)
+++            ):
++                 raise ValueError(
++-                    "intermediate_rotation requires unclamped gated silu or situ "
++-                    "(no swiglu limit/oai)"
+++                    "intermediate_rotation requires gated silu (clamped or "
+++                    "unclamped) or unclamped situ (no swiglu-oai)"
++                 )
++             if int(intermediate_size) % 128 != 0:
++                 raise ValueError(
++@@ -2415,6 +2425,14 @@ class W4A16FusedMoeKernel:
++                 iu2_1 = uh1 * svu1
++                 iu2_2 = uh2 * svu2
++                 iu2_3 = uh3 * svu3
+++                if cutlass.const_expr(self.has_swiglu_limit):
+++                    # LOCAL PATCH (EXL3): DS4.1's clamp law, applied where the
+++                    # model defines it -- on the effective gate/up (post svh),
+++                    # gate clamped from above and up symmetrically, before silu.
+++                    ig2_0, iu2_0 = self._clamp_swiglu_inputs(ig2_0, iu2_0)
+++                    ig2_1, iu2_1 = self._clamp_swiglu_inputs(ig2_1, iu2_1)
+++                    ig2_2, iu2_2 = self._clamp_swiglu_inputs(ig2_2, iu2_2)
+++                    ig2_3, iu2_3 = self._clamp_swiglu_inputs(ig2_3, iu2_3)
++                 # silu(gate) * up, then pre-scale suh_down
++                 d2 = isz + isz
++                 sd0 = rot_scales_flat[s_base + d2 + Int32(0)].to(cutlass.Float32)
++diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py
++index 12057f9b8..f0f3e4aa4 100644
++--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py
+++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py
++@@ -8,6 +8,7 @@ from cutlass.cutlass_dsl import Int32
++ from cutlass.cutlass_dsl import Int64
++ from b12x._lib.compiler import KernelCompileSpec
++ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
+++from b12x.moe._shared.trellis_codebooks import is_lut_free
++ from cutlass.base_dsl.compiler import OptLevel
++ from b12x._lib.compile_plan import attach_programs
++ from b12x._lib.compiler import compile as b12x_compile
++@@ -998,7 +999,7 @@ def _w4a16_fused_moe_launch_flat(
++         )
++         fc1_trellis_lut_addr = iq2_lut.data_ptr()
++         fc2_trellis_lut_addr = iq2_lut.data_ptr()
++-    elif weight_layout == "trellis_t256" and trellis_codebook != "mcg":
+++    elif weight_layout == "trellis_t256" and not is_lut_free(trellis_codebook):
++         trellis_rank_lut = _trellis256_execution_lut(
++             a_input.device, trellis_codebook, direct_lut=fused.trellis_direct_lut
++         )
++diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py
++index 36c4aff7d..c18a3ca15 100644
++--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py
+++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py
++@@ -7,6 +7,7 @@ from cutlass.cutlass_dsl import Int32
++ from cutlass.cutlass_dsl import Int64
++ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
++ from b12x.moe._shared.trellis_codebooks import LUT_FP16
+++from b12x.moe._shared.trellis_codebooks import MUL1
++ from cutlass.cutlass_dsl import Uint32
++ from b12x.moe._shared.kernels.trellis_ring import (
++     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
++@@ -59,6 +60,8 @@ from b12x._lib.intrinsics.packed import packed_dequant_e4m3x4_to_bfloat2x2
++ from b12x._lib.intrinsics.packed import packed_dequant_e4m3x4_to_half2x2
++ from b12x._lib.intrinsics.packed import packed_dequant_e8m0x4_to_bfloat2x2
++ from b12x._lib.intrinsics.packed import packed_dequant_e8m0x4_to_half2x2
+++from b12x._lib.intrinsics.trellis import packed_dequant_trellis_mul1_to_bfloat2x4
+++from b12x._lib.intrinsics.trellis import packed_dequant_trellis_mul1_to_half2x4
++ from b12x._lib.intrinsics.trellis import packed_dequant_trellis_stream_to_bfloat2x4
++ from b12x._lib.intrinsics.trellis import packed_dequant_trellis_stream_to_half2x4
++ from b12x._lib.intrinsics.trellis import packed_dequant_trellis_to_bfloat2x4
++@@ -3547,6 +3550,15 @@ class W4A16GemmKernel:
++                 o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
++                     win_a, win_b, int(bits)
++                 )
+++        elif cutlass.const_expr(self.trellis_codebook == MUL1):
+++            if cutlass.const_expr(self.is_fp16):
+++                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
+++                    win_a, win_b, bits
+++                )
+++            else:
+++                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_bfloat2x4(
+++                    win_a, win_b, bits
+++                )
++         elif cutlass.const_expr(self.trellis_codebook == LUT_FP16):
++             if cutlass.const_expr(self.is_fp16):
++                 o0, o1, o2, o3 = packed_decode_lut_fp16_to_half2x4(
++diff --git a/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py b/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py
++index df9b14a39..dfaae9c97 100644
++--- a/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py
+++++ b/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py
++@@ -2,10 +2,13 @@
++ 
++ A ``trellis_t256`` tile stores 256 tail-biting codes whose 16-bit decode
++ windows are interpreted by one codebook. The codebook is a model-level
++-setting; three are defined:
+++setting; four are defined:
++ 
++ - ``mcg``: multiplicative congruential decode (multiplier ``0xCBAC1FED``)
++   with a lop3 mask/or into two added fp16 halves.
+++- ``mul1``: multiplicative decode with multiplier ``0x83DCD12D`` followed by a
+++  four-byte sum and one FP16 affine step (ExLlamaV3 ``codebook.cuh`` cb==2);
+++  defined for K2/K3/K4.
++ - ``lut_e4m3``: integer permutation of each decode window followed by a
++   fixed E4M3 value table; defined for K2/K3/K4.
++ - ``lut_fp16``: integer permutation followed by a piecewise-linear FP16 value
++@@ -18,13 +21,28 @@ constants, so the ids participate in kernel cache keys.
++ from __future__ import annotations
++ 
++ MCG = "mcg"
+++MUL1 = "mul1"
++ LUT_E4M3 = "lut_e4m3"
++ LUT_FP16 = "lut_fp16"
++ 
++-CODEBOOKS: tuple[str, ...] = (MCG, LUT_E4M3, LUT_FP16)
+++CODEBOOKS: tuple[str, ...] = (MCG, MUL1, LUT_E4M3, LUT_FP16)
++ 
++ MCG_MULTIPLIER = 0xCBAC1FED
++-CODEBOOK_SENTINELS: dict[int, str] = {MCG_MULTIPLIER: MCG}
+++MUL1_MULTIPLIER = 0x83DCD12D
+++CODEBOOK_SENTINELS: dict[int, str] = {
+++    MCG_MULTIPLIER: MCG,
+++    MUL1_MULTIPLIER: MUL1,
+++}
+++
+++# Codebooks whose decode is a register-only arithmetic law: they never read an
+++# execution LUT, so kernels take the empty LUT slot instead of staging one.
+++LUT_FREE_CODEBOOKS: frozenset[str] = frozenset((MCG, MUL1))
+++
+++
+++def is_lut_free(codebook: str) -> bool:
+++    """True when ``codebook`` decodes without an execution value table."""
+++
+++    return codebook in LUT_FREE_CODEBOOKS
++ 
++ 
++ def normalize_codebook(codebook: str | int) -> str:
++@@ -39,7 +57,8 @@ def normalize_codebook(codebook: str | int) -> str:
++         if normalized is None:
++             raise ValueError(
++                 "unsupported trellis codebook sentinel "
++-                f"{int(codebook) & 0xFFFFFFFF:#010x}; expected MCG 0xcbac1fed"
+++                f"{int(codebook) & 0xFFFFFFFF:#010x}; expected MCG 0xcbac1fed "
+++                "or MUL1 0x83dcd12d"
++             )
++         return normalized
++     text = str(codebook).strip().lower()
++@@ -47,17 +66,19 @@ def normalize_codebook(codebook: str | int) -> str:
++         return text
++     raise ValueError(
++         f"unsupported trellis codebook {codebook!r}; expected "
++-        "'mcg', 'lut_e4m3', or 'lut_fp16'"
+++        "'mcg', 'mul1', 'lut_e4m3', or 'lut_fp16'"
++     )
++ 
++ 
++ def validate_codebook_bits(codebook: str, bits: int) -> None:
++     """Reject (codebook, bitrate) pairs the decoders do not define.
++ 
++-    MCG decodes any supported tile bitrate; the lookup-table codebooks are
++-    defined only on their construction ranges.
+++    MCG decodes any supported tile bitrate; the lookup-table and MUL1 codebooks
+++    are defined only on their construction ranges.
++     """
++ 
+++    if codebook == MUL1 and bits not in (2, 3, 4):
+++        raise ValueError("mul1 is defined only for K2/K3/K4")
++     if codebook == LUT_E4M3 and bits not in (2, 3, 4):
++         raise ValueError("lut_e4m3 is defined only for K2/K3/K4")
++     if codebook == LUT_FP16 and bits not in (5, 6):
++diff --git a/flashinfer/experimental/b12x/moe/fused_moe/config.py b/flashinfer/experimental/b12x/moe/fused_moe/config.py
++index 6745af9dc..88fc8774a 100644
++--- a/flashinfer/experimental/b12x/moe/fused_moe/config.py
+++++ b/flashinfer/experimental/b12x/moe/fused_moe/config.py
++@@ -9,6 +9,7 @@ from typing import Any, Mapping
++ 
++ class TrellisCodebook(str, Enum):
++     MCG = "mcg"
+++    MUL1 = "mul1"
++     LUT_E4M3 = "lut_e4m3"
++     LUT_FP16 = "lut_fp16"
++ 
++diff --git a/flashinfer/experimental/b12x/moe/fused_moe/trellis.py b/flashinfer/experimental/b12x/moe/fused_moe/trellis.py
++index 366362003..9a1c0a669 100644
++--- a/flashinfer/experimental/b12x/moe/fused_moe/trellis.py
+++++ b/flashinfer/experimental/b12x/moe/fused_moe/trellis.py
++@@ -309,6 +309,8 @@ def _symmetric_bits(
++         allowed = (uniform_bits,)
++     elif config.codebook is TrellisCodebook.MCG:
++         allowed = (3, 4, 5)
+++    elif config.codebook is TrellisCodebook.MUL1:
+++        allowed = (2, 3, 4)
++     elif config.codebook is TrellisCodebook.LUT_E4M3:
++         allowed = (3,)
++     else:
+diff --git a/setup.py b/setup.py
+index 7a6e9f6..6e51be4 100644
+--- a/setup.py
++++ b/setup.py
+@@ -18,6 +18,12 @@ ext_modules = []
+ cmdclass = {}
+ 
+ 
++def _cb_flags() -> list[str]:
++    """``-DP2B_CB=<n>`` from VLLM_EXL3_P2B_CB, for every compiler in the build."""
++    cb = os.environ.get("VLLM_EXL3_P2B_CB")
++    return [f"-DP2B_CB={int(cb)}"] if cb else []
++
++
+ def _cxx_std():
+     """C++ standard for the extension: torch >= 2.14 headers refuse anything below C++20."""
+     override = os.environ.get("VLLM_EXL3_CXX_STD")
+@@ -76,8 +82,17 @@ if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
+                 ],
+                 include_dirs=include_dirs,
+                 extra_compile_args={
+-                    "cxx": ["-O3", _cxx_std()],
+-                    "nvcc": ["-O3", _cxx_std()],
++                    # Expert codebook: 1 = MCG (historical default), 2 = mul1.
++                    # Both DeepSeek-V4.1 packs are mul1, so a build for them
++                    # needs VLLM_EXL3_P2B_CB=2; the extension then exports
++                    # P2B_CB so Python can gate the native path on it instead
++                    # of assuming MCG. It has to go to BOTH compilers: the
++                    # kernels live in .cu (nvcc) but bindings.cpp reports the
++                    # value to Python and is compiled by the host compiler --
++                    # defining it only for nvcc yields a mul1 kernel that
++                    # advertises MCG.
++                    "cxx": ["-O3", _cxx_std()] + _cb_flags(),
++                    "nvcc": ["-O3", _cxx_std()] + _cb_flags(),
+                 },
+             )
+         )
+diff --git a/src/vllm_exl3/b12x_moe.py b/src/vllm_exl3/b12x_moe.py
+new file mode 100644
+index 0000000..42a1898
+--- /dev/null
++++ b/src/vllm_exl3/b12x_moe.py
+@@ -0,0 +1,604 @@
++"""Optional b12x W4A16 trellis MoE backend for `mul1` EXL3 packs.
++
++Selected only by an explicit ``VLLM_EXL3_MOE_KERNEL=b12x``; every other value
++(including ``auto``) leaves the existing native/ExLlamaV3/python-loop dispatch
++untouched.  The backend runs NVIDIA's ``b12x`` fused MoE (the CuTe-DSL W4A16
++trellis kernel from the hyperflare/flashinfer experiment) against the *live*
++EXL3 arenas, zero-copy, with the ``mul1`` codebook decoded by the fp16 arm
++added in ``b12x._lib.intrinsics.trellis.packed_dequant_trellis_mul1_to_half2x4``
++(bit-exact to ``codebook.cuh`` cb==2; the pre-existing mul1 intrinsic rounds to
++E4M3 and is 2.6% rel-L2 on the weights, so it is not used here).
++
++Scope of this backend, by construction:
++
++* routed experts only, uniform K in {2, 3, 4}, one codebook per layer
++  (``(False, True)`` = mul1 for every projection);
++* gated silu, with or without the DS4.1 clamp (``swiglu_limit = 10.0``); the
++  clamp law is b12x's ``swiglu_clamp_after_silu=False`` path, which matches the
++  plugin's reference loop exactly;
++* no ``expert_map`` (TP-only, not EP) and no mixed-K store;
++* above ``VLLM_EXL3_B12X_MIN_M`` rows (default 64): at 8 rows/expert the b12x
++  MoE is ~15% faster than the fused ``exl3_moe``, but at decode sizes it is
++  5-9x slower than the gemv path, so narrow batches keep the established
++  dispatch.
++
++Every entry point degrades instead of raising: a missing import, an
++unsupported geometry or a launch failure clears ``layer._exl3_b12x_state`` and
++leaves ``layer._exl3_b12x_error`` for the diagnostics line, and the caller
++falls back to the paths it already had.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++from collections import OrderedDict
++from functools import lru_cache
++from typing import Any
++
++import torch
++
++BACKEND = "b12x"
++_MIN_ROWS_DEFAULT = 64
++# How many distinct (rows, topk) workspaces to keep, process-wide.
++_MAX_CACHED_SHAPES = 4
++# Scratch is geometry, not layer: every layer of a pipeline stage has the same
++# E/H/I/K, and these buffers are pure workspace (weights are read-only views in
++# `prepared`). Sharing them across layers turns 8 copies per rank into one.
++# Measured 18/11: per-layer workspaces (8 layers x ~112 MB at M=512) ate the
++# whole KV budget and aborted the boot ("16384 needs 0.05 GiB, 0.04 available").
++_SHARED: "OrderedDict[tuple, tuple]" = OrderedDict()
++# Block sizes whose kernel specialization has been compiled in this process.
++# The CuTe cache key has no M in it, but it DOES carry `moe_block_size` (via
++# the fc1/fc2 GEMM keys), and `select_route_block_size_m` picks 8 for M<=384
++# and 16 for M=512+. A prefill chunk that lands on the other block size would
++# then JIT-compile inside a serving step: measured 18/11, a 1744-token prompt
++# split into 512/512/512/208 hung the pp_broadcast collective until the NCCL
++# watchdog killed the engine. Warm both at load, and let an operator pin one.
++_WARMED_BLOCKS: set[tuple] = set()
++_WARMUP_ROWS = {8: 256, 16: 512, 32: 1024}
++
++
++
++def _logger():
++    try:
++        from vllm.logger import init_logger
++
++        # The vLLM "vllm." prefix is what carries the configured level and the
++        # handler; a bare "vllm_exl3.b12x_moe" logger drops every INFO line
++        # (measured 18/11: the whole b12x diagnosis was invisible at boot).
++        return init_logger("vllm." + __name__)
++    except Exception:  # pragma: no cover - import-time safety
++        import logging
++
++        return logging.getLogger(__name__)
++
++
++def _flag(name: str, default: bool) -> bool:
++    raw = os.environ.get(name)
++    if raw is None:
++        return default
++    return raw.strip().lower() in ("1", "true", "yes", "on")
++
++
++def requested() -> bool:
++    """True only when the operator asked for this backend by name."""
++    return os.environ.get("VLLM_EXL3_MOE_KERNEL", "auto").strip().lower() == BACKEND
++
++
++def min_rows() -> int:
++    raw = os.environ.get("VLLM_EXL3_B12X_MIN_M", "").strip()
++    if raw:
++        try:
++            return max(0, int(raw))
++        except ValueError:
++            pass
++    return _MIN_ROWS_DEFAULT
++
++
++def max_rows() -> int:
++    """Upper bound for this backend (0 = no bound)."""
++    raw = os.environ.get("VLLM_EXL3_B12X_MAX_M", "").strip()
++    if raw:
++        try:
++            return max(0, int(raw))
++        except ValueError:
++            pass
++    return 0
++
++
++def _vendor_dir() -> str | None:
++    """Directory that contains the ``b12x`` package (self-contained tree)."""
++    for name in ("VLLM_EXL3_B12X_PATH", "VLLM_EXL3_B12X_SRC"):
++        raw = os.environ.get(name, "").strip()
++        if raw:
++            # Accept either the package's parent or a flashinfer/experimental root.
++            for cand in (raw, os.path.join(raw, "flashinfer", "experimental")):
++                if os.path.isdir(os.path.join(cand, "b12x")):
++                    return cand
++            return raw
++    for cand in (
++        os.path.expanduser("~/b12x-vendor"),
++        os.path.join(
++            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
++            "third_party",
++            "b12x",
++        ),
++    ):
++        if os.path.isdir(os.path.join(cand, "b12x")):
++            return cand
++    return None
++
++
++@lru_cache(maxsize=1)
++def _libs():
++    """Import the b12x entry points once; returns None when unavailable."""
++    vendor = _vendor_dir()
++    if vendor is None:
++        return None
++    if vendor not in sys.path:
++        sys.path.insert(0, vendor)
++    try:
++        from b12x.moe._shared.kernels.w4a16.host import (
++            make_w4a16_packed_buffers,
++            select_route_block_size_m,
++        )
++        from b12x.moe._shared.kernels.w4a16.kernel.execution import run_w4a16_moe
++        from b12x.moe._shared.kernels.w4a16.prepare import (
++            prepare_trellis256_moe_weights,
++        )
++    except Exception as exc:  # pragma: no cover - depends on the install
++        _logger().warning("b12x MoE backend unavailable: %r", exc)
++        return None
++    return {
++        "make_buffers": make_w4a16_packed_buffers,
++        "select_block": select_route_block_size_m,
++        "run": run_w4a16_moe,
++        "prepare": prepare_trellis256_moe_weights,
++    }
++
++
++def available() -> bool:
++    return _libs() is not None
++
++
++def joint_w13_wanted() -> bool:
++    """Whether gate/up should share one projection-major arena at load time.
++
++    ``b12x``'s full-rotation path requires ``[2,E,H/16,I/16,16*bits]i16``
++    contiguous; the plugin's per-projection arenas cannot be viewed that way,
++    so the planner allocates the pair up front.  The per-expert Parameters stay
++    views of that storage, which the existing EXL3/exllamav3 paths dereference
++    by pointer, so nothing else changes.
++    """
++    return requested() and _flag("VLLM_EXL3_B12X_JOINT_W13", True) and available()
++
++
++def plan_joint_w13(
++    layer: Any,
++    shapes_by_proj: dict[str, dict[int, tuple[int, ...]]],
++    ats_eids: dict[str, set[int]] | None = None,
++) -> dict[tuple[int, ...], list[int]]:
++    """``shape -> [expert_id, ...]`` groups that may share a gate/up arena."""
++    if not joint_w13_wanted():
++        return {}
++    if getattr(layer, "_exl3_mixed_k", False) or getattr(
++        layer, "_exl3_has_frac_k", False
++    ):
++        return {}
++    gate = shapes_by_proj.get("gate") or {}
++    up = shapes_by_proj.get("up") or {}
++    if not gate or set(gate) != set(up):
++        return {}
++    if any(tuple(up[e]) != tuple(shapes_by_proj["gate"][e]) for e in up):
++        return {}
++    if (ats_eids or {}).get("gate") or (ats_eids or {}).get("up"):
++        return {}
++    groups: dict[tuple[int, ...], list[int]] = {}
++    for eid in sorted(shapes_by_proj["gate"]):
++        shape = tuple(int(x) for x in shapes_by_proj["gate"][eid])
++        if len(shape) != 3 or int(shape[-1]) % 16 != 0:
++            return {}
++        groups.setdefault(shape, []).append(int(eid))
++    return groups
++
++
++def _layer_act_is_plain_silu(layer: Any) -> bool:
++    try:
++        from .exl3 import MOE_ACT_SILU, resolve_moe_act
++
++        act = getattr(layer, "_exl3_moe_act", None)
++        if act is None:
++            act = resolve_moe_act(layer)
++        return int(act) == int(MOE_ACT_SILU)
++    except Exception:
++        return False
++
++
++def prepare_layer(layer: Any) -> dict[str, Any] | None:
++    """Build this layer's ``PreparedW4A16MoeWeights`` once, after weight load.
++
++    Returns the state dict (also stored on ``layer._exl3_b12x_state``) or None
++    when the layer is out of scope.  Never raises: failures land in
++    ``layer._exl3_b12x_error`` and the layer keeps its established dispatch.
++    """
++    if not requested():
++        return None
++    if getattr(layer, "_exl3_b12x_tried", False):
++        return getattr(layer, "_exl3_b12x_state", None)
++    layer._exl3_b12x_tried = True
++
++    def _skip(reason: str) -> None:
++        layer._exl3_b12x_state = None
++        layer._exl3_b12x_error = reason
++        _logger().info("b12x MoE disabled for this layer: %s", reason)
++
++    libs = _libs()
++    if libs is None:
++        _skip("b12x import failed")
++        return None
++    try:
++        from .exl3 import _uva_trellis_placement_requested
++
++        if _uva_trellis_placement_requested(layer):
++            _skip("UVA trellis placement is not qualified for b12x")
++            return None
++    except Exception:
++        pass
++
++    if getattr(layer, "_exl3_gateless", False):
++        _skip("gateless layer")
++        return None
++    # `_exl3_mixed_k` is not the right predicate: EXL3_FORCE_MIXEDK=1 sets it on
++    # every layer to route uniform-K layers through exl3_moe_mixedk. The real
++    # question is whether this layer's experts share one (Kg,Ku,Kd), which the
++    # loader stores in _exl3_k_tuple (None = heterogeneous or fractional).
++    if getattr(layer, "_exl3_has_frac_k", False):
++        _skip("fractional K")
++        return None
++    k_tuple = getattr(layer, "_exl3_k_tuple", None)
++    if k_tuple is None or int(k_tuple[0]) != int(k_tuple[1]) or int(k_tuple[0]) != int(
++        k_tuple[2]
++    ):
++        _skip(f"K is not uniform across the layer ({k_tuple!r})")
++        return None
++    flags = tuple(getattr(layer, "_exl3_codebook_flags", (True, False) * 3))
++    if flags != (False, True) * 3:
++        _skip(f"codebook flags {flags} are not uniformly mul1")
++        return None
++    if not _layer_act_is_plain_silu(layer):
++        _skip("activation is not plain silu")
++        return None
++    # DS4.1 runs a clamped SwiGLU (``swiglu_limit = 10.0``): gate clamped from
++    # above, up clamped symmetrically, silu applied to the clamped gate. b12x
++    # implements exactly that law (activation.py::_clamp_swiglu_inputs with
++    # swiglu_clamp_after_silu=False), and the plugin's own reference loop does
++    # the same, so the clamp travels to the kernel instead of disqualifying the
++    # layer. It is constant per layer and the activation is compiled into the
++    # launch, so apply() refuses a per-call value that disagrees.
++    _limit = getattr(layer, "_exl3_swiglu_limit", None)
++    try:
++        swiglu_limit = float(_limit) if _limit is not None else None
++    except (TypeError, ValueError):
++        _skip(f"swiglu clamp limit is not a number ({_limit!r})")
++        return None
++    if swiglu_limit is not None and swiglu_limit <= 0.0:
++        swiglu_limit = None
++
++    joint = getattr(layer, "_exl3_b12x_joint_w13", None) or {}
++    if len(joint) != 1:
++        _skip(f"needs exactly one joint gate/up arena, got {len(joint)}")
++        return None
++    shape, base = next(iter(joint.items()))
++    down_arenas = list(getattr(layer, "_exl3_down_trellis_arenas", None) or [])
++    if len(down_arenas) != 1:
++        _skip(f"needs exactly one down arena, got {len(down_arenas)}")
++        return None
++    w2 = down_arenas[0]
++
++    if base.dim() != 5 or int(base.shape[0]) != 2:
++        _skip(f"joint arena has shape {tuple(base.shape)}")
++        return None
++    num_experts = int(base.shape[1])
++    hidden = int(layer._exl3_hidden_size)
++    intermediate = int(layer._exl3_intermediate_local)
++    bits = int(shape[-1]) // 16
++    if tuple(int(x) for x in base.shape[2:]) != (
++        int(layer._exl3_hidden_size) // 16,
++        int(layer._exl3_intermediate_local) // 16,
++        16 * bits,
++    ):
++        _skip(f"joint arena does not match H/I geometry: {tuple(base.shape)}")
++        return None
++    if bits not in (2, 3, 4):
++        _skip(f"mul1 is defined for K2/K3/K4, got K{bits}")
++        return None
++    if hidden % 128 or intermediate % 128:
++        _skip(f"tile geometry needs multiples of 128 (H={hidden} I={intermediate})")
++        return None
++
++    try:
++        gate_suh = layer.w13_suh[:, 0].contiguous()
++        up_suh = layer.w13_suh[:, 1].contiguous()
++        down_svh = layer.w2_svh.contiguous()
++        # [gate_svh | up_svh | down_suh] per expert, the order the full-rotation
++        # kernel indexes (see b12x prepare: intermediate_rotations is [E, 3I]).
++        intermediate_rotations = torch.cat(
++            [layer.w13_svh[:, 0], layer.w13_svh[:, 1], layer.w2_suh], dim=1
++        ).contiguous()
++        prepared = libs["prepare"](
++            w13=base,
++            w2=w2,
++            hidden_size=hidden,
++            intermediate_size=intermediate,
++            num_experts=num_experts,
++            activation="silu",
++            fc1_tile_n=128,
++            fc2_tile_n=128,
++            w13_layout="trellis_t256_proj",
++            trellis_bits=bits,
++            codebook="mul1",
++            params_dtype=torch.float16,
++            gate_suh=gate_suh,
++            up_suh=up_suh,
++            intermediate_rotations=intermediate_rotations,
++            down_svh=down_svh,
++        )
++    except Exception as exc:
++        _skip(f"prepare failed: {exc!r}")
++        return None
++
++    state = {
++        "prepared": prepared,
++        "num_experts": num_experts,
++        "hidden": hidden,
++        "intermediate": intermediate,
++        "bits": bits,
++        "swiglu_limit": swiglu_limit,
++        "device": base.device,
++        "buffers": {},
++        "blocks": {},
++        "scratch": {},
++        # Keep every table alive: prepared holds only views/pointers into them.
++        "keepalive": (
++            base,
++            w2,
++            gate_suh,
++            up_suh,
++            down_svh,
++            intermediate_rotations,
++        ),
++        "error": None,
++    }
++    layer._exl3_b12x_state = state
++    layer._exl3_b12x_error = None
++    _logger().info(
++        "b12x MoE prepared: K=%d E=%d H=%d I=%d", bits, num_experts, hidden, intermediate
++    )
++    # Compile every route-block specialization now, while no request is in
++    # flight: a first-use compile inside a serving step stalls the pipeline
++    # long enough to trip the NCCL watchdog (measured 18/11).
++    try:
++        _warm_blocks(state, libs)
++    except Exception as exc:  # a failed warmup must not sink the load
++        _logger().warning("b12x MoE warmup failed: %r", exc)
++    return state
++
++
++def _buffers(state: dict[str, Any], libs, m: int, topk: int):
++    key = (int(m), int(topk))
++    cached = state["buffers"].get(key)
++    if cached is not None:
++        return cached, state["blocks"][key], state["scratch"][key]
++    shared_key = (
++        state["device"],
++        int(state["hidden"]),
++        int(state["intermediate"]),
++        int(state["num_experts"]),
++        int(state["bits"]),
++        int(m),
++        int(topk),
++    )
++    entry = _SHARED.get(shared_key)
++    if entry is None:
++        block = _block_size(libs, m, topk, state["num_experts"])
++        bufs = libs["make_buffers"](
++            state["prepared"],
++            m=m,
++            topk=topk,
++            dtype=torch.float16,
++            device=state["device"],
++            route_num_experts=state["num_experts"],
++            full_rotation=True,
++            block_size_m=block,
++        )
++        scratch = {
++            "a": torch.empty(
++                (m, state["hidden"]), dtype=torch.float16, device=state["device"]
++            ),
++            "tw": torch.empty((m, topk), dtype=torch.float32, device=state["device"]),
++        }
++        entry = (bufs, block, scratch)
++        _SHARED[shared_key] = entry
++        # Never evict during CUDA graph capture: a buffer recorded into a graph
++        # must stay alive for every replay, so a capture grows the cache instead.
++        if not torch.cuda.is_current_stream_capturing():
++            while len(_SHARED) > _MAX_CACHED_SHAPES:
++                _SHARED.popitem(last=False)
++    else:
++        _SHARED.move_to_end(shared_key)
++    bufs, block, scratch = entry
++    state["buffers"][key] = bufs
++    state["blocks"][key] = block
++    state["scratch"][key] = scratch
++    return bufs, block, scratch
++
++
++def _block_size(libs, m: int, topk: int, num_experts: int) -> int:
++    """Route block for this batch shape (env-pinnable).
++
++    ``VLLM_EXL3_B12X_BLOCK_M`` forces one specialization for every M, which is
++    what a serving boot wants: the alternative is a JIT compile the first time
++    a prefill chunk lands in the other block-size bucket.
++    """
++    raw = os.environ.get("VLLM_EXL3_B12X_BLOCK_M", "").strip()
++    if raw:
++        try:
++            pinned = int(raw)
++        except ValueError:
++            pinned = 0
++        if pinned > 0:
++            return pinned
++    return int(libs["select_block"](m, topk, num_experts))
++
++
++def _run_dispatch(libs, state, a, tw, ti, bufs, block: int) -> None:
++    """One ``run_w4a16_moe`` launch -- the single call site for apply/warmup."""
++    libs["run"](
++        a,
++        state["prepared"],
++        tw,
++        ti,
++        activation="silu",
++        swiglu_limit=state.get("swiglu_limit"),
++        swiglu_clamp_after_silu=False,
++        intermediate_cache13=bufs.intermediate_cache13,
++        intermediate_cache2=bufs.intermediate_cache2,
++        output=bufs.output,
++        fc1_c_tmp=bufs.fc1_c_tmp,
++        fc2_c_tmp=bufs.fc2_c_tmp,
++        packed_route_indices=bufs.packed_route_indices,
++        block_expert_ids=bufs.block_expert_ids,
++        packed_route_count=bufs.packed_route_count,
++        expert_offsets=bufs.expert_offsets,
++        expert_counts=bufs.expert_counts,
++        route_block_size_m=block,
++        full_rotation=True,
++        suh_gate_table=state["prepared"].gate_suh,
++        suh_up_table=state["prepared"].up_suh,
++        svh_table=state["prepared"].down_svh,
++        intermediate_rotation_scales=state["prepared"].intermediate_rotations,
++        rotation_a_gate=bufs.rotation_a_gate,
++        rotation_a_up=bufs.rotation_a_up,
++    )
++
++
++def _warm_blocks(state, libs, topk: int = 6) -> None:
++    """Compile every route-block specialization this boot can reach.
++
++    Runs one real dispatch per block size on throwaway data. A CUDA graph has
++    not been captured yet at this point, so the temporaries are plain
++    allocations; the workspaces themselves stay in ``_SHARED`` (they are the
++    geometry, and losing them would just move the compile back into serving).
++    Errors are swallowed: a failed warmup must not sink the boot.
++    """
++    if state is None:
++        return
++    key_base = (
++        state["device"],
++        int(state["hidden"]),
++        int(state["intermediate"]),
++        int(state["num_experts"]),
++        int(state["bits"]),
++    )
++    if key_base in _WARMED_BLOCKS:
++        return
++    pinned = os.environ.get("VLLM_EXL3_B12X_BLOCK_M", "").strip()
++    try:
++        blocks = [int(pinned)] if pinned and int(pinned) > 0 else [8, 16]
++    except ValueError:
++        blocks = [8, 16]
++    for block in blocks:
++        m = _WARMUP_ROWS.get(block, max(block * 8, 64))
++        try:
++            bufs, block_used, scratch = _buffers(state, libs, m, topk)
++            a = scratch["a"].zero_()
++            tw = scratch["tw"].fill_(1.0 / topk)
++            ti = torch.zeros(
++                (m, topk), dtype=torch.int32, device=state["device"]
++            )
++            _run_dispatch(libs, state, a, tw, ti, bufs, block_used)
++            torch.cuda.synchronize()
++            _logger().info(
++                "b12x MoE warmup compiled: block=%d M=%d topk=%d",
++                block_used,
++                m,
++                topk,
++            )
++        except Exception as exc:  # never sink the boot over a warmup
++            _logger().warning("b12x MoE warmup (block=%s) failed: %r", block, exc)
++    _WARMED_BLOCKS.add(key_base)
++
++
++def apply(
++    layer: Any,
++    x2d: torch.Tensor,
++    ids: torch.Tensor,
++    weights: torch.Tensor,
++    expert_map: torch.Tensor | None,
++    limit: float | None = None,
++) -> torch.Tensor | None:
++    """Run one layer through b12x; None means "use the established path"."""
++    state = getattr(layer, "_exl3_b12x_state", None)
++    if state is None:
++        return None
++    if expert_map is not None:
++        layer._exl3_b12x_error = "expert_map (EP) is not qualified"
++        return None
++    if limit is not None and float(limit) != (state.get("swiglu_limit") or 0.0):
++        # The clamp is baked into the launched activation; a per-call value that
++        # disagrees with the one the layer was prepared with would silently
++        # change the math, so fall back rather than serve a different function.
++        layer._exl3_b12x_error = (
++            f"per-call swiglu limit {limit!r} differs from prepared "
++            f"{state.get('swiglu_limit')!r}"
++        )
++        return None
++    tokens = int(x2d.shape[0])
++    if tokens < min_rows():
++        return None
++    cap = max_rows()
++    if cap and tokens > cap:
++        return None
++    topk = int(ids.shape[-1])
++    if topk != 6:
++        # DS4.1 routes 6 of 384; other arities are untested here.
++        layer._exl3_b12x_error = f"topk={topk} is not qualified"
++        return None
++    try:
++        libs = _libs()
++        if libs is None:
++            return None
++        device = x2d.device
++        bufs, block, scratch = _buffers(state, libs, tokens, topk)
++        # Fixed scratch, never a per-call allocation: this runs inside CUDA
++        # graph capture, where fresh allocations belong to the graph pool.
++        a = scratch["a"]
++        a.copy_(x2d)
++        tw = scratch["tw"]
++        tw.copy_(weights.reshape(tokens, topk))
++        ti = ids.contiguous()
++        if ti.device != device or tuple(ti.shape) != (tokens, topk):
++            return None
++        if not state.get("logged_active"):
++            state["logged_active"] = True
++            _logger().info(
++                "b12x MoE active: first dispatch M=%d topk=%d block=%d",
++                tokens,
++                topk,
++                block,
++            )
++        _run_dispatch(libs, state, a, tw, ti, bufs, block)
++        # The kernel writes every output row (verified: the buffer starts as
++        # torch.empty and still matches), so no zeroing is needed. Only the
++        # fp32-activation case would hand back this reusable buffer itself.
++        return bufs.output if x2d.dtype != torch.float32 else bufs.output.clone()
++    except Exception as exc:  # never let the optional backend break a step
++        layer._exl3_b12x_error = repr(exc)
++        _warn = getattr(_logger(), "warning_once", _logger().warning)
++        _warn(
++            "b12x EXL3 MoE dispatch failed; falling back to the established "
++            "path: %s",
++            exc,
++        )
++        return None
+diff --git a/src/vllm_exl3/deepseek_v41.py b/src/vllm_exl3/deepseek_v41.py
+index f553869..b040f1b 100644
+--- a/src/vllm_exl3/deepseek_v41.py
++++ b/src/vllm_exl3/deepseek_v41.py
+@@ -261,14 +261,27 @@ def _install_native_geometry_wrapper(exl3_module: object) -> None:
+                 return False
+             hidden = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
+             intermediate = int(getattr(layer, "_exl3_intermediate_local", 0))
+-            bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
++            bits = getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1))
++            if isinstance(bits, float) and not bits.is_integer():
++                # Half-integer bitrate: no native decoder, int() would read the
++                # tile with the wrong width.
++                return False
++            bits = int(bits)
+             rows = int(x2d.shape[0])
+         except (AttributeError, TypeError, ValueError, OverflowError):
+             return False
+ 
+         if not (
+             hidden == DEEPSEEK_V41_HIDDEN
+-            and intermediate == DEEPSEEK_V41_INTERMEDIATE
++            # `intermediate` here is the PER-RANK width (`_exl3_intermediate_local`),
++            # and plan_deepseek_v41 splits the 2304 intermediate over the TP group
++            # (TP2 -> 1152). Comparing it to the global 2304 rejected every
++            # sharded deployment, so the native p2b kernel could never be
++            # selected here even after the codebook gate was fixed. Accept any
++            # divisor of the global width that still clears the kernel's
++            # 128-multiple geometry check (done below).
++            and intermediate > 0
++            and DEEPSEEK_V41_INTERMEDIATE % intermediate == 0
+             and int(x2d.shape[1]) == hidden
+             and native_p2b_geometry_supported(hidden, intermediate)
+             and bits in (2, 3, 4)
 diff --git a/src/vllm_exl3/exl3.py b/src/vllm_exl3/exl3.py
-index d2be348..b3bafdb 100644
+index d2be348..4394e19 100644
 --- a/src/vllm_exl3/exl3.py
 +++ b/src/vllm_exl3/exl3.py
-@@ -1456,13 +1456,27 @@ def _narrow_tp(
+@@ -135,8 +135,14 @@ def _temp_rows_fused() -> int:
+ 
+ TEMP_ROWS_FUSED = _temp_rows_fused()
+ _COOP = os.environ.get("VLLM_EXL3_COOP", "1") == "1"
+-_COOP_SLOTS_MAX = 256
+-_COOP_ROWS_MAX = 32
++try:
++    _COOP_SLOTS_MAX = max(1, min(512, int(os.environ.get("VLLM_EXL3_COOP_SLOTS_MAX", "512"))))
++except (TypeError, ValueError):
++    _COOP_SLOTS_MAX = 512
++try:
++    _COOP_ROWS_MAX = max(32, min(96, int(os.environ.get("VLLM_EXL3_COOP_ROWS_MAX", "88"))))
++except (TypeError, ValueError):
++    _COOP_ROWS_MAX = 88
+ try:
+     FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
+ except (TypeError, ValueError):
+@@ -217,6 +223,23 @@ MINIMAX_FUSED_LINEAR_MODULES = {
+ # from_config in the same process.
+ _MINIMAX_M3_PACK_REQUESTED = False
+ 
++# VLLM_EXL3_MOE_TRACE=1: log one line per MoE layer on its first call, saying
++# which kernel the dispatch actually picked (loop / coop / native / mixed_k)
++# and the facts that decided it. The paths stamp `layer._exl3_last_apply`, but
++# the decision itself is silent, so "is the native kernel even in the path for
++# this pack?" has been answered by inference far too often.
++_MOE_TRACE = os.environ.get("VLLM_EXL3_MOE_TRACE", "0") == "1"
++# One-shot per-process report of the b12x decision inputs (see the loader hook).
++_B12X_PROBE: dict[str, bool] = {}
++
++# VLLM_EXL3_P2B_PADDED=1: serve the decode MoE through `p2b_fused_moe_padded`
++# (9 ordinary same-stream launches, zero host sync) instead of the cooperative
++# kernel. The cooperative entry (cudaLaunchCooperativeKernel) is an illegal
++# call inside CUDA graph capture, so this is the only native MoE that can live
++# in the decode graph -- and with EAGER=0 the graph is worth ~7x here. Off by
++# default: it is an A/B arm, gated by scripts/greedy_gate.py.
++_P2B_PADDED = os.environ.get("VLLM_EXL3_P2B_PADDED", "0") == "1"
++
+ # Shared fused scratch: decode is sequential across layers.
+ _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+ _COOP_TEMP_CACHE: dict[tuple, Any] = {}
+@@ -676,14 +699,24 @@ def _trellis_nbytes(layer: Any) -> int:
+             if p is None or int(getattr(p, "numel", lambda: 0)()) == 0:
+                 continue
+             total += int(p.numel()) * int(p.element_size())
+-    # Arenas may be counted twice if we also sum views; prefer arena bytes when present.
++    # Arenas may be counted twice if we also sum views; prefer arena bytes when
++    # present. A joint gate/up arena (b12x) is registered under both projection
++    # lists, so count each backing storage once.
+     arena_bytes = 0
++    seen: set[int] = set()
+     for aname in (
+         "_exl3_gate_trellis_arenas",
+         "_exl3_up_trellis_arenas",
+         "_exl3_down_trellis_arenas",
+     ):
+         for arena in getattr(layer, aname, []) or []:
++            try:
++                key = int(arena.untyped_storage().data_ptr())
++            except Exception:
++                key = id(arena)
++            if key in seen:
++                continue
++            seen.add(key)
+             arena_bytes += int(arena.numel()) * int(arena.element_size())
+     return arena_bytes if arena_bytes else total
+ 
+@@ -746,6 +779,7 @@ def _main_stack_num_layers(model_dir: str) -> int | None:
+ def _try_prescan_trellis_shapes(
+     layer: Any,
+     num_experts: int,
++    model_dir: str | None = None,
+ ) -> dict[str, dict[int, tuple[int, ...]]] | None:
+     """Header-only shape scan from the on-disk checkpoint (no tensor materialize).
+ 
+@@ -755,7 +789,7 @@ def _try_prescan_trellis_shapes(
+     ``layer.starting_expert_offset`` / EP metadata is present; otherwise assume
+     local id == global id (offline tests).
+     """
+-    model_dir = os.environ.get("VLLM_ENGRAM_MODEL_DIR") or os.environ.get(
++    model_dir = model_dir or os.environ.get("VLLM_ENGRAM_MODEL_DIR") or os.environ.get(
+         "VLLM_EXL3_MODEL_DIR"
+     )
+     if not model_dir and _VLLM_AVAILABLE:
+@@ -862,7 +896,8 @@ def _try_prescan_trellis_shapes(
+                 shape = tuple(desc.shape)
+                 if (desc.dtype != "I16" or len(shape) != 3
+                         or any(type(x) is not int or x <= 0 for x in shape)
+-                        or shape[-1] % 16 or not 2 <= shape[-1] // 16 <= 8
++                        or shape[-1] % 16 not in (0, 8)
++                        or not 1 <= shape[-1] // 16 <= 8
+                         or math.prod(shape) * 2 != desc.nbytes):
+                     raise ValueError("invalid EXL3 planned tensor metadata: " + key)
+             else:
+@@ -873,16 +908,70 @@ def _try_prescan_trellis_shapes(
+     return shapes
+ 
+ 
++def _uva_expert_layer_selection() -> "set[int] | None":
++    """Layer ids from ``VLLM_EXL3_UVA_EXPERT_LAYERS`` (experimental).
++
++    ``"0,8,16-18"`` -> {0, 8, 16, 17, 18}. Unset/empty -> None (default
++    behaviour untouched). This exists because the packed expert arena is per
++    LAYER: vLLM's ``--cpu-offload-params`` matches parameter-name segments
++    relative to the decoder layer, so it cannot single out one layer among
++    forty, and the trellis placeholders are zero-element at wrap time, so the
++    ``--cpu-offload-gb`` budget never counts them either. Without a selector
++    the only reachable settings are "no experts in host memory" or "all of
++    them" (196 GiB of pinned RAM).
++    """
++    raw = os.environ.get("VLLM_EXL3_UVA_EXPERT_LAYERS", "").strip()
++    if not raw:
++        return None
++    out: set[int] = set()
++    for part in raw.replace(",", " ").split():
++        if "-" in part:
++            lo, hi = part.split("-", 1)
++            out.update(range(int(lo), int(hi) + 1))
++        else:
++            out.add(int(part))
++    return out
++
++
++def _layer_index_of(layer: Any) -> "int | None":
++    # torch >= 2.11 can hand out a LayerName opaque object (see
++    # fused_moe/runner/moe_runner._resolve_layer_name); unwrap before matching.
++    for attr in ("layer_name", "prefix"):
++        raw = getattr(layer, attr, None)
++        raw = getattr(raw, "value", raw)
++        match = re.search(r"layers\.(\d+)", str(raw or ""))
++        if match:
++            return int(match.group(1))
++    return None
++
++
+ def _uva_trellis_placement_requested(layer: Any) -> bool:
+     """True when the packed routed-expert payload must live in pinned host memory.
+ 
+-    Either the recipe demanded it (VLLM_EXL3_REQUIRE_UVA_EXPERTS=1) or vLLM's
+-    UVA offloader already marked the layer's trellis placeholders at
+-    construction time. In both cases the real payload allocated here must not
+-    silently land on the accelerator.
++    Either ``VLLM_EXL3_UVA_EXPERT_LAYERS`` named this layer, the recipe demanded
++    it for every layer (VLLM_EXL3_REQUIRE_UVA_EXPERTS=1), or vLLM's UVA
++    offloader already marked the layer's trellis placeholders at construction
++    time. In every case the real payload allocated here must not silently land
++    on the accelerator.
+     """
+     from .uva_offload import uva_expert_offload_required
+ 
++    selection = _uva_expert_layer_selection()
++    if selection is not None:
++        index = _layer_index_of(layer)
++        if index is None:
++            logger.warning(
++                "EXL3 UVA: cannot parse a layer index from %r; leaving it resident",
++                getattr(layer, "layer_name", "?"),
++            )
++            return False
++        if index in selection:
++            logger.info(
++                "EXL3 UVA: layer %s -> pinned host trellis arena (experimental)",
++                getattr(layer, "layer_name", index),
++            )
++            return True
++        return False
+     if uva_expert_offload_required():
+         return True
+     placeholder = getattr(layer, "w13_trellis", None)
+@@ -969,6 +1058,25 @@ def prepare_trellis_arena_plan(
+         ats_eids = {}
+     stats["ats_alias_experts"] = sum(len(v) for v in ats_eids.values())
+     stats["ats_alias_bytes"] = ats_alias_bytes
++    # b12x (VLLM_EXL3_MOE_KERNEL=b12x) needs one projection-major
++    # [2,E,H/16,I/16,16*bits]i16 backing for gate+up; two separate per-projection
++    # arenas cannot be viewed that way. Allocate the pair here, once, and keep
++    # the per-expert Parameters as views of it (the EXL3/exllamav3 paths only
++    # dereference the pointers). Anything that does not fit stays per-projection.
++    joint_groups: dict[tuple[int, ...], tuple[list[int], Any]] = {}
++    try:
++        from . import b12x_moe as _b3x
++
++        _joint_wanted = _b3x.plan_joint_w13(layer, shapes_by_proj, ats_eids)
++    except Exception:
++        _joint_wanted = {}
++    for _shape, _eids in _joint_wanted.items():
++        _base = _alloc_trellis_arena(layer, (2, len(_eids), *_shape), dest_device)
++        joint_groups[_shape] = (list(_eids), _base)
++    if joint_groups:
++        layer._exl3_b12x_joint_w13 = {
++            _s: _base for _s, (_e, _base) in joint_groups.items()
++        }
+     for proj, plist in proj_to_plist.items():
+         by_shape: dict[tuple[int, ...], list[int]] = defaultdict(list)
+         for eid, shape in sorted((shapes_by_proj.get(proj) or {}).items()):
+@@ -980,7 +1088,17 @@ def prepare_trellis_arena_plan(
+         n_experts = int(len(plist))
+         for shape, eids in by_shape.items():
+             n = len(eids)
+-            arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
++            joint = joint_groups.get(shape) if proj in ("gate", "up") else None
++            if joint is not None and list(joint[0]) == list(eids):
++                # gate and up are the two halves of one projection-major arena.
++                base = joint[1]
++                arena = base[0] if proj == "gate" else base[1]
++                owner = base
++                counts_bytes = proj == "gate"
++            else:
++                arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
++                owner = arena
++                counts_bytes = True
+             meta = {
+                 "arena": arena,
+                 "eid_to_idx": {eid: i for i, eid in enumerate(eids)},
+@@ -995,12 +1113,18 @@ def prepare_trellis_arena_plan(
+                 new_p._exl3_owner = layer
+                 plist[eid] = new_p
+                 eid_index[proj][eid] = (shape, i)
+-            arenas.append(_arena_parameter(arena))
++            arenas.append(_arena_parameter(owner))
+             stats["arenas"].setdefault(proj, []).append(
+-                {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
++                {
++                    "shape": list(shape),
++                    "n": n,
++                    "bytes": int(owner.nbytes) if counts_bytes else 0,
++                    "joint": not counts_bytes,
++                }
+             )
+-            stats["allocations_after"] += 1
+-            stats["final_bytes"] += int(arena.nbytes)
++            if counts_bytes:
++                stats["allocations_after"] += 1
++                stats["final_bytes"] += int(owner.nbytes)
+         setattr(layer, proj_to_attr[proj], arenas)
+     layer._exl3_trellis_arena_plan = plan
+     layer._exl3_trellis_eid_index = eid_index
+@@ -1456,13 +1580,37 @@ def _narrow_tp(
                  "block; unset VLLM_EXL3_MOE_TP_ALIGN or use an expert-parallel build"
              )
          off, length = aligned_tp_split(size * unit, tp_rank, tp_size, align)
@@ -37,10 +1465,20 @@ index d2be348..b3bafdb 100644
 +    if os.environ.get("EXL3_TP_COPY_SHARD", "0") == "1":
 +        return shard.contiguous()
 +    return shard
++
++
++def _env_flag(name: str, default: str = "0") -> bool:
++    """Boolean env var: "0"/""/unset are off.
++
++    ``os.environ.get(name)`` is truthy for the string "0", which made
++    VLLM_EXL3_LOG_MOE_ROUTING print one line per expert tensor even when the
++    serve script exported it as 0 (millions of lines across 10 workers).
++    """
++    return os.environ.get(name, default).strip().lower() not in ("", "0", "false", "no", "off")
  
  
  def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
-@@ -1487,6 +1501,28 @@ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
+@@ -1487,6 +1635,28 @@ def _resolve_tp_geometry(*owners: Any) -> tuple[int, int]:
      return get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
  
  
@@ -69,7 +1507,20 @@ index d2be348..b3bafdb 100644
  def shard_exl3_col(
      loaded: torch.Tensor, suffix: str, tp_rank: int, tp_size: int, aligned: bool = False
  ) -> torch.Tensor:
-@@ -1790,6 +1826,25 @@ def _hf_config_is_minimax_m3(hf_config: Any) -> bool:
+@@ -1566,9 +1736,10 @@ def assert_exl3_trellis_3d(
+             f"EXL3 trellis tile shape {(in_tiles, out_tiles, words)} does "
+             f"not cover {in_features}x{out_features} (16-wide tiles)"
+         )
+-    if words % 16 or not 2 <= words // 16 <= 8:
++    if words % 16 not in (0, 8) or not 1 <= words // 16 <= 8:
+         raise ValueError(
+-            f"EXL3 trellis width {words} is not 16*K with K in 2..8"
++            f"EXL3 trellis width {words} is not 16*K with K integer or "
++            "half-integer in 1..3.5 / 8"
+         )
+     return words // 16
+ 
+@@ -1790,6 +1961,25 @@ def _hf_config_is_minimax_m3(hf_config: Any) -> bool:
      )
  
  
@@ -95,7 +1546,7 @@ index d2be348..b3bafdb 100644
  def minimax_pack_detected(cfg: "Exl3Config") -> bool:
      """Whether this Exl3Config serves the MiniMax-M3 sparse-attention pack.
  
-@@ -1798,7 +1853,7 @@ def minimax_pack_detected(cfg: "Exl3Config") -> bool:
+@@ -1798,7 +1988,7 @@ def minimax_pack_detected(cfg: "Exl3Config") -> bool:
      override_quantization_method marker (set from vLLM's hf_config) plus the
      derived non-routed coverage.
      """
@@ -104,7 +1555,398 @@ index d2be348..b3bafdb 100644
          return True
      layers = getattr(getattr(cfg, "non_routed_exl3", None), "layers", {}) or {}
      modules = getattr(getattr(cfg, "non_routed_exl3", None), "modules", []) or []
-@@ -3294,6 +3349,18 @@ def apply_exl3_fused_moe(
+@@ -2168,13 +2358,14 @@ def _exllamav3_moe_available() -> bool:
+ def get_moe_kernel_backend() -> str:
+     """Resolve ``VLLM_EXL3_MOE_KERNEL`` to the requested/available backend.
+ 
+-    ``native`` and ``exllamav3`` are intentionally returned as requested even
+-    when their optional extension is absent.  The dispatch function then applies
+-    the documented graceful fallback; this makes configuration introspection
+-    deterministic and avoids importing CUDA extensions during config parsing.
++    ``native``, ``exllamav3`` and ``b12x`` are intentionally returned as
++    requested even when their optional extension is absent.  The dispatch
++    function then applies the documented graceful fallback; this makes
++    configuration introspection deterministic and avoids importing CUDA
++    extensions during config parsing.
+     """
+     requested = os.environ.get("VLLM_EXL3_MOE_KERNEL", "auto").strip().lower()
+-    if requested not in {"native", "exllamav3", "auto"}:
++    if requested not in {"native", "exllamav3", "b12x", "auto"}:
+         logger.warning(
+             "Unknown VLLM_EXL3_MOE_KERNEL=%r; using auto selection", requested
+         )
+@@ -2255,6 +2446,33 @@ def _exl3_moe_arity(fn) -> int | None:
+     idx = [int(m) for m in re.findall(r"\barg(\d+)\s*:", doc)]
+     if idx:
+         return max(idx) + 1
++    # pybind11 with explicit py::arg(...) names (the 1.6 bindings do this): the
++    # docstring spells the parameter names instead of arg0/arg1, so count the
++    # top-level parameters of the signature. Without this the arity reads as
++    # None and the K-specialised mixedk tail (k_max + expert_order) is dropped.
++    depth = 0
++    start = cur = None
++    n = 0
++    for i, ch in enumerate(doc):
++        if start is None:
++            if ch == "(":
++                start = cur = i + 1
++                depth = 1
++            continue
++        if ch in "([{":
++            depth += 1
++        elif ch in ")]}":
++            depth -= 1
++            if depth == 0:
++                if doc[cur:i].strip():
++                    n += 1
++                break
++        elif ch == "," and depth == 1:
++            if doc[cur:i].strip():
++                n += 1
++            cur = i + 1
++    if n:
++        return n
+     try:
+         import inspect
+ 
+@@ -2413,6 +2631,40 @@ def apply_exl3_python_loop(
+     return out
+ 
+ 
++def _exl3_k_float(words: int) -> float:
++    """EXL3 bitrate K of a trellis tile: ``words = 16 * K`, K integer or half-integer.
++
++    exllamav3 >= 1.5.0 (and the 1.6.x packs) allow the half-integer bitrates
++    1.5 / 2.5 / 3.5 on the mul1 codebook, encoded as a 40- or 24-word tile:
++    16*K words for the integer part plus one extra half-tile of 8 words.
++    """
++    words = int(words)
++    if words <= 0 or words % 16 not in (0, 8):
++        raise ValueError(
++            f"EXL3 trellis width {words} is not 16*K for an integer or "
++            "half-integer K (16, 24, 32, 40, 48, ...)"
++        )
++    return words / 16.0
++
++
++def _exl3_k_bits(words: int) -> int:
++    """Integer part of the bitrate (what MAXBITS/instance selection uses)."""
++    return int(int(words) // 16)
++
++
++def _exl3_k2(words: int) -> int:
++    """Runtime K in HALF-BIT units: ``2 * bits + half`` (see exllamav3 bits_k.cuh).
++
++    This is the convention the fused mixed-K kernel's runtime switch uses since
++    the 1.6 line: cases 2/4/6/... are the integer rates, odd cases are the
++    half-integer ones. Older trees read plain bits here (cases 1..8); the
++    doubled value is what the partiy gate against exllamav3 >= 1.5.0 checks.
++    """
++    words = int(words)
++    _exl3_k_float(words)  # validate
++    return 2 * (words // 16) + (1 if words % 16 else 0)
++
++
+ def _assert_mixedk_karrays_match_groups(k_gate, k_up, k_down, k_groups, n_exp, device):
+     """Fail closed: the unified kernel's per-expert K arrays and the grouped
+     launches' scalar K tuples are two spellings of the same load-time fact, so
+@@ -2532,24 +2784,18 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+     layer._exl3_fused_temps = temps
+     layer._exl3_fused_concurrency = concurrency
+     if mixed_k:
+-        # Per-expert K arrays for exl3_moe_mixedk carry the TRUE bit-width K =
+-        # trellis.shape[-1] // 16, exactly like the scalar K tuple the grouped
+-        # launch passes (below) and the fork engine's own caller
+-        # (exllamav3/modules/block_sparse_mlp.py builds them from
+-        # LinearEXL3.inner.K). The kernel consumes them as bits: it reads
+-        # K_gate_arr[expert_idx] straight into moe_gemm_tile's runtime switch,
+-        # whose cases 1..8 are the bits instances -- the same switch the
+-        # uniform kernel's true-K scalar feeds
+-        # (exllamav3_ext/quant/exl3_moe_kernel.cuh). Commit 3275819 briefly
+-        # shipped shape[-1] // 8 = 2*K here ("half-bit units"); the doubled K
+-        # selected the wrong bits instance and read past each trellis, which
+-        # is the mixedk_unified cosine ~0 of GPU_JOB-2 run 5. (The older
+-        # sm_121 illegal-memory-access reports predate this line and had a
+-        # different, already-closed cause: the 3f3ed81-era tree already used
+-        # // 16 here.)
+         layer._exl3_k = None
+         layer._exl3_mixedk_unified = True
+-        k_gate = (
++        # Per-expert K arrays travel to the fused kernel in HALF-BIT units
++        # (`k2 = 2*bits + half`, exllamav3 bits_k.cuh / k2_from_K) -- the
++        # mixed-K runtime switch's convention since the 1.6 line, where cases
++        # 2/4/6 are the integer rates and 3/5 the halves. Measured 07/11 on
++        # real turbo experts (scripts/frac_mixedk_check.py, production entry
++        # point): K=2.5 -> [5] and [5,6] decode at cos 1.0000/0.9997, while the
++        # plain-bit spelling [2],[2,3] drops to 0.0039 -- the 40-word tile is
++        # then read at the wrong width. The plain-bit spelling is kept
++        # separately for the cross-check against the per-K-group tuples.
++        k_bits_gate = (
+             torch.tensor(
+                 [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
+                 dtype=torch.int32,
+@@ -2562,16 +2808,32 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+                 device=device,
+             )
+         )
+-        k_up = torch.tensor(
++        k_bits_up = torch.tensor(
+             [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
+             dtype=torch.int32,
+             device=device,
+         )
+-        k_down = torch.tensor(
++        k_bits_down = torch.tensor(
+             [int(pack["down"].trellis.shape[-1]) // 16 for pack in inners],
+             dtype=torch.int32,
+             device=device,
+         )
++        k_gate = torch.tensor(
++            [_exl3_k2(pack["up" if gateless else "gate"].trellis.shape[-1])
++             for pack in inners],
++            dtype=torch.int32,
++            device=device,
++        )
++        k_up = torch.tensor(
++            [_exl3_k2(pack["up"].trellis.shape[-1]) for pack in inners],
++            dtype=torch.int32,
++            device=device,
++        )
++        k_down = torch.tensor(
++            [_exl3_k2(pack["down"].trellis.shape[-1]) for pack in inners],
++            dtype=torch.int32,
++            device=device,
++        )
+         layer._exl3_K_gate_arr = k_gate
+         layer._exl3_K_up_arr = k_up
+         layer._exl3_K_down_arr = k_down
+@@ -2581,14 +2843,23 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+         # pipeline needs) with no device sync and therefore no graph break.
+         # max over ALL THREE projections: an expert whose down K exceeds its up K would
+         # otherwise select an instance with too few bits cases (__builtin_unreachable).
++        # NOTE: the launcher wants this in BITS and exllamav3 derives it from its own
++        # half-bit arrays as ``(max_k2 + 1) // 2`` -- i.e. a half rate rounds UP
++        # (K = 2.5 -> 3, which takes the generic/mul1-k4 instance). Reproduced exactly
++        # rather than using the tighter floor: the value also sizes the dynamic shared
++        # memory of the low-K instances, and a layer of pure K = 2.5 experts must land
++        # on the same instance the upstream reference would pick.
+         layer._exl3_k_max_launch = int(
+-            max(
+-                int(pack[p].trellis.shape[-1])
+-                for pack in inners
+-                for p in ("gate", "up", "down")
+-                if p in pack
++            (
++                max(
++                    _exl3_k2(pack[p].trellis.shape[-1])
++                    for pack in inners
++                    for p in ("gate", "up", "down")
++                    if p in pack
++                )
++                + 1
+             )
+-            // 16
++            // 2
+         )
+         # K-descending expert order (LPT). k_gate/k_up/k_down are per-expert load-time
+         # constants, so the permutation and its rank are computed once here and are free
+@@ -2619,14 +2890,26 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
+             (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
+         ]
+         # Fail closed (see _assert_mixedk_karrays_match_groups): the unified
+-        # K arrays and the grouped scalar tuples must agree per expert.
++        # K arrays and the grouped scalar tuples must agree per expert. The
++        # arrays are half-bit units, the tuples plain bits, so the check runs
++        # against the plain-bit spelling.
+         _assert_mixedk_karrays_match_groups(
+-            k_gate, k_up, k_down, layer._exl3_k_groups, n_exp, device
++            k_bits_gate, k_bits_up, k_bits_down, layer._exl3_k_groups, n_exp, device
++        )
++        layer._exl3_has_frac_k = bool(
++            any(int(pack[p].trellis.shape[-1]) % 16 == 8
++                for pack in inners for p in ("gate", "up", "down") if p in pack)
+         )
+         if len(layer._exl3_k_groups) == 1:
+             _kt = layer._exl3_k_groups[0][0]
+-            layer._exl3_k_tuple = _kt
+-            layer._exl3_coop_compat = bool((not gateless) and _kt[0] == _kt[1])
++            # `_exl3_k_tuple` is the UNIFORM launch's scalar K and it is spelled in
++            # plain bits, which cannot express K = 2.5. Leaving it set would send a
++            # uniform frac layer to the batched `exl3_moe` path; None keeps it on the
++            # unified mixedk launch (whose per-expert K arrays carry the half).
++            layer._exl3_k_tuple = None if layer._exl3_has_frac_k else _kt
++            layer._exl3_coop_compat = bool(
++                (not gateless) and _kt[0] == _kt[1] and not layer._exl3_has_frac_k
++            )
+         else:
+             layer._exl3_k_tuple = None
+             layer._exl3_coop_compat = False
+@@ -2727,7 +3010,22 @@ def _native_moe_dimensions_supported(
+     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
+     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
+     rows = int(x2d.shape[0])
+-    bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
++    # `_exl3_k` is None on a mixed-K layer (`build_exl3_fused_state` clears it
++    # because the scalar cannot express K=2.5); with `EXL3_FORCE_MIXEDK=1` that
++    # is EVERY layer, and `int(None)` raised inside the try/except of the fused
++    # entry point once per layer per step -- caught and silently downgraded to
++    # the ext path, but paying a Python exception and a stack unwind in the
++    # hottest loop. Fail closed here instead.
++    if getattr(layer, "_exl3_has_frac_k", False):
++        return False
++    k_raw = getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1))
++    if k_raw is None:
++        return False
++    if isinstance(k_raw, float) and not k_raw.is_integer():
++        # Half-integer bitrates (2.5) have no native decoder: int(2.5) would
++        # silently read the 40-word tile as K=2 and decode garbage.
++        return False
++    bits = int(k_raw)
+     if not (
+         rows >= 1
+         and int(x2d.shape[1]) == hidden_meta == 4096
+@@ -2780,6 +3078,20 @@ def _native_moe_max_rows(bits: int) -> int:
+ _MCG_CODEBOOK_FLAGS = (True, False) * 3
+ 
+ 
++def _native_codebook_flags(module: object) -> tuple[bool, bool]:
++    """``(mcg, mul1)`` the loaded extension was compiled for.
++
++    ``P2B_CB`` is a compile-time switch (1 = MCG, 2 = mul1) and the kernels
++    TORCH_CHECK the caller's ``mcg`` against it. A binary that predates the flag
++    exports nothing, so keep the historical MCG assumption there. Both
++    DeepSeek-V4.1 packs are mul1 (``.mul1`` markers, no ``.mcg``), which is why
++    comparing against a hard-coded MCG tuple disabled the native path for them
++    without a single line in the log.
++    """
++    cb = int(getattr(module, "P2B_CB", 1) or 1)
++    return (cb == 1, cb == 2)
++
++
+ def _apply_native_fused_moe(
+     x2d: torch.Tensor,
+     ids: torch.Tensor,
+@@ -2801,12 +3113,21 @@ def _apply_native_fused_moe(
+     """
+     if getattr(layer, "_exl3_mixed_store", None) is not None:
+         return None
+-    if getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS) != _MCG_CODEBOOK_FLAGS:
+-        return None
+     module = _load_native_exl3_ext()
+-    if module is None or not _native_moe_dimensions_supported(
++    if module is None:
++        return None
++    # The pack's codebook must match the one this binary was compiled for; the
++    # kernel checks it again, but failing here keeps the cost off the hot path.
++    native_cb = _native_codebook_flags(module)
++    if tuple(getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)) != native_cb * 3:
++        return None
++    if not _native_moe_dimensions_supported(
+         x2d, layer, inners, limit
+     ):
++        # Stamped for the trace line: without it "the native path never runs"
++        # looks the same whether the codebook, the geometry, the rows cap or
++        # the ABI refused -- and each has a different fix.
++        layer._exl3_native_error = "geometry/rows gate"
+         return None
+     intermediate = int(getattr(layer, "_exl3_intermediate_local", 2048))
+     clamp_limit = float(limit) if limit is not None else 0.0
+@@ -2855,7 +3176,63 @@ def _apply_native_fused_moe(
+     )
+     xh = x2d.to(dtype=torch.float16).contiguous()
+     native_out = torch.empty_like(xh)
+-    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
++    k_raw = getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))
++    if k_raw is None or (isinstance(k_raw, float) and not k_raw.is_integer()):
++        # Fail closed: the native ABI has no half-integer decoder, and a
++        # mixed-K layer carries no scalar K at all.
++        layer._exl3_native_error = f"fractional/unset K={k_raw} has no native kernel"
++        return None
++    k = int(k_raw)
++    if _P2B_PADDED and bool(getattr(module, "P2B_MOE_PADDED", False)):
++        # Fixed-shape, all-device entry: one call for the whole decode batch
++        # instead of one cooperative launch per row, and capture-legal. Buffers
++        # are cached per (shape, device) on the layer so a graph replay reuses
++        # the same addresses (a fresh allocation per call would move them).
++        cache = getattr(layer, "_exl3_p2b_cache", None)
++        key = (tuple(xh.shape), xh.dtype, xh.device.index)
++        if cache is None or cache.get("key") != key:
++            cache = {
++                "key": key,
++                "out": torch.empty_like(xh),
++                # n_valid is metadata for the kernel's token guard; the value is
++                # a device fact and must never be read on the host.
++                "n_valid": torch.full((1,), int(xh.shape[0]), dtype=torch.int32,
++                                      device=xh.device),
++                "k": tuple(
++                    torch.full((n_exp,), k, dtype=torch.int8, device=xh.device)
++                    for _ in range(3)
++                ),
++            }
++            layer._exl3_p2b_cache = cache
++        out_p = cache["out"]
++        result = module.p2b_fused_moe_padded(
++            xh,
++            out_p,
++            ptrs["gate_trellis"],
++            ptrs["gate_suh"],
++            ptrs["gate_svh"],
++            ptrs["up_trellis"],
++            ptrs["up_suh"],
++            ptrs["up_svh"],
++            ptrs["down_trellis"],
++            ptrs["down_suh"],
++            ptrs["down_svh"],
++            safe_ids,
++            safe_weights,
++            cache["n_valid"],
++            cache["k"][0],
++            cache["k"][1],
++            cache["k"][2],
++            n_exp,
++            topk,
++            bool(native_cb[0]),
++            intermediate,
++            clamp_limit,
++        )
++        if isinstance(result, torch.Tensor) and result is not out_p:
++            out_p.copy_(result)
++        return out_p
++
+     fn = module.p2b_fused_moe
+     extra_args = (intermediate, clamp_limit) if extended_abi else ()
+     for row in range(int(x2d.shape[0])):
+@@ -2876,7 +3253,7 @@ def _apply_native_fused_moe(
+             k,
+             k,
+             k,
+-            True,
++            bool(native_cb[0]),
+             *extra_args,
+         )
+         # pybind returns the same output tensor, while lightweight test doubles
+@@ -3175,6 +3552,20 @@ def apply_exl3_fused_moe(
+     tokens, hidden = x2d.shape
+     n_exp = len(inners)
+ 
++    if get_moe_kernel_backend() == "b12x":
++        try:
++            from . import b12x_moe as _b12x
++
++            b12x_out = _b12x.apply(
++                layer, x2d, ids, weights, expert_map, limit=limit
++            )
++        except Exception as exc:  # defensive: b12x_moe.apply does not raise
++            b12x_out = None
++            layer._exl3_b12x_error = repr(exc)
++        if b12x_out is not None:
++            layer._exl3_last_apply = "b12x"
++            return b12x_out
++
+     # Keep this entry point independently usable by callers that bypass
+     # ``apply_exl3_experts`` (for example, custom vLLM runners).
+     if get_moe_kernel_backend() == "native":
+@@ -3294,6 +3685,18 @@ def apply_exl3_fused_moe(
          return out
  
      fat_possible = (not _capturing) and (tokens > FAT_EXPERT_THRESHOLD)
@@ -123,7 +1965,47 @@ index d2be348..b3bafdb 100644
      fat_route = torch.zeros_like(local, dtype=torch.bool)
      if fat_possible:
          fat = counts > FAT_EXPERT_THRESHOLD
-@@ -3676,6 +3743,16 @@ def apply_exl3_experts(
+@@ -3345,6 +3748,16 @@ def apply_exl3_fused_moe(
+         use_grouped = (k_groups is not None) and (mode != "unified") and (
+             mode == "grouped" or grouped_default
+         )
++        # The per-group path runs the uniform `exl3_moe`, whose K is an integer
++        # bitrate: a K = 2.5 bucket would be launched as K = 2 and decode the half
++        # tile at the wrong width. Half-integer rates therefore pin the unified
++        # launch, whatever VLLM_EXL3_MIXEDK_MODE says.
++        if getattr(layer, "_exl3_has_frac_k", False) and use_grouped:
++            getattr(logger, "warning_once", logger.warning)(
++                "EXL3 mixed-K: half-integer bitrate present (K=2.5/3.5); grouped "
++                "dispatch cannot carry it -- using the unified exl3_moe_mixedk launch"
++            )
++            use_grouped = False
+         # Name the mixed-K dispatch mode once: the serve's receipts and logs
+         # must show which kernel family carries production traffic. (Under a
+         # real vLLM install the logger carries info_once; the stdlib fallback
+@@ -3655,6 +4068,22 @@ def apply_exl3_experts(
+     # unsupported shapes and launch failures fall through to the established
+     # ExLlamaV3/Python implementations below.
+     backend = get_moe_kernel_backend()
++    if backend == "b12x" and (fused is not False):
++        try:
++            from . import b12x_moe as _b12x
++
++            b12x_out = _b12x.apply(
++                layer, x2d, ids, weights, expert_map, limit=limit
++            )
++        except Exception as exc:  # the module never raises; belt and braces
++            b12x_out = None
++            layer._exl3_b12x_error = repr(exc)
++            getattr(logger, "warning_once", logger.warning)(
++                "b12x EXL3 MoE dispatch failed; falling back: %s", exc
++            )
++        if b12x_out is not None:
++            layer._exl3_last_apply = "b12x"
++            return b12x_out.to(dtype=x.dtype)
+     if backend == "native" and (fused is not False):
+         try:
+             native_out = _apply_native_fused_moe(
+@@ -3676,6 +4105,16 @@ def apply_exl3_experts(
      if fused is True and not have_ptrs:
          raise RuntimeError("EXL3 fused apply requested but pointer tables are missing")
      use_fused = (fused_moe_enabled() if fused is None else bool(fused)) and have_ptrs
@@ -140,7 +2022,7 @@ index d2be348..b3bafdb 100644
      if use_fused:
          try:
              import exllamav3_ext
-@@ -3716,6 +3793,29 @@ def _exl3_pad128(n: int) -> int:
+@@ -3716,6 +4155,29 @@ def _exl3_pad128(n: int) -> int:
      return (int(n) + 127) // 128 * 128
  
  
@@ -170,7 +2052,81 @@ index d2be348..b3bafdb 100644
  def _prefix_has_suffix(prefix: str, suffix: str) -> bool:
      """Module-path suffix match: "self_attn.o_proj" matches
      "model.layers.3.self_attn.o_proj" but not "...cross_attn.o_proj_x"."""
-@@ -4061,7 +4161,7 @@ class Exl3Config(QuantizationConfig):
+@@ -3805,6 +4267,11 @@ def _read_sidecar_tensor_storage() -> Any:
+     return ts if isinstance(ts, dict) and ts else None
+ 
+ 
++# Por processo (nao serializa junto com o quant config): os workers recebem o
++# objeto pronto do frontend, entao o register feito la' nao os alcanca.
++_SKIPS_REGISTERED = False
++
++
+ @register_quantization_config("exl3")
+ class Exl3Config(QuantizationConfig):
+     """Routed-experts-only EXL3/MCG. Dense / shared / attention stay native."""
+@@ -3826,12 +4293,23 @@ class Exl3Config(QuantizationConfig):
+         # layers are shaped for their own K and would fail the load shape
+         # check under the base K.
+         raw_layer_bits = kwargs.pop("layer_bits", None) or {}
+-        self.layer_bits: dict[int | str, int] = {
+-            (int(k) if isinstance(k, int) or str(k).lstrip("-").isdigit() else str(k)): int(v)
++        def _norm_bits(v: Any) -> Any:
++            """Keep a half-integer bitrate as float; integer rates stay ints.
++
++            The 1.6-line packs (e.g. turboderp 2.68bpw) store routed experts at
++            K=2.5; hidden-integer rates are legal on the mul1 codebook. int()
++            here would silently turn them into K=2 and read the trellis with
++            the wrong width.
++            """
++            f = float(v)
++            return int(f) if f.is_integer() else f
++
++        self.layer_bits: dict[int | str, int | float] = {
++            (int(k) if isinstance(k, int) or str(k).lstrip("-").isdigit() else str(k)): _norm_bits(v)
+             for k, v in dict(raw_layer_bits).items()
+         }
+         for layer_idx, layer_k in self.layer_bits.items():
+-            if layer_k not in (2, 3, 4, 5, 6):
++            if layer_k not in (2, 2.5, 3, 3.5, 4, 5, 6):
+                 raise ValueError(
+                     f"unsupported EXL3 bits={layer_k} for layer {layer_idx}"
+                 )
+@@ -3910,7 +4388,7 @@ class Exl3Config(QuantizationConfig):
+                 if method is not None:
+                     return method, "mxfp4"
+             except Exception as exc:  # pragma: no cover - depends on vLLM build
+-                if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
++                if _env_flag("VLLM_EXL3_LOG_MOE_ROUTING"):
+                     print(f"[exl3-routing] mxfp4 delegate unusable: {exc}", flush=True)
+         delegate = self._non_routed_delegate()
+         if delegate is not None:
+@@ -4032,6 +4510,25 @@ class Exl3Config(QuantizationConfig):
+         # "bf16_as_stored": dense linears are BF16 tensors; never delegate them
+         # (the delegate still serves source-format MTP experts).
+         inst.non_routed_dtype_policy = str(config.get("non_routed_dtype_policy", ""))
++        # Diretorio do checkpoint para o prescan das arenas de trellis. Vai no
++        # proprio quantization_config (serializado para os workers) porque a
++        # variavel de ambiente nao chega de forma confiavel: no boot 6/7 so' o
++        # rank 0 prescanou e os outros 9 caíram no staging em host.
++        inst.model_dir = config.get("model_dir")
++        # Tensores EXL3 que o pack substitui por bf16 num overlay (wo_a, head,
++        # indexer.wk, compressor.wkv/wgate). O iterador de pesos do vLLM
++        # enumera os tensores PELO ARQUIVO, nao pelo index, entao apagar a
++        # chave do index nao basta: sem este skip o loader oferece
++        # ``head.trellis`` e o modelo morre com "no module or parameter named
++        # 'head'". Registrado aqui porque este e' o primeiro ponto em que o
++        # pack e' lido, antes de qualquer iterador de pesos existir.
++        # Guardado no objeto (nao so' registrado aqui): o frontend resolve o
++        # quant config e os workers recebem o objeto JA' serializado, entao um
++        # register() so' neste ponto nao chega nos processos que de fato
++        # percorrem os shards. O registro acontece em _register_skips(), que
++        # get_quant_method chama em cada worker antes de qualquer iterador.
++        inst.skip_weight_names = list(config.get("skip_weight_names") or [])
++        inst._register_skips()
+         # Mixed-format packs: draft/MTP blocks appended past the main stack can
+         # keep their experts in the source format (e.g. MXFP4). Declare
+         # mtp_experts: "source" plus mtp_experts_start_layer: <first draft
+@@ -4061,7 +4558,7 @@ class Exl3Config(QuantizationConfig):
          # MiniMax-M3 pack: no ledger anywhere (the public card is only
          # {quant_method: exl3, version: 0.0.2}); the coverage comes from the
          # architecture via the override_quantization_method marker instead.
@@ -179,7 +2135,58 @@ index d2be348..b3bafdb 100644
              derived = _derive_minimax_non_routed_coverage()
              inst.non_routed_exl3 = derived
              logger.info(
-@@ -4303,6 +4403,41 @@ def _check_moe_codebook_markers(mcg: torch.Tensor, mul1: torch.Tensor, what: str
+@@ -4099,9 +4596,33 @@ class Exl3Config(QuantizationConfig):
+                 return spec
+         return None
+ 
++    def _register_skips(self) -> None:
++        """Registra os tensores que o pack substitui (overlay bf16).
++
++        O iterador de pesos do vLLM enumera os tensores pelo ARQUIVO, nao pelo
++        index, entao os EXL3 originais de wo_a/head/indexer.wk/compressor
++        continuam aparecendo. Precisa rodar em CADA worker: o frontend resolve
++        o quant config e serializa o objeto para os workers, entao o register
++        feito no from_config nao atravessa o processo.
++        """
++        global _SKIPS_REGISTERED
++        if _SKIPS_REGISTERED:
++            return
++        names = getattr(self, "skip_weight_names", None) or []
++        if not names:
++            return
++        from vllm.model_executor.model_loader.weight_utils import (
++            register_skip_weight_names,
++        )
++
++        register_skip_weight_names(names)
++        _SKIPS_REGISTERED = True
++
+     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+         from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+ 
++        self._register_skips()
++
+         # VL wrappers (NanoNemotronVL) construct the inner text model under a
+         # `language_model` prefix and strip that prefix again at load time
+         # (load_weights yields name.split(".")[1:]), so construction-time
+@@ -4124,14 +4645,14 @@ class Exl3Config(QuantizationConfig):
+                 if _by_index:
+                     dm, how = self._mtp_expert_method(layer, prefix)
+                     if dm is not None:
+-                        if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
++                        if _env_flag("VLLM_EXL3_LOG_MOE_ROUTING"):
+                             print(
+                                 f"[exl3-routing] MoE {prefix} -> source via {how} "
+                                 f"(by_index={_by_index})",
+                                 flush=True,
+                             )
+                         return dm
+-            if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
++            if _env_flag("VLLM_EXL3_LOG_MOE_ROUTING"):
+                 print(f"[exl3-routing] MoE {prefix} -> exl3", flush=True)
+             return Exl3MoEMethod(
+                 layer.moe_config, self, bits=self.bits_for_prefix(prefix)
+@@ -4303,6 +4824,41 @@ def _check_moe_codebook_markers(mcg: torch.Tensor, mul1: torch.Tensor, what: str
          )
  
  
@@ -221,7 +2228,67 @@ index d2be348..b3bafdb 100644
  class Exl3MoEMethod(FusedMoEMethodBase):
      """Packed MCG trellis experts: create/load packed tensors, LinearEXL3 apply."""
  
-@@ -4724,7 +4859,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+@@ -4516,12 +5072,22 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         layer._exl3_mixed_k = False
+         layer._exl3_n_experts = int(num_experts)
+         # Linear EP placement offset for checkpoint prescan (local->global).
++        # So' vale com EP > 1: com EP=1 `get_ep_group()` devolve o grupo global
++        # e `ep.rank` e' o rank do PP/TP, o que jogava o prescan em
++        # `layers.N.ffn.experts.{rank*384}` (inexistente) em 9 dos 10 workers --
++        # eles caiam no staging de host. Medido no boot 7 (04/11 23:29).
+         if not hasattr(layer, "starting_expert_offset"):
++            layer.starting_expert_offset = 0
+             try:
+-                from vllm.distributed.parallel_state import get_ep_group
++                from vllm.distributed.parallel_state import (
++                    get_ep_group,
++                    get_tensor_model_parallel_world_size,
++                )
+ 
+                 ep = get_ep_group()
+-                layer.starting_expert_offset = int(ep.rank) * int(num_experts)
++                ep_size = int(getattr(ep, "world_size", 1) or 1)
++                if ep_size > 1 and ep_size > get_tensor_model_parallel_world_size():
++                    layer.starting_expert_offset = int(ep.rank) * int(num_experts)
+             except Exception:
+                 layer.starting_expert_offset = 0
+         # Header-only shape scan (no allocation yet). Arenas are created on the
+@@ -4532,7 +5098,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             _exl3_trellis_arena_enabled()
+             and os.environ.get("VLLM_EXL3_ARENA_PRESCAN", "1") != "0"
+         ):
+-            shapes = _try_prescan_trellis_shapes(layer, int(num_experts))
++            shapes = _try_prescan_trellis_shapes(
++                layer,
++                int(num_experts),
++                getattr(self.quant_config, "model_dir", None),
++            )
+             if shapes is not None:
+                 layer._exl3_trellis_shapes_pending = shapes
+                 logger.info(
+@@ -4589,7 +5159,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+             owner_mod
+         ):
+             shard_id = "w3"
+-        if os.environ.get("VLLM_EXL3_LOG_MOE_ROUTING"):
++        if _env_flag("VLLM_EXL3_LOG_MOE_ROUTING"):
+             print(
+                 f"[exl3-load] weight_name={weight_name!r} shard_id={shard_id!r} "
+                 f"expert_id={expert_id} suffix={_suffix_from_mapped_name(weight_name)!r}",
+@@ -4661,9 +5231,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                     f"expert={expert_id}: got {tuple(sharded.shape)} "
+                     f"expected prefix {expect_prefix}+K_words"
+                 )
+-            if int(sharded.shape[-1]) % 16 != 0:
++            if int(sharded.shape[-1]) % 16 not in (0, 8):
+                 raise RuntimeError(
+-                    f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
++                    f"EXL3 trellis K_words is not 16*K (integer or half-integer): "
++                    f"{tuple(sharded.shape)}"
+                 )
+ 
+             use_arena = _exl3_trellis_arena_enabled()
+@@ -4724,7 +5295,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                      staged = staged.cpu()
                  if staged.dtype != torch.int16:
                      staged = staged.to(dtype=torch.int16)
@@ -238,10 +2305,48 @@ index d2be348..b3bafdb 100644
                      staged = staged.contiguous()
                  if _exl3_mem_waterfall_enabled():
                      _exl3_mem_snapshot("AFTER_READ", owner_mod)
-@@ -4993,6 +5136,15 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+@@ -4917,6 +5496,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         layer._exl3_gateless = gateless
+         inners: list[dict[str, Any]] = []
+         k_values: list[int] = []
++        # Same widths without the floor: a K = 2.5 tile is 40 words, so
++        # `// 16` above collapses it to 2. Only used to detect the fraction.
++        k_half_values: list[float] = []
+         # _BATCHED_MARKERS: prefetch every marker block once (4 host
+         # transfers) instead of 6 .item() syncs per expert (288/layer).
+         w13_mcg_h = _marker_row_host(layer.w13_mcg)
+@@ -4961,6 +5543,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                         int(dt.shape[-1]) // 16,
+                     ]
+                 )
++                k_half_values.extend(
++                    [
++                        int(ut.shape[-1]) / 16.0,
++                        int(dt.shape[-1]) / 16.0,
++                    ]
++                )
+                 continue
+             gate = make_linear_exl3(
+                 gt,
+@@ -4991,8 +5579,29 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                     int(dt.shape[-1]) // 16,
+                 ]
              )
++            k_half_values.extend(
++                [
++                    int(gt.shape[-1]) / 16.0,
++                    int(ut.shape[-1]) / 16.0,
++                    int(dt.shape[-1]) / 16.0,
++                ]
++            )
          layer._exl3_inners = inners
-         mixed_k = len(set(k_values)) > 1
+-        mixed_k = len(set(k_values)) > 1
++        # `// 16` above loses the half of a K = 2.5 tile (40 words); the frac
++        # detection needs the exact width, so it reads `k_half_values`. Layers
++        # of a whole-bit pack never differ between the two views.
++        frac_k = any(float(v) != int(v) for v in k_half_values)
++        layer._exl3_has_frac_k = frac_k
++        mixed_k = len(set(k_values)) > 1 or frac_k
 +        # A/B LOCAL: EXL3_FORCE_MIXEDK=1 manda tambem as camadas de K uniforme
 +        # pelo kernel mixedk (K por expert). Motivo (27/10): o kernel uniforme
 +        # `exl3_moe` bate no K=4 (L3..16) mas produz saida errada no K=3
@@ -254,7 +2359,16 @@ index d2be348..b3bafdb 100644
          layer._exl3_mixed_k = mixed_k
          k_tuples = {
              (
-@@ -5009,6 +5161,17 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+@@ -5004,11 +5613,24 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+         }
+         if len(k_tuples) == 1:
+             _kt = next(iter(k_tuples))
+-            layer._exl3_k_tuple = _kt
+-            layer._exl3_coop_compat = bool((not gateless) and _kt[0] == _kt[1])
++            layer._exl3_k_tuple = None if frac_k else _kt
++            layer._exl3_coop_compat = bool(
++                (not gateless) and _kt[0] == _kt[1] and not frac_k
++            )
          else:
              layer._exl3_k_tuple = None
              layer._exl3_coop_compat = False
@@ -272,15 +2386,111 @@ index d2be348..b3bafdb 100644
          # Codebook flags (mcg, mul1) per projection for the fused kernel launch;
          # every expert in a layer must agree. Gateless layers have no gate
          # projection: the up module's flags stand in for the gate slots (the
-@@ -5139,6 +5302,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+@@ -5031,6 +5653,36 @@ class Exl3MoEMethod(FusedMoEMethodBase):
+                         f"EXL3 experts disagree on codebook: expert {e} {f_e} vs expert 0 {flags}"
+                     )
+             layer._exl3_codebook_flags = flags
++        # One-time b12x MoE preparation (VLLM_EXL3_MOE_KERNEL=b12x only): it
++        # wraps the live arenas zero-copy and materialises the [E,3I] per-expert
++        # intermediate rotations. Out-of-scope layers record why and keep their
++        # established dispatch.
++        try:
++            from . import b12x_moe as _b12x
++
++            if _b12x.requested():
++                _b12x.prepare_layer(layer)
++            elif not _B12X_PROBE.get("logged"):
++                # One line per process: says WHICH process decided "not b12x"
++                # and with what environment. The workers are where the answer
++                # matters, and their env is not visible from /proc (setproctitle
++                # rewrites the area), so the process itself has to report it.
++                _B12X_PROBE["logged"] = True
++                logger.info(
++                    "b12x probe: not requested in this process "
++                    "(VLLM_EXL3_MOE_KERNEL=%r, VLLM_EXL3_B12X_PATH=%r, "
++                    "vendor=%r, env_vars=%d)",
++                    os.environ.get("VLLM_EXL3_MOE_KERNEL"),
++                    os.environ.get("VLLM_EXL3_B12X_PATH"),
++                    _b12x._vendor_dir(),
++                    len(os.environ),
++                )
++        except Exception as exc:  # optional backend must never fail a load
++            layer._exl3_b12x_state = None
++            layer._exl3_b12x_error = repr(exc)
++            getattr(logger, "warning", logger.info)(
++                "b12x MoE layer preparation failed: %s", exc
++            )
+         fused_ok = False
+         fused_err = None
+         # Fused/native MoE launches take a single K for gate/up/down across the
+@@ -5139,9 +5791,45 @@ class Exl3MoEMethod(FusedMoEMethodBase):
          # act 3) and beta (must be None/1.0) and returns the clamp limit.
          _alpha, limit = resolve_moe_gate_params(self._gate_param_source(layer))
          del _alpha
+-        return apply_exl3_experts(
 +        _dump_route(layer, topk_ids, topk_weights, x)
-         return apply_exl3_experts(
++        out = apply_exl3_experts(
              x, topk_ids, topk_weights, layer, limit=limit
          )
-@@ -5898,10 +6062,24 @@ class Exl3LinearMethod(LinearMethodBase):
++        _rows = int(x.numel() // x.shape[-1])
++        # One line per layer per size class: the first call of a layer is the
++        # prefill/capture pass (hundreds of rows) and it takes a DIFFERENT
++        # branch from decode (a handful of rows), so logging only the first
++        # call answers the wrong question. `_exl3_last_apply` is stamped by the
++        # inner paths with the kernel that actually ran.
++        _cls = "decode" if _rows <= 16 else "prefill"
++        if _MOE_TRACE and _cls not in getattr(layer, "_exl3_trace_done", ()):
++            layer._exl3_trace_done = set(getattr(layer, "_exl3_trace_done", ())) | {_cls}
++            logger.info(
++                "EXL3 MoE trace [%s]: path=%s k=%r k_tuple=%r frac=%s "
++                "mixedk_unified=%s flags=%r rows=%d hidden=%d inter=%d",
++                _cls,
++                getattr(layer, "_exl3_last_apply", None),
++                getattr(layer, "_exl3_k", "<unset>"),
++                getattr(layer, "_exl3_k_tuple", "<unset>"),
++                bool(getattr(layer, "_exl3_has_frac_k", False)),
++                bool(getattr(layer, "_exl3_mixedk_unified", False)),
++                getattr(layer, "_exl3_codebook_flags", "<unset>"),
++                int(x.numel() // x.shape[-1]),
++                int(getattr(layer, "_exl3_hidden_size", 0)),
++                int(getattr(layer, "_exl3_intermediate_local", 0)),
++            )
++            logger.info(
++                "EXL3 MoE trace [%s]: native_err=%r",
++                _cls,
++                getattr(layer, "_exl3_native_error", None),
++            )
++            logger.info(
++                "EXL3 MoE trace [%s]: b12x_state=%s b12x_err=%r",
++                _cls,
++                getattr(layer, "_exl3_b12x_state", None) is not None,
++                getattr(layer, "_exl3_b12x_error", None),
++            )
++        return out
+ 
+     def _gate_param_source(self, layer):
+         # vLLM invokes quant_method.apply(self.moe, ...), so `layer` and
+@@ -5870,6 +6558,19 @@ class Exl3LinearMethod(LinearMethodBase):
+         is_col_parallel = isinstance(layer, ColumnParallelLinear)
+         is_qkv_parallel = isinstance(layer, QKVParallelLinear)
+         is_merged_col_parallel = isinstance(layer, MergedColumnParallelLinear)
++        # ReplicatedLinear: the checkpoint holds the FULL tensor and every rank
++        # keeps a copy (vLLM's default loader just copies it). The EXL3 loader
++        # must not narrow it -- DS4.1 has two such layers with EXL3 weights,
++        # `engram.wkv` (25600 out) and `indexer.wq_b` (4096 out), and sharding
++        # them fails with "dest (25600,) != loaded (12800,)".
++        is_replicated = not (
++            is_row_parallel
++            or is_col_parallel
++            or is_qkv_parallel
++            or is_merged_col_parallel
++        )
++        if layer is not None:
++            layer._exl3_linear_replicated = is_replicated
+ 
+         # For column-parallel: output dimension is sharded (each shard has different outputs)
+         # For row-parallel: input dimension is sharded (each shard has same input, different outputs)
+@@ -5898,10 +6599,24 @@ class Exl3LinearMethod(LinearMethodBase):
          indexer_shards = self._indexer_shards(layer, n_shards)
          if indexer_shards:
              _, tp_size = _resolve_tp_geometry(layer)
@@ -307,7 +2517,7 @@ index d2be348..b3bafdb 100644
                  )
          # Unified BF16-staging shard list: config bf16 shards plus the
          # dequantized indexer shards, in ascending order (the apply-side row
-@@ -5924,17 +6102,34 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -5924,17 +6639,34 @@ class Exl3LinearMethod(LinearMethodBase):
          in_per_partition = _exl3_pad128(true_in)
          output_partition_sizes = [_exl3_pad128(s) for s in true_out_sizes]
          padded = in_per_partition != true_in or output_partition_sizes != true_out_sizes
@@ -316,7 +2526,7 @@ index d2be348..b3bafdb 100644
 +        pad_window = None
 +        pad_lead = [0] * n_shards
 +        if padded and not is_row_parallel and n_shards == 1:
-+            _tpr, _tpw = _resolve_tp_geometry(layer)
++            _tpr, _tpw = (0, 1) if is_replicated else _resolve_tp_geometry(layer)
 +            if _tpw > 1 and true_out_sizes[0] % 128:
 +                off, lead, width = _exl3_pad_col_window(true_out_sizes[0], _tpr, _tpw)
 +                pad_window = (off, lead, width)
@@ -347,7 +2557,7 @@ index d2be348..b3bafdb 100644
              # vLLM registers the bias after create_weights with this instance's
              # weight_loader; a padded checkpoint bias is trimmed to the true size.
              _orig_loader = layer.weight_loader
-@@ -6073,6 +6268,8 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6073,6 +6805,8 @@ class Exl3LinearMethod(LinearMethodBase):
          layer._exl3_linear_is_merged = is_merged_col_parallel
          layer._exl3_linear_bf16_shards = bf16_shards
          layer._exl3_linear_padded = padded
@@ -356,7 +2566,17 @@ index d2be348..b3bafdb 100644
          layer._exl3_linear_true_in = true_in
          layer._exl3_linear_true_out = true_out_sizes
  
-@@ -6191,14 +6388,24 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6094,6 +6828,9 @@ class Exl3LinearMethod(LinearMethodBase):
+             loaded_shard_id: str | int | None = None,
+         ) -> None:
+             tp_rank, tp_size = _resolve_tp_geometry(layer, param)
++            if getattr(layer, "_exl3_linear_replicated", False):
++                # ReplicatedLinear: full checkpoint tensor on every rank.
++                tp_rank, tp_size = 0, 1
+ 
+             # One checkpoint tensor may span several consecutive shards; vLLM's
+             # WeightsMapper says so with a tuple of shard ids (Qwen3.5/4
+@@ -6191,14 +6928,24 @@ class Exl3LinearMethod(LinearMethodBase):
                          f"EXL3 indexer shard {shard_idx} payload arrived via "
                          f"suffix {suffix!r}, expected 'weight'"
                      )
@@ -389,7 +2609,7 @@ index d2be348..b3bafdb 100644
  
              # Special handling for weight (bf16 staging) and markers
              if suffix in ("weight", "mcg", "mul1"):
-@@ -6270,7 +6477,27 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6270,7 +7017,27 @@ class Exl3LinearMethod(LinearMethodBase):
                  shard_tp_rank = tp_rank
  
              # Apply TP slicing based on layer type
@@ -418,7 +2638,7 @@ index d2be348..b3bafdb 100644
                  # Row-parallel: input is sharded, trellis dim 0 and suh dim 0
                  sharded = shard_exl3_row(loaded, suffix, tp_rank, tp_size)
              else:
-@@ -6279,6 +6506,11 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6279,6 +7046,11 @@ class Exl3LinearMethod(LinearMethodBase):
                      loaded, suffix, shard_tp_rank, shard_tp_size
                  )
  
@@ -430,7 +2650,7 @@ index d2be348..b3bafdb 100644
              # Copy into the right location
              if suffix == "trellis":
                  # Ragged per-shard staging: shards may carry different K, so
-@@ -6287,8 +6519,19 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6287,8 +7059,19 @@ class Exl3LinearMethod(LinearMethodBase):
                  if dest.numel() == 0:
                      # First arrival for this shard: adopt the exact-shape
                      # payload (already TP-sharded above) as the slot's data.
@@ -450,7 +2670,7 @@ index d2be348..b3bafdb 100644
                      if tuple(dest.shape) != tuple(sharded.shape):
                          raise RuntimeError(
                              f"EXL3 linear trellis shape mismatch shard={shard_idx}: "
-@@ -6306,6 +6549,9 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6306,6 +7089,9 @@ class Exl3LinearMethod(LinearMethodBase):
              else:
                  raise ValueError(f"unknown EXL3 suffix={suffix}")
  
@@ -460,7 +2680,7 @@ index d2be348..b3bafdb 100644
              if tuple(dest.shape) != tuple(sharded.shape):
                  raise RuntimeError(
                      f"EXL3 linear load shape mismatch shard={shard_idx} "
-@@ -6616,6 +6862,10 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6616,6 +7402,10 @@ class Exl3LinearMethod(LinearMethodBase):
          for slot, shard_idx in enumerate(indexer_shards):
              payload = layer._exl3_indexer_payloads[slot]
              scales = layer._exl3_indexer_scales[slot]
@@ -471,7 +2691,7 @@ index d2be348..b3bafdb 100644
              if payload is None or scales is None:
                  raise RuntimeError(
                      f"EXL3 indexer shard {shard_idx} incomplete at load end "
-@@ -6725,9 +6975,17 @@ class Exl3LinearMethod(LinearMethodBase):
+@@ -6725,9 +7515,17 @@ class Exl3LinearMethod(LinearMethodBase):
          else:
              y = outputs[0]
  
@@ -491,3 +2711,90 @@ index d2be348..b3bafdb 100644
  
          # Cast back to input dtype
          y = y.to(dtype=x.dtype)
+diff --git a/src/vllm_exl3/k78_compat.py b/src/vllm_exl3/k78_compat.py
+index 66deed0..d001056 100644
+--- a/src/vllm_exl3/k78_compat.py
++++ b/src/vllm_exl3/k78_compat.py
+@@ -27,11 +27,17 @@ def _safe_legacy_k(value: object) -> object:
+     return 6 if k in (7, 8) else value
+ 
+ 
+-def _validate_k(value: object, label: str) -> int:
++def _validate_k(value: object, label: str) -> int | float:
+     try:
+-        k = int(value)  # type: ignore[arg-type]
++        f = float(value)  # type: ignore[arg-type]
+     except (TypeError, ValueError, OverflowError) as exc:
+         raise ValueError(f"{label} must be an integer K2-K8, got {value!r}") from exc
++    if not f.is_integer():
++        # Half-integer bitrates 1.5 / 2.5 / 3.5 are legal on the mul1 codebook.
++        if f not in (1.5, 2.5, 3.5):
++            raise ValueError(f"unsupported EXL3 {label}={value!r}; expected K2-K8 or 1.5/2.5/3.5")
++        return f
++    k = int(f)
+     if k not in _ALLOWED:
+         raise ValueError(f"unsupported EXL3 {label}={k}; expected K2-K8")
+     return k
+diff --git a/src/vllm_exl3/mixed_k_guard.py b/src/vllm_exl3/mixed_k_guard.py
+index 61c02f1..afe67b8 100644
+--- a/src/vllm_exl3/mixed_k_guard.py
++++ b/src/vllm_exl3/mixed_k_guard.py
+@@ -70,7 +70,11 @@ def install_mixed_k_prescan_guard(exl3_module: Any) -> None:
+     if bool(getattr(current, "_vllm_exl3_mixed_k_prescan_guard", False)):
+         return
+ 
+-    def guarded(layer: Any, num_experts: int):
++    def guarded(layer: Any, num_experts: int, model_dir: str | None = None):
++        # `model_dir` opcional: `create_weights` passa o diretorio do pack
++        # (vem serializado no quantization_config) para o prescan funcionar em
++        # TODOS os workers, nao so' no rank 0. Sem ele, repassa so' 2 args ao
++        # original, que resolve por env/config.
+         placement = _placement_strategy(layer)
+         if _eplb_active(layer) or placement not in (None, "linear"):
+             logger = getattr(exl3_module, "logger", None)
+@@ -82,7 +86,11 @@ def install_mixed_k_prescan_guard(exl3_module: Any) -> None:
+                     _eplb_active(layer),
+                 )
+             return None
+-        shapes = current(layer, num_experts)
++        shapes = (
++            current(layer, num_experts, model_dir)
++            if model_dir
++            else current(layer, num_experts)
++        )
+         if shapes is None:
+             return None
+         resolver = getattr(exl3_module, "_resolve_tp_geometry", None)
+diff --git a/src/vllm_exl3/physical_k_compat.py b/src/vllm_exl3/physical_k_compat.py
+index e4fce3a..bd0387e 100644
+--- a/src/vllm_exl3/physical_k_compat.py
++++ b/src/vllm_exl3/physical_k_compat.py
+@@ -10,7 +10,7 @@ from __future__ import annotations
+ from typing import Any
+ 
+ 
+-def _physical_k_values(inners: list[dict[str, Any]]) -> set[int]:
++def _physical_k_values(inners: list[dict[str, Any]]) -> set[int | float]:
+     values: set[int] = set()
+     for pack in inners:
+         gateless = pack.get("gate") is None
+@@ -28,12 +28,16 @@ def _physical_k_values(inners: list[dict[str, Any]]) -> set[int]:
+                         f"EXL3 fused state cannot determine physical K for {projection}"
+                     )
+                 words = int(trellis.shape[-1])
+-                if words <= 0 or words % 16:
++                if words <= 0 or words % 16 not in (0, 8):
+                     raise RuntimeError(
+                         f"EXL3 fused state invalid trellis width {words} for {projection}"
+                     )
+-                k = words // 16
+-            values.add(int(k))
++                # /16, não //16: uma tile de 40 palavras é K = 2.5
++                k = words / 16
++            # Keep the exact bitrate: a half-integer rate (2.5) must reach the
++            # kernel as a float. int() here is what silently turned a 40-word
++            # tile into K=2 and decoded the shard with the wrong width.
++            values.add(k if isinstance(k, float) else int(k))
+     return values
+ 
+ 
