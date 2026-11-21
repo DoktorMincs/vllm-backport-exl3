@@ -5,8 +5,9 @@ serve) para este fork, rodando em **10× RTX 3090 (sm_86, sem P2P)**. Geométric
 vencedora: `TP=2 × PP=5`, `--dtype bfloat16`, KV `fp8_ds_mla`, DSpark (drafter
 `mtp.*`) ligado, Engram servido do disco.
 
-Os caminhos abaixo são placeholders — como no [`docs/exl3-mm31`](../exl3-mm31),
-copie os scripts para `$EXL3_ROOT/scripts` e ajuste as variáveis.
+Os scripts de conversão do pack e de medição estão versionados em
+[`scripts/`](scripts/README.md) — copie-os para `$EXL3_ROOT/scripts` e ajuste as
+variáveis; os caminhos abaixo são placeholders.
 
 | variável | o que é |
 |---|---|

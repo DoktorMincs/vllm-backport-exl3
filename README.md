@@ -286,20 +286,27 @@ vllm/v1/worker/gpu/spec_decode/dflash{,2}/       block-diffusion drafter (+ the 
 tools/qwen38/serve.sh, bench.py                  NVFP4 launcher and throughput bench
 docs/exl3-mm31/                                  MiniMax defect catalogue, patches, scripts
 docs/exl3-ds41/RUNBOOK.md                        DeepSeek port: every wave, every number
+docs/exl3-ds41/scripts/                          pack conversion kit (exllamav3 -> vLLM)
 docs/qwen38-nvfp4/RUNBOOK.md                     NVFP4 on SM86 + DFlash2
 README-upstream.md                               the original vllm-backport README
 ```
 
 # Reproducing
 
-The engine changes are already in `master`, so a plain clone is enough:
+The engine changes are already in `master`, so a plain clone gets the code. It does **not**
+get weights, compiled extensions, the AGPL plugin, or a built `exllamav3` — a clone alone
+boots nothing. What each model additionally needs:
 
-```bash
-git clone https://github.com/DoktorMincs/vllm-backport-exl3 && cd vllm-backport-exl3
-```
+| model | you must bring |
+|---|---|
+| **Qwen3.8-27B-NVFP4** | build this fork with torch 2.13+cu130; `nvidia/Qwen3.8-27B-NVFP4-QAD` (19.9 GB) and, for speculation, `z-lab/Qwen3.8-27B-DFlash2` (3.85 GB) |
+| **MiniMax-M3.1-EXL3** | the Mia-AiLab pack (184 / 160 GB); the `vllm-exl3` plugin at `053c634` + the diff below; an `exllamav3` rebuilt for sm_86 with `ACT_SILU_OAI` (`docs/exl3-mm31/scripts/build_exllamav3.sh`) |
+| **DeepSeek-V4.1-EXL3** | the Mia-AiLab DS4.1 pack (or the turboderp one plus the conversion kit in `docs/exl3-ds41/scripts/`); the plugin diff; the same `exllamav3`; `mw00/project-maya`'s `tools/mm3` for the conversion oracle |
 
-The cumulative diff exists so the delta against upstream can be read — and applied to a
-clean checkout of `wtdcode/vllm-backport` at `ced6985fd1`:
+Everything else — engine code, runbooks, bench tooling, conversion scripts — is here.
+
+The cumulative diff of the engine exists so the delta against upstream can be read — and
+applied to a clean checkout of `wtdcode/vllm-backport` at `ced6985fd1`:
 
 ```bash
 git clone https://github.com/wtdcode/vllm-backport && cd vllm-backport
@@ -308,9 +315,11 @@ git apply /path/to/vllm-backport-exl3/docs/exl3-mm31/patches/backport-exl3-mm31-
 ```
 
 Plugin and runtime for the EXL3 models (AGPL-3.0-only — patch, do not vendor). The diff is
-generated against `vcruz305/vllm-exl3` at `053c634`; check that commit out first. The
-scripts read `EXL3_PORT` (default `~/exl3-port`) as the environment root and expect the
-plugin at `$EXL3_ROOT/pkgs/vllm-exl3`:
+cumulative against `vcruz305/vllm-exl3` at `053c634`: it carries the MiniMax work, the
+DeepSeek-V4.1 native MoE path, the half-integer K (2.5) support, the cooperative-MoE
+limits raised to 512 slots / 88 rows, and the optional b12x MoE backend. Check `053c634`
+out first. The scripts read `EXL3_PORT` (default `~/exl3-port`) as the environment root and
+expect the plugin at `$EXL3_ROOT/pkgs/vllm-exl3`:
 
 ```bash
 EXL3_ROOT="${EXL3_PORT:-$HOME/exl3-port}"
@@ -322,8 +331,12 @@ git apply /path/to/vllm-backport-exl3/docs/exl3-mm31/patches/plugin-exl3-local-c
 # exl3_moe_mixedk) for sm_86 with ACT_SILU_OAI (act 3) in the non-coop path
 ```
 
-The measurement and runbook tooling is in `docs/exl3-mm31/scripts/` (sanitized; see its
-`README.md` for the environment variables it expects).
+The measurement and runbook tooling is in `docs/exl3-mm31/scripts/`, and the DeepSeek pack
+conversion kit is in [`docs/exl3-ds41/scripts/`](docs/exl3-ds41/scripts/README.md) — both
+sanitized, paths taken from the environment; each directory's `README.md` lists the
+variables it expects. Converting the DeepSeek pack also needs `exl3_torch` from
+[`mw00/project-maya`](https://github.com/mw00/project-maya) (`tools/mm3`, MIT), pointed at
+by `MAYA_TOOLS`.
 
 Boot, MiniMax (TP=2 × PP=5 on 10 GPUs):
 
@@ -392,6 +405,7 @@ Almost none of what runs here is ours. In rough order of how much this repo owes
 | [avtc/vllm-backport](https://github.com/avtc/vllm-backport) — avtc | author of the base commit `ced6985fd1`; their fork of `wtdcode/vllm-backport` is where that commit was written | Apache-2.0 |
 | [nvidia/Qwen3.8-27B-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4-QAD) — NVIDIA | the NVFP4 checkpoint and its QAD recipe | NVIDIA Open Model License |
 | [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) — z-lab | the DFlash2 block-diffusion drafter | Apache-2.0 |
+| [mw00/project-maya](https://github.com/mw00/project-maya) — Peasant Smith and contributors | `tools/mm3/exl3_torch.py`, the EXL3 torch decoder used as the oracle when converting the DeepSeek pack | MIT |
 | [deepseek-ai](https://huggingface.co/deepseek-ai) | DeepSeek-V4.1-Flash-1017 and its MTP/DSpark draft heads | follow DeepSeek's model terms |
 
 And to the usual stack underneath all of it: PyTorch, Triton, FlashInfer, NCCL and CUDA.
